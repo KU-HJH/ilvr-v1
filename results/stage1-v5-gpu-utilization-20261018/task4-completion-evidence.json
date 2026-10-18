@@ -1,0 +1,2168 @@
+{
+  "task": "Task4 actual execution identity/integration and final local operator measurements",
+  "status": "DONE_WITH_CONCERNS: assigned implementation/measurement scope complete; independent reviews and root final verification remain pending",
+  "owner_agent": "/root/gpu_util_t4_impl",
+  "measured_revision": "7632cde6bb8892829d3b0c5678ea8a5c6fbd8f30",
+  "wip_runtime_test_benchmark_commit": "b3e13a4abcc237e10c397eb076be8bd3b79a9f55",
+  "reviewed_numerical_repair_commit": "4440fe78b72b71303ab30f29b1b73aa11183c1f2",
+  "approved_spec": {
+    "path": "docs/superpowers/specs/2026-10-18-stage1-v5-gpu-utilization-commitment-v1.md",
+    "sha256": "843832ae9b09c10f28dea3dea60ceaa8d845f77f103f98259d4f26304cbe659a",
+    "bytes": 20415
+  },
+  "root_gate_record": {
+    "path": "docs/superpowers/2026-10-18-stage1-v5-gpu-utilization-workflow.md",
+    "sha256": "b9d2175f18c8d8ed0726b218a9d490f5b2e487c456246081c36f635bda8348f6",
+    "bytes": 38886
+  },
+  "root_authorization": "Parent explicitly resumed unchanged Task4 after independent T3 SPEC PASS and QUALITY PASS; no new design/algorithm/tolerance/geometry changes authorized or made.",
+  "skills": {
+    "TDD": "Previously read and executed for runtime/profile/geometry at b3e13a4; causal RED logs retained by original evidence. No source changes needed on resumed Task4.",
+    "lifecycle": "Root owns Superpowers control, independent reviews, fresh whole-change verification and finish gates. No subagents/advisory hooks invoked by implementer."
+  },
+  "preserved_original_failure_artifacts": {
+    "results/stage1-v5-gpu-utilization-20261018/task4-evidence.json": {
+      "sha256": "be033964bab41b85ae1b2e82470cb5c8c3fcae5448894be4e4aea1ec970a0875",
+      "bytes": 7832
+    },
+    "results/stage1-v5-gpu-utilization-20261018/task4-cpu-long-discrete-failure.json": {
+      "sha256": "cdb66d95c382c13e71db07958d855a2f2bbed248af8ea4b84190858d3ba4a27e",
+      "bytes": 146556
+    }
+  },
+  "repair_evidence": {
+    "path": "results/stage1-v5-gpu-utilization-20261018/task3-numerical-repair-evidence.json",
+    "sha256": "2ce0a9216a4123605e356c7ae7bb3b6fdde6655a0337c752679820ba0242116d",
+    "bytes": 15462
+  },
+  "runtime_identity": {
+    "source_paths": {
+      "v5_trainer": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_trainer.py",
+      "stage1_trainer": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/trainer.py",
+      "transformers_trainer": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/trainer.py",
+      "query": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/query.py",
+      "targets": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/targets.py",
+      "history_attention": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/history_attention.py",
+      "history_teacher": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/history_teacher.py",
+      "history_metric": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/history_metric.py",
+      "v5_execution": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_execution.py",
+      "v5_selection": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_selection.py",
+      "v5_trace": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py",
+      "v5_replay": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py"
+    },
+    "source_sha256": {
+      "v5_trainer": "f74aeb92ba95f49c23f8815a380beb4180ecb657e7090816ec81275d53d80fc6",
+      "stage1_trainer": "98375dd8aa827248b0f50553b35dd30047fec4c14489db99af045f017e6be453",
+      "transformers_trainer": "e1ab378575edc9dbd05ec7f882224e5f3147dc7a3a811af3f2c201d5dcdaa649",
+      "query": "97713ccef41333f7432c83f35591056b9ab4cc694c4e8ebb8ed59c9db14f6cca",
+      "targets": "2f11a504868cd32b87d46bc9c73e03380d87105530607530a7f800e1435d92cd",
+      "history_attention": "ce6a9eb946b856f0677227792721de0012be2328243c8e5d6f4c1bb2493ba62a",
+      "history_teacher": "ccb00a666143272137deb9e4d982666bcb4fe2bb1787ddca34e1e136550f350c",
+      "history_metric": "13264bb8cd0a2bdbd2ed43f7c0b1f2c0d3a046d5ddef34157bab4b97cd245f9e",
+      "v5_execution": "d18a3a41c74d741228442100a471ab208dce8e3c0912fc33361a79e26a4f0ad1",
+      "v5_selection": "a534cf7184c43575ca8fca610df0f14325ed221db3dceb1564b34802c891b43c",
+      "v5_trace": "c13d5007b40fa0892281fc9be7ec338d955375183712700fa41ce987ec641049",
+      "v5_replay": "27d42a8f03e9a547a01d7b4538bdd17409662bf74e2cee998da7eb9aba670797"
+    },
+    "operator_profile": {
+      "id": "stage1_v5_vectorized_ops_v1",
+      "attention_query_chunk_max": 32,
+      "attention_score_probability_target_bytes": 33554432
+    },
+    "historical_parser_sha256": "027e00961105d4a438226008c3aacd3202c873575f003038a8f95f1769f5439c",
+    "observation": "Twelve literal expected bindings passed actual _build_v5_runtime_contract tests. Module __file__ bytes (including decorated function modules) are hashed; no wrapper getsourcefile identity. Source/profile remain in cross-rank and saved/current comparisons."
+  },
+  "focused_correctness": {
+    "command": "env CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q --capture=tee-sys --tb=short tests/stage1/v5/test_resume.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_trainer.py tests/stage1/v5/test_history_integration.py tests/stage1/v5/test_gpu_utilization.py --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t4-postrepair-green",
+    "exit_code": 0,
+    "result": "269 passed, 90 skipped in 26.27s",
+    "log": {
+      "path": "logs/stage1-v5-gpu-utilization-20261018/t4-postrepair-green.log",
+      "sha256": "b29afb9be820ad5c367676c146ffc890d49d72bddf747644cf3276a4119fc2fe",
+      "bytes": 7486577
+    },
+    "read_scope": "All7486577bytes read; both embedded full benchmark JSON objects parsed/validated and all non-JSON text read. Five actual train-dispatch mismatch witnesses, native/history integration and restored long exact-key witnesses present.",
+    "actual_resume_dispatch_witnesses": [
+      "..............RESUME_DISPATCH drift=lr parent_calls=1 optimizer_calls=0 publication_calls=0 historical_bytes_unchanged=True",
+      "RESUME_DISPATCH drift=old_sources parent_calls=1 optimizer_calls=0 publication_calls=0 historical_bytes_unchanged=True",
+      "RESUME_DISPATCH drift=missing_profile parent_calls=1 optimizer_calls=0 publication_calls=0 historical_bytes_unchanged=True",
+      "RESUME_DISPATCH drift=changed_source parent_calls=1 optimizer_calls=0 publication_calls=0 historical_bytes_unchanged=True",
+      "RESUME_DISPATCH drift=changed_profile parent_calls=1 optimizer_calls=0 publication_calls=0 historical_bytes_unchanged=True"
+    ],
+    "scope_note": "Existing CPU contract tests include tiny Trainer/optimizer/reference oracles. They are unit/integration fixtures, not production multi-node training or a new training launch."
+  },
+  "resource_checks": [
+    {
+      "command": "nvidia-smi",
+      "exit_code": 0,
+      "log": {
+        "path": "logs/stage1-v5-gpu-utilization-20261018/t4-cuda-default-idle-check.log",
+        "sha256": "f6087901373288f01f0cc41a98a4a52855d3cce7a36d557d19be88c71cfd9fbc",
+        "bytes": 2057
+      },
+      "observed": "Both H100 NVL GPUs 0MiB/0% and no running processes; CUDA0 selected immediately after read."
+    },
+    {
+      "command": "nvidia-smi",
+      "exit_code": 0,
+      "log": {
+        "path": "logs/stage1-v5-gpu-utilization-20261018/t4-cuda-long-idle-check.log",
+        "sha256": "117207d734298aea75a45dcc27f52d027361f1a3d702a6946cce7cb4de06517b",
+        "bytes": 2057
+      },
+      "observed": "Both H100 NVL GPUs 0MiB/0% and no running processes; CUDA0 selected immediately after read."
+    }
+  ],
+  "measurement_protocol": {
+    "warmup": 3,
+    "repetitions": 20,
+    "runs_per_profile_device": 1,
+    "timing": "Paired alternating before/after synchronized raw wall times; medians verified against complete20element arrays. Original long-CUDA dropout outliers preserved unchanged.",
+    "memory": "Each implementation measured independently after collection/synchronization; CUDA cache emptied and peak stats reset per implementation, reporting baseline/extra/absolute allocated and reserved peaks. CPU tracemalloc counts Python storage only, excluding CPU tensor storage.",
+    "host_observation": "Recorded .tolist calls, dtype, elements and bytes plus actual operator counters; these counters do not establish complete system PCIe traffic.",
+    "original_oracles": "All reports retain byte-identical source65643f0 frozen four-module identities, separate full-row selector oracle and seven joint selection configs.",
+    "scope_labels": "Replay timing includes prefix concatenation/binding/dummy decoder callback/identity head. Dropout includes F/packed owner, non-reentrant checkpoint replay, sin/reduction/detach and backward overhead; no operator-benchmark optimizer/training/model load."
+  },
+  "median_ms_table": [
+    {
+      "device": "cpu",
+      "geometry": "default",
+      "operator": "attention",
+      "before_ms": 10.701291,
+      "after_ms": 8.328744,
+      "change_percent": -22.170661465051268
+    },
+    {
+      "device": "cpu",
+      "geometry": "default",
+      "operator": "selection",
+      "before_ms": 0.7369965,
+      "after_ms": 0.7054180000000001,
+      "change_percent": -4.284755762069414
+    },
+    {
+      "device": "cpu",
+      "geometry": "default",
+      "operator": "replay_mask",
+      "before_ms": 2.7860955,
+      "after_ms": 0.7080234999999999,
+      "change_percent": -74.58724943204568
+    },
+    {
+      "device": "cpu",
+      "geometry": "default",
+      "operator": "dropout",
+      "before_ms": 4.5862359999999995,
+      "after_ms": 2.6186420000000004,
+      "change_percent": -42.90215331265115
+    },
+    {
+      "device": "cpu",
+      "geometry": "long",
+      "operator": "attention",
+      "before_ms": 266.270208,
+      "after_ms": 292.19236550000005,
+      "change_percent": 9.735282701998727
+    },
+    {
+      "device": "cpu",
+      "geometry": "long",
+      "operator": "selection",
+      "before_ms": 1.642772,
+      "after_ms": 1.057242,
+      "change_percent": -35.64280374878559
+    },
+    {
+      "device": "cpu",
+      "geometry": "long",
+      "operator": "replay_mask",
+      "before_ms": 18.928739,
+      "after_ms": 17.031025,
+      "change_percent": -10.025570113254778
+    },
+    {
+      "device": "cpu",
+      "geometry": "long",
+      "operator": "dropout",
+      "before_ms": 60.7463365,
+      "after_ms": 25.2760295,
+      "change_percent": -58.390857858564026
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "attention",
+      "before_ms": 10.6143415,
+      "after_ms": 3.739776,
+      "change_percent": -64.76676391088417
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "selection",
+      "before_ms": 1.0566125,
+      "after_ms": 1.6085829999999999,
+      "change_percent": 52.2396337351678
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "replay_mask",
+      "before_ms": 6.8953705,
+      "after_ms": 0.9596775,
+      "change_percent": -86.0822924598468
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "dropout",
+      "before_ms": 4.527571,
+      "after_ms": 2.1268985000000002,
+      "change_percent": -53.023409240849006
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "attention",
+      "before_ms": 25.758399500000003,
+      "after_ms": 12.085292500000001,
+      "change_percent": -53.08212957874188
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "selection",
+      "before_ms": 1.951376,
+      "after_ms": 1.8070735,
+      "change_percent": -7.394910053213732
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "replay_mask",
+      "before_ms": 33.414273,
+      "after_ms": 1.596244,
+      "change_percent": -95.22286778467394
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "dropout",
+      "before_ms": 45.1420165,
+      "after_ms": 2.4281575,
+      "change_percent": -94.62106992938607
+    }
+  ],
+  "timing_regressions": [
+    {
+      "device": "cpu",
+      "geometry": "long",
+      "operator": "attention",
+      "before_ms": 266.270208,
+      "after_ms": 292.19236550000005,
+      "change_percent": 9.735282701998727
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "selection",
+      "before_ms": 1.0566125,
+      "after_ms": 1.6085829999999999,
+      "change_percent": 52.2396337351678
+    }
+  ],
+  "cuda_memory_increases": [
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "attention",
+      "before_ms": 10.6143415,
+      "after_ms": 3.739776,
+      "change_percent": -64.76676391088417,
+      "field": "extra_peak_allocated_bytes",
+      "before_bytes": 5811200,
+      "after_bytes": 6287872
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "attention",
+      "before_ms": 10.6143415,
+      "after_ms": 3.739776,
+      "change_percent": -64.76676391088417,
+      "field": "peak_allocated_bytes",
+      "before_bytes": 41700352,
+      "after_bytes": 42177024
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "selection",
+      "before_ms": 1.0566125,
+      "after_ms": 1.6085829999999999,
+      "change_percent": 52.2396337351678,
+      "field": "extra_peak_allocated_bytes",
+      "before_bytes": 41472,
+      "after_bytes": 82944
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "selection",
+      "before_ms": 1.0566125,
+      "after_ms": 1.6085829999999999,
+      "change_percent": 52.2396337351678,
+      "field": "peak_allocated_bytes",
+      "before_bytes": 35930624,
+      "after_bytes": 35972096
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "replay_mask",
+      "before_ms": 6.8953705,
+      "after_ms": 0.9596775,
+      "change_percent": -86.0822924598468,
+      "field": "extra_peak_allocated_bytes",
+      "before_bytes": 1115648,
+      "after_bytes": 1129472
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "operator": "replay_mask",
+      "before_ms": 6.8953705,
+      "after_ms": 0.9596775,
+      "change_percent": -86.0822924598468,
+      "field": "peak_allocated_bytes",
+      "before_bytes": 37004800,
+      "after_bytes": 37018624
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "attention",
+      "before_ms": 25.758399500000003,
+      "after_ms": 12.085292500000001,
+      "change_percent": -53.08212957874188,
+      "field": "extra_peak_allocated_bytes",
+      "before_bytes": 93552640,
+      "after_bytes": 101165056
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "attention",
+      "before_ms": 25.758399500000003,
+      "after_ms": 12.085292500000001,
+      "change_percent": -53.08212957874188,
+      "field": "peak_allocated_bytes",
+      "before_bytes": 148251648,
+      "after_bytes": 155864064
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "attention",
+      "before_ms": 25.758399500000003,
+      "after_ms": 12.085292500000001,
+      "change_percent": -53.08212957874188,
+      "field": "peak_reserved_bytes",
+      "before_bytes": 169869312,
+      "after_bytes": 197132288
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "selection",
+      "before_ms": 1.951376,
+      "after_ms": 1.8070735,
+      "change_percent": -7.394910053213732,
+      "field": "extra_peak_allocated_bytes",
+      "before_bytes": 69120,
+      "after_bytes": 171520
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "selection",
+      "before_ms": 1.951376,
+      "after_ms": 1.8070735,
+      "change_percent": -7.394910053213732,
+      "field": "peak_allocated_bytes",
+      "before_bytes": 54768128,
+      "after_bytes": 54870528
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "replay_mask",
+      "before_ms": 33.414273,
+      "after_ms": 1.596244,
+      "change_percent": -95.22286778467394,
+      "field": "extra_peak_allocated_bytes",
+      "before_bytes": 53139968,
+      "after_bytes": 53364736
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "operator": "replay_mask",
+      "before_ms": 33.414273,
+      "after_ms": 1.596244,
+      "change_percent": -95.22286778467394,
+      "field": "peak_allocated_bytes",
+      "before_bytes": 107838976,
+      "after_bytes": 108063744
+    }
+  ],
+  "measurements": [
+    {
+      "device": "cpu",
+      "geometry": "default",
+      "command": "env CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python scripts/benchmark_stage1_v5_attention_selection.py --device cpu --profile default --warmup 3 --repetitions 20 --output results/stage1-v5-gpu-utilization-20261018/candidate-cpu-default.json",
+      "exit_code": 0,
+      "report": {
+        "path": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-default.json",
+        "sha256": "1337209f9e07a852b93e79c668ab1459fcbc487a011dc9acfcc5cb7f1e753276",
+        "bytes": 267217
+      },
+      "full_stdout_log": {
+        "path": "logs/stage1-v5-gpu-utilization-20261018/candidate-cpu-default.log",
+        "sha256": "1337209f9e07a852b93e79c668ab1459fcbc487a011dc9acfcc5cb7f1e753276",
+        "bytes": 267217
+      },
+      "source_identity": {
+        "baseline_commit": "65643f08cb6e61fbbb200de825d57086f5c7a127",
+        "candidate_commit": "7632cde6bb8892829d3b0c5678ea8a5c6fbd8f30",
+        "candidate_sha256": {
+          "v5_execution": "d18a3a41c74d741228442100a471ab208dce8e3c0912fc33361a79e26a4f0ad1",
+          "v5_selection": "a534cf7184c43575ca8fca610df0f14325ed221db3dceb1564b34802c891b43c",
+          "stage1_v5_trace": "c13d5007b40fa0892281fc9be7ec338d955375183712700fa41ce987ec641049",
+          "stage1_v5_replay": "27d42a8f03e9a547a01d7b4538bdd17409662bf74e2cee998da7eb9aba670797"
+        },
+        "candidate_paths": {
+          "v5_execution": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_execution.py",
+          "v5_selection": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_selection.py",
+          "stage1_v5_trace": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py",
+          "stage1_v5_replay": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py"
+        },
+        "benchmark_sha256": "a02177a75f6dbcfc04a9addbd54bff736cca8fbe58a549961b8961ee09396cc0",
+        "fixtures_sha256": "cddf312bee884ddc2eb977f611807ba2f3a1c28d76e620c65c7d88165c48b475"
+      },
+      "gpu_identity": null,
+      "packages": {
+        "torch": "2.7.1+cu128",
+        "transformers": "4.50.0.dev0",
+        "peft": "0.17.1",
+        "flash-attn": "2.8.3",
+        "deepspeed": "0.18.7"
+      },
+      "torch_runtime": "2.7.1+cu128",
+      "cuda_runtime": "12.8",
+      "python": "3.11.15",
+      "geometry_note": "Synthetic bounded geometry informed by audit T~16698 and 1-6 blocks; not an actual dataset sample or production maximum.",
+      "fixture_scope": {
+        "attention_fixture": {
+          "batch": 2,
+          "length": 512,
+          "queries": 64,
+          "heads": 8,
+          "head_dim": 32,
+          "layers": 2,
+          "dtype": "bfloat16 projections, float32 observation",
+          "scope": "projection/hook fixture with fixed decoder callbacks; no model load"
+        },
+        "selection_fixture": {
+          "queries": 32,
+          "candidates_per_query": 128,
+          "full_row_length": 4096,
+          "vocab": 17,
+          "dtype": "float32",
+          "validation": false,
+          "input": "identical prebuilt compact candidate rows"
+        },
+        "replay_mask_fixture": {
+          "batch": 2,
+          "length": 512,
+          "blocks": 4,
+          "rows": 8,
+          "mask_shape": [
+            8,
+            1,
+            24,
+            344
+          ],
+          "suffix_lengths": [
+            24,
+            19,
+            13,
+            7
+          ],
+          "dtype": "float32",
+          "validation": false,
+          "scope": "actual packed replay bias, prefix concatenation, binding, dummy decoder callback and identity head; no attention/model forward"
+        },
+        "dropout_fixture": {
+          "source_lengths": [
+            512,
+            499
+          ],
+          "hidden_size": 64,
+          "native_shape": [
+            2,
+            512,
+            64
+          ],
+          "packed_shape": [
+            200,
+            64
+          ],
+          "probability": 0.05,
+          "sites": 1,
+          "checkpoint": "non-reentrant early-stop",
+          "dtype": "float32",
+          "validation": false,
+          "scope": "actual private-generator F/packed dropout, checkpoint recomputation and backward; includes owner/checkpoint/sin/reduction/output-detach overhead; no train step"
+        }
+      },
+      "equality": {
+        "attention_exact_equal": true,
+        "attention_close": true,
+        "joint_selected_keys_exact_equal": true,
+        "selected_keys_exact_equal": true,
+        "mask_exact_equal": true,
+        "dropout_exact_equal": true,
+        "dropout_global_rng_unchanged": true
+      },
+      "attention_errors": {
+        "attention_max_absolute_error": 0.0,
+        "attention_max_relative_error": 0.0,
+        "attention_atol": 1e-07,
+        "attention_rtol": 1e-05
+      },
+      "operators": {
+        "attention": {
+          "before_median_ms": 10.701291,
+          "after_median_ms": 8.328744,
+          "change_percent": -22.170661465051268,
+          "before_memory": {
+            "peak_python_bytes": 31502,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "after_memory": {
+            "peak_python_bytes": 33240,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "before_operations": {
+            "key_float_copies": 4,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 158,
+            "stack_calls": 0,
+            "index_put_calls": 0,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 132,
+            "batched_matmul_calls": 128
+          },
+          "after_operations": {
+            "key_float_copies": 4,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 4,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 226,
+            "stack_calls": 4,
+            "index_put_calls": 0,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 36,
+            "batched_matmul_calls": 32
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-default.json :: attention_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "selection": {
+          "before_median_ms": 0.7369965,
+          "after_median_ms": 0.7054180000000001,
+          "change_percent": -4.284755762069414,
+          "before_memory": {
+            "peak_python_bytes": 193647,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "after_memory": {
+            "peak_python_bytes": 94439,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 0,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 0,
+            "stack_calls": 1,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 1,
+            "tolist_elements": 4160,
+            "tolist_bytes": 16640,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.float32",
+                "elements": 4160,
+                "bytes": 16640
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 0,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 0,
+            "stack_calls": 1,
+            "index_put_calls": 2,
+            "stable_sort_calls": 32,
+            "integer_float_casts": 0,
+            "tolist_calls": 2,
+            "tolist_elements": 2496,
+            "tolist_bytes": 14848,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 1216,
+                "bytes": 9728
+              },
+              {
+                "dtype": "torch.float32",
+                "elements": 1280,
+                "bytes": 5120
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-default.json :: selection_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "replay_mask": {
+          "before_median_ms": 2.7860955,
+          "after_median_ms": 0.7080234999999999,
+          "change_percent": -74.58724943204568,
+          "before_memory": {
+            "peak_python_bytes": 32966,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "after_memory": {
+            "peak_python_bytes": 37948,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 1,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 67,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 1111,
+            "stack_calls": 1,
+            "index_put_calls": 63,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 4,
+            "stack_calls": 0,
+            "index_put_calls": 1,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-default.json :: replay_mask_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "dropout": {
+          "before_median_ms": 4.5862359999999995,
+          "after_median_ms": 2.6186420000000004,
+          "change_percent": -42.90215331265115,
+          "before_memory": {
+            "peak_python_bytes": 148374,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "after_memory": {
+            "peak_python_bytes": 24211,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 4,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 8,
+            "random_draw_elements": 258816,
+            "select_calls": 2422,
+            "stack_calls": 4,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 8,
+            "tolist_calls": 8,
+            "tolist_elements": 4844,
+            "tolist_bytes": 38752,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 1011,
+                "bytes": 8088
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 1011,
+                "bytes": 8088
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 200,
+                "bytes": 1600
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 200,
+                "bytes": 1600
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 200,
+                "bytes": 1600
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 200,
+                "bytes": 1600
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 1011,
+                "bytes": 8088
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 1011,
+                "bytes": 8088
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 4,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 8,
+            "random_draw_elements": 258816,
+            "select_calls": 0,
+            "stack_calls": 0,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 8,
+            "tolist_calls": 4,
+            "tolist_elements": 8,
+            "tolist_bytes": 64,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-default.json :: dropout_{before,after}.milliseconds (all20rawtimes preserved)"
+        }
+      }
+    },
+    {
+      "device": "cpu",
+      "geometry": "long",
+      "command": "env CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python scripts/benchmark_stage1_v5_attention_selection.py --device cpu --profile long --warmup 3 --repetitions 20 --output results/stage1-v5-gpu-utilization-20261018/candidate-cpu-long.json",
+      "exit_code": 0,
+      "report": {
+        "path": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-long.json",
+        "sha256": "39b443a59c01858440e10d1a586b493fb16fd9d05c374e42af3d5d0a1371d613",
+        "bytes": 7224734
+      },
+      "full_stdout_log": {
+        "path": "logs/stage1-v5-gpu-utilization-20261018/candidate-cpu-long.log",
+        "sha256": "39b443a59c01858440e10d1a586b493fb16fd9d05c374e42af3d5d0a1371d613",
+        "bytes": 7224734
+      },
+      "source_identity": {
+        "baseline_commit": "65643f08cb6e61fbbb200de825d57086f5c7a127",
+        "candidate_commit": "7632cde6bb8892829d3b0c5678ea8a5c6fbd8f30",
+        "candidate_sha256": {
+          "v5_execution": "d18a3a41c74d741228442100a471ab208dce8e3c0912fc33361a79e26a4f0ad1",
+          "v5_selection": "a534cf7184c43575ca8fca610df0f14325ed221db3dceb1564b34802c891b43c",
+          "stage1_v5_trace": "c13d5007b40fa0892281fc9be7ec338d955375183712700fa41ce987ec641049",
+          "stage1_v5_replay": "27d42a8f03e9a547a01d7b4538bdd17409662bf74e2cee998da7eb9aba670797"
+        },
+        "candidate_paths": {
+          "v5_execution": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_execution.py",
+          "v5_selection": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_selection.py",
+          "stage1_v5_trace": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py",
+          "stage1_v5_replay": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py"
+        },
+        "benchmark_sha256": "a02177a75f6dbcfc04a9addbd54bff736cca8fbe58a549961b8961ee09396cc0",
+        "fixtures_sha256": "cddf312bee884ddc2eb977f611807ba2f3a1c28d76e620c65c7d88165c48b475"
+      },
+      "gpu_identity": null,
+      "packages": {
+        "torch": "2.7.1+cu128",
+        "transformers": "4.50.0.dev0",
+        "peft": "0.17.1",
+        "flash-attn": "2.8.3",
+        "deepspeed": "0.18.7"
+      },
+      "torch_runtime": "2.7.1+cu128",
+      "cuda_runtime": "12.8",
+      "python": "3.11.15",
+      "geometry_note": "Synthetic bounded geometry informed by audit T~16698 and 1-6 blocks; not an actual dataset sample or production maximum.",
+      "fixture_scope": {
+        "attention_fixture": {
+          "batch": 2,
+          "length": 8192,
+          "queries": 134,
+          "heads": 8,
+          "head_dim": 32,
+          "layers": 2,
+          "dtype": "bfloat16 projections, float32 observation",
+          "scope": "projection/hook fixture with fixed decoder callbacks; no model load"
+        },
+        "selection_fixture": {
+          "queries": 24,
+          "candidates_per_query": 512,
+          "full_row_length": 8192,
+          "vocab": 17,
+          "dtype": "float32",
+          "validation": false,
+          "input": "identical prebuilt compact candidate rows"
+        },
+        "replay_mask_fixture": {
+          "batch": 2,
+          "length": 8192,
+          "blocks": 6,
+          "rows": 12,
+          "mask_shape": [
+            12,
+            1,
+            96,
+            6240
+          ],
+          "suffix_lengths": [
+            96,
+            80,
+            64,
+            48,
+            32,
+            16
+          ],
+          "dtype": "float32",
+          "validation": false,
+          "scope": "actual packed replay bias, prefix concatenation, binding, dummy decoder callback and identity head; no attention/model forward"
+        },
+        "dropout_fixture": {
+          "source_lengths": [
+            8192,
+            8179
+          ],
+          "hidden_size": 64,
+          "native_shape": [
+            2,
+            8192,
+            64
+          ],
+          "packed_shape": [
+            2056,
+            64
+          ],
+          "probability": 0.05,
+          "sites": 1,
+          "checkpoint": "non-reentrant early-stop",
+          "dtype": "float32",
+          "validation": false,
+          "scope": "actual private-generator F/packed dropout, checkpoint recomputation and backward; includes owner/checkpoint/sin/reduction/output-detach overhead; no train step"
+        }
+      },
+      "equality": {
+        "attention_exact_equal": true,
+        "attention_close": true,
+        "joint_selected_keys_exact_equal": true,
+        "selected_keys_exact_equal": true,
+        "mask_exact_equal": true,
+        "dropout_exact_equal": true,
+        "dropout_global_rng_unchanged": true
+      },
+      "attention_errors": {
+        "attention_max_absolute_error": 0.0,
+        "attention_max_relative_error": 0.0,
+        "attention_atol": 1e-07,
+        "attention_rtol": 1e-05
+      },
+      "operators": {
+        "attention": {
+          "before_median_ms": 266.270208,
+          "after_median_ms": 292.19236550000005,
+          "change_percent": 9.735282701998727,
+          "before_memory": {
+            "peak_python_bytes": 44765,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "after_memory": {
+            "peak_python_bytes": 46975,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "before_operations": {
+            "key_float_copies": 4,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 298,
+            "stack_calls": 0,
+            "index_put_calls": 0,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 272,
+            "batched_matmul_calls": 268
+          },
+          "after_operations": {
+            "key_float_copies": 4,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 4,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 502,
+            "stack_calls": 12,
+            "index_put_calls": 0,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 100,
+            "batched_matmul_calls": 96
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-long.json :: attention_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "selection": {
+          "before_median_ms": 1.642772,
+          "after_median_ms": 1.057242,
+          "change_percent": -35.64280374878559,
+          "before_memory": {
+            "peak_python_bytes": 557020,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "after_memory": {
+            "peak_python_bytes": 340855,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 0,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 0,
+            "stack_calls": 1,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 1,
+            "tolist_elements": 12336,
+            "tolist_bytes": 49344,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.float32",
+                "elements": 12336,
+                "bytes": 49344
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 0,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 0,
+            "stack_calls": 1,
+            "index_put_calls": 2,
+            "stable_sort_calls": 24,
+            "integer_float_casts": 0,
+            "tolist_calls": 2,
+            "tolist_elements": 7392,
+            "tolist_bytes": 44256,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 3672,
+                "bytes": 29376
+              },
+              {
+                "dtype": "torch.float32",
+                "elements": 3720,
+                "bytes": 14880
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-long.json :: selection_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "replay_mask": {
+          "before_median_ms": 18.928739,
+          "after_median_ms": 17.031025,
+          "change_percent": -10.025570113254778,
+          "before_memory": {
+            "peak_python_bytes": 137158,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "after_memory": {
+            "peak_python_bytes": 179110,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 1,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 340,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 5772,
+            "stack_calls": 1,
+            "index_put_calls": 336,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 4,
+            "stack_calls": 0,
+            "index_put_calls": 1,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-long.json :: replay_mask_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "dropout": {
+          "before_median_ms": 60.7463365,
+          "after_median_ms": 25.2760295,
+          "change_percent": -58.390857858564026,
+          "before_memory": {
+            "peak_python_bytes": 2365115,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "after_memory": {
+            "peak_python_bytes": 24275,
+            "note": "Python allocations only; excludes CPU tensor storage"
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 4,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 8,
+            "random_draw_elements": 4190976,
+            "select_calls": 36854,
+            "stack_calls": 4,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 8,
+            "tolist_calls": 8,
+            "tolist_elements": 73708,
+            "tolist_bytes": 589664,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 16371,
+                "bytes": 130968
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 16371,
+                "bytes": 130968
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2056,
+                "bytes": 16448
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2056,
+                "bytes": 16448
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2056,
+                "bytes": 16448
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2056,
+                "bytes": 16448
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 16371,
+                "bytes": 130968
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 16371,
+                "bytes": 130968
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 4,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 8,
+            "random_draw_elements": 4190976,
+            "select_calls": 0,
+            "stack_calls": 0,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 8,
+            "tolist_calls": 4,
+            "tolist_elements": 8,
+            "tolist_bytes": 64,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cpu-long.json :: dropout_{before,after}.milliseconds (all20rawtimes preserved)"
+        }
+      },
+      "restored_original_failure_boundary": {
+        "query": [
+          1,
+          8125
+        ],
+        "before": [
+          289,
+          1235
+        ],
+        "after": [
+          289,
+          1235
+        ]
+      }
+    },
+    {
+      "device": "cuda",
+      "geometry": "default",
+      "command": "env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python scripts/benchmark_stage1_v5_attention_selection.py --device cuda:0 --profile default --warmup 3 --repetitions 20 --output results/stage1-v5-gpu-utilization-20261018/candidate-cuda-default.json",
+      "exit_code": 0,
+      "report": {
+        "path": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-default.json",
+        "sha256": "e7d47a146ce79d0c9be29ee11bfeb15927e2877f0ae8ccfc01cc788ebd97a2d6",
+        "bytes": 267881
+      },
+      "full_stdout_log": {
+        "path": "logs/stage1-v5-gpu-utilization-20261018/candidate-cuda-default.log",
+        "sha256": "e7d47a146ce79d0c9be29ee11bfeb15927e2877f0ae8ccfc01cc788ebd97a2d6",
+        "bytes": 267881
+      },
+      "source_identity": {
+        "baseline_commit": "65643f08cb6e61fbbb200de825d57086f5c7a127",
+        "candidate_commit": "7632cde6bb8892829d3b0c5678ea8a5c6fbd8f30",
+        "candidate_sha256": {
+          "v5_execution": "d18a3a41c74d741228442100a471ab208dce8e3c0912fc33361a79e26a4f0ad1",
+          "v5_selection": "a534cf7184c43575ca8fca610df0f14325ed221db3dceb1564b34802c891b43c",
+          "stage1_v5_trace": "c13d5007b40fa0892281fc9be7ec338d955375183712700fa41ce987ec641049",
+          "stage1_v5_replay": "27d42a8f03e9a547a01d7b4538bdd17409662bf74e2cee998da7eb9aba670797"
+        },
+        "candidate_paths": {
+          "v5_execution": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_execution.py",
+          "v5_selection": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_selection.py",
+          "stage1_v5_trace": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py",
+          "stage1_v5_replay": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py"
+        },
+        "benchmark_sha256": "a02177a75f6dbcfc04a9addbd54bff736cca8fbe58a549961b8961ee09396cc0",
+        "fixtures_sha256": "cddf312bee884ddc2eb977f611807ba2f3a1c28d76e620c65c7d88165c48b475"
+      },
+      "gpu_identity": {
+        "name": "NVIDIA H100 NVL",
+        "total_memory_bytes": 99949674496,
+        "capability": [
+          9,
+          0
+        ]
+      },
+      "packages": {
+        "torch": "2.7.1+cu128",
+        "transformers": "4.50.0.dev0",
+        "peft": "0.17.1",
+        "flash-attn": "2.8.3",
+        "deepspeed": "0.18.7"
+      },
+      "torch_runtime": "2.7.1+cu128",
+      "cuda_runtime": "12.8",
+      "python": "3.11.15",
+      "geometry_note": "Synthetic bounded geometry informed by audit T~16698 and 1-6 blocks; not an actual dataset sample or production maximum.",
+      "fixture_scope": {
+        "attention_fixture": {
+          "batch": 2,
+          "length": 512,
+          "queries": 64,
+          "heads": 8,
+          "head_dim": 32,
+          "layers": 2,
+          "dtype": "bfloat16 projections, float32 observation",
+          "scope": "projection/hook fixture with fixed decoder callbacks; no model load"
+        },
+        "selection_fixture": {
+          "queries": 32,
+          "candidates_per_query": 128,
+          "full_row_length": 4096,
+          "vocab": 17,
+          "dtype": "float32",
+          "validation": false,
+          "input": "identical prebuilt compact candidate rows"
+        },
+        "replay_mask_fixture": {
+          "batch": 2,
+          "length": 512,
+          "blocks": 4,
+          "rows": 8,
+          "mask_shape": [
+            8,
+            1,
+            24,
+            344
+          ],
+          "suffix_lengths": [
+            24,
+            19,
+            13,
+            7
+          ],
+          "dtype": "float32",
+          "validation": false,
+          "scope": "actual packed replay bias, prefix concatenation, binding, dummy decoder callback and identity head; no attention/model forward"
+        },
+        "dropout_fixture": {
+          "source_lengths": [
+            512,
+            499
+          ],
+          "hidden_size": 64,
+          "native_shape": [
+            2,
+            512,
+            64
+          ],
+          "packed_shape": [
+            200,
+            64
+          ],
+          "probability": 0.05,
+          "sites": 1,
+          "checkpoint": "non-reentrant early-stop",
+          "dtype": "float32",
+          "validation": false,
+          "scope": "actual private-generator F/packed dropout, checkpoint recomputation and backward; includes owner/checkpoint/sin/reduction/output-detach overhead; no train step"
+        }
+      },
+      "equality": {
+        "attention_exact_equal": false,
+        "attention_close": true,
+        "joint_selected_keys_exact_equal": true,
+        "selected_keys_exact_equal": true,
+        "mask_exact_equal": true,
+        "dropout_exact_equal": true,
+        "dropout_global_rng_unchanged": true
+      },
+      "attention_errors": {
+        "attention_max_absolute_error": 4.656612873077393e-10,
+        "attention_max_relative_error": 2.3570058260702353e-07,
+        "attention_atol": 1e-07,
+        "attention_rtol": 1e-05
+      },
+      "operators": {
+        "attention": {
+          "before_median_ms": 10.6143415,
+          "after_median_ms": 3.739776,
+          "change_percent": -64.76676391088417,
+          "before_memory": {
+            "baseline_allocated_bytes": 35889152,
+            "peak_allocated_bytes": 41700352,
+            "extra_peak_allocated_bytes": 5811200,
+            "peak_reserved_bytes": 44040192
+          },
+          "after_memory": {
+            "baseline_allocated_bytes": 35889152,
+            "peak_allocated_bytes": 42177024,
+            "extra_peak_allocated_bytes": 6287872,
+            "peak_reserved_bytes": 44040192
+          },
+          "before_operations": {
+            "key_float_copies": 4,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 158,
+            "stack_calls": 0,
+            "index_put_calls": 0,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 132,
+            "batched_matmul_calls": 128
+          },
+          "after_operations": {
+            "key_float_copies": 4,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 4,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 226,
+            "stack_calls": 4,
+            "index_put_calls": 0,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 36,
+            "batched_matmul_calls": 32
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-default.json :: attention_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "selection": {
+          "before_median_ms": 1.0566125,
+          "after_median_ms": 1.6085829999999999,
+          "change_percent": 52.2396337351678,
+          "before_memory": {
+            "baseline_allocated_bytes": 35889152,
+            "peak_allocated_bytes": 35930624,
+            "extra_peak_allocated_bytes": 41472,
+            "peak_reserved_bytes": 37748736
+          },
+          "after_memory": {
+            "baseline_allocated_bytes": 35889152,
+            "peak_allocated_bytes": 35972096,
+            "extra_peak_allocated_bytes": 82944,
+            "peak_reserved_bytes": 37748736
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 0,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 0,
+            "stack_calls": 1,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 1,
+            "tolist_elements": 4160,
+            "tolist_bytes": 16640,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.float32",
+                "elements": 4160,
+                "bytes": 16640
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 0,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 0,
+            "stack_calls": 1,
+            "index_put_calls": 2,
+            "stable_sort_calls": 32,
+            "integer_float_casts": 0,
+            "tolist_calls": 2,
+            "tolist_elements": 2496,
+            "tolist_bytes": 14848,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 1216,
+                "bytes": 9728
+              },
+              {
+                "dtype": "torch.float32",
+                "elements": 1280,
+                "bytes": 5120
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-default.json :: selection_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "replay_mask": {
+          "before_median_ms": 6.8953705,
+          "after_median_ms": 0.9596775,
+          "change_percent": -86.0822924598468,
+          "before_memory": {
+            "baseline_allocated_bytes": 35889152,
+            "peak_allocated_bytes": 37004800,
+            "extra_peak_allocated_bytes": 1115648,
+            "peak_reserved_bytes": 37748736
+          },
+          "after_memory": {
+            "baseline_allocated_bytes": 35889152,
+            "peak_allocated_bytes": 37018624,
+            "extra_peak_allocated_bytes": 1129472,
+            "peak_reserved_bytes": 37748736
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 1,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 67,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 1111,
+            "stack_calls": 1,
+            "index_put_calls": 63,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 4,
+            "stack_calls": 0,
+            "index_put_calls": 1,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-default.json :: replay_mask_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "dropout": {
+          "before_median_ms": 4.527571,
+          "after_median_ms": 2.1268985000000002,
+          "change_percent": -53.023409240849006,
+          "before_memory": {
+            "baseline_allocated_bytes": 35889152,
+            "peak_allocated_bytes": 37303296,
+            "extra_peak_allocated_bytes": 1414144,
+            "peak_reserved_bytes": 37748736
+          },
+          "after_memory": {
+            "baseline_allocated_bytes": 35889152,
+            "peak_allocated_bytes": 37303296,
+            "extra_peak_allocated_bytes": 1414144,
+            "peak_reserved_bytes": 37748736
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 4,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 8,
+            "random_draw_elements": 258816,
+            "select_calls": 2422,
+            "stack_calls": 4,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 8,
+            "tolist_calls": 8,
+            "tolist_elements": 4844,
+            "tolist_bytes": 38752,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 1011,
+                "bytes": 8088
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 1011,
+                "bytes": 8088
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 200,
+                "bytes": 1600
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 200,
+                "bytes": 1600
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 200,
+                "bytes": 1600
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 200,
+                "bytes": 1600
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 1011,
+                "bytes": 8088
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 1011,
+                "bytes": 8088
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 4,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 8,
+            "random_draw_elements": 258816,
+            "select_calls": 0,
+            "stack_calls": 0,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 8,
+            "tolist_calls": 4,
+            "tolist_elements": 8,
+            "tolist_bytes": 64,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-default.json :: dropout_{before,after}.milliseconds (all20rawtimes preserved)"
+        }
+      }
+    },
+    {
+      "device": "cuda",
+      "geometry": "long",
+      "command": "env CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python scripts/benchmark_stage1_v5_attention_selection.py --device cuda:0 --profile long --warmup 3 --repetitions 20 --output results/stage1-v5-gpu-utilization-20261018/candidate-cuda-long.json",
+      "exit_code": 0,
+      "report": {
+        "path": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-long.json",
+        "sha256": "eba856be7122931e03369e19e05ed2eef6fea98cbc56dfeaa4967f8e358d034c",
+        "bytes": 7225359
+      },
+      "full_stdout_log": {
+        "path": "logs/stage1-v5-gpu-utilization-20261018/candidate-cuda-long.log",
+        "sha256": "eba856be7122931e03369e19e05ed2eef6fea98cbc56dfeaa4967f8e358d034c",
+        "bytes": 7225359
+      },
+      "source_identity": {
+        "baseline_commit": "65643f08cb6e61fbbb200de825d57086f5c7a127",
+        "candidate_commit": "7632cde6bb8892829d3b0c5678ea8a5c6fbd8f30",
+        "candidate_sha256": {
+          "v5_execution": "d18a3a41c74d741228442100a471ab208dce8e3c0912fc33361a79e26a4f0ad1",
+          "v5_selection": "a534cf7184c43575ca8fca610df0f14325ed221db3dceb1564b34802c891b43c",
+          "stage1_v5_trace": "c13d5007b40fa0892281fc9be7ec338d955375183712700fa41ce987ec641049",
+          "stage1_v5_replay": "27d42a8f03e9a547a01d7b4538bdd17409662bf74e2cee998da7eb9aba670797"
+        },
+        "candidate_paths": {
+          "v5_execution": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_execution.py",
+          "v5_selection": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_selection.py",
+          "stage1_v5_trace": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py",
+          "stage1_v5_replay": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py"
+        },
+        "benchmark_sha256": "a02177a75f6dbcfc04a9addbd54bff736cca8fbe58a549961b8961ee09396cc0",
+        "fixtures_sha256": "cddf312bee884ddc2eb977f611807ba2f3a1c28d76e620c65c7d88165c48b475"
+      },
+      "gpu_identity": {
+        "name": "NVIDIA H100 NVL",
+        "total_memory_bytes": 99949674496,
+        "capability": [
+          9,
+          0
+        ]
+      },
+      "packages": {
+        "torch": "2.7.1+cu128",
+        "transformers": "4.50.0.dev0",
+        "peft": "0.17.1",
+        "flash-attn": "2.8.3",
+        "deepspeed": "0.18.7"
+      },
+      "torch_runtime": "2.7.1+cu128",
+      "cuda_runtime": "12.8",
+      "python": "3.11.15",
+      "geometry_note": "Synthetic bounded geometry informed by audit T~16698 and 1-6 blocks; not an actual dataset sample or production maximum.",
+      "fixture_scope": {
+        "attention_fixture": {
+          "batch": 2,
+          "length": 8192,
+          "queries": 134,
+          "heads": 8,
+          "head_dim": 32,
+          "layers": 2,
+          "dtype": "bfloat16 projections, float32 observation",
+          "scope": "projection/hook fixture with fixed decoder callbacks; no model load"
+        },
+        "selection_fixture": {
+          "queries": 24,
+          "candidates_per_query": 512,
+          "full_row_length": 8192,
+          "vocab": 17,
+          "dtype": "float32",
+          "validation": false,
+          "input": "identical prebuilt compact candidate rows"
+        },
+        "replay_mask_fixture": {
+          "batch": 2,
+          "length": 8192,
+          "blocks": 6,
+          "rows": 12,
+          "mask_shape": [
+            12,
+            1,
+            96,
+            6240
+          ],
+          "suffix_lengths": [
+            96,
+            80,
+            64,
+            48,
+            32,
+            16
+          ],
+          "dtype": "float32",
+          "validation": false,
+          "scope": "actual packed replay bias, prefix concatenation, binding, dummy decoder callback and identity head; no attention/model forward"
+        },
+        "dropout_fixture": {
+          "source_lengths": [
+            8192,
+            8179
+          ],
+          "hidden_size": 64,
+          "native_shape": [
+            2,
+            8192,
+            64
+          ],
+          "packed_shape": [
+            2056,
+            64
+          ],
+          "probability": 0.05,
+          "sites": 1,
+          "checkpoint": "non-reentrant early-stop",
+          "dtype": "float32",
+          "validation": false,
+          "scope": "actual private-generator F/packed dropout, checkpoint recomputation and backward; includes owner/checkpoint/sin/reduction/output-detach overhead; no train step"
+        }
+      },
+      "equality": {
+        "attention_exact_equal": true,
+        "attention_close": true,
+        "joint_selected_keys_exact_equal": true,
+        "selected_keys_exact_equal": true,
+        "mask_exact_equal": true,
+        "dropout_exact_equal": true,
+        "dropout_global_rng_unchanged": true
+      },
+      "attention_errors": {
+        "attention_max_absolute_error": 0.0,
+        "attention_max_relative_error": 0.0,
+        "attention_atol": 1e-07,
+        "attention_rtol": 1e-05
+      },
+      "operators": {
+        "attention": {
+          "before_median_ms": 25.758399500000003,
+          "after_median_ms": 12.085292500000001,
+          "change_percent": -53.08212957874188,
+          "before_memory": {
+            "baseline_allocated_bytes": 54699008,
+            "peak_allocated_bytes": 148251648,
+            "extra_peak_allocated_bytes": 93552640,
+            "peak_reserved_bytes": 169869312
+          },
+          "after_memory": {
+            "baseline_allocated_bytes": 54699008,
+            "peak_allocated_bytes": 155864064,
+            "extra_peak_allocated_bytes": 101165056,
+            "peak_reserved_bytes": 197132288
+          },
+          "before_operations": {
+            "key_float_copies": 4,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 298,
+            "stack_calls": 0,
+            "index_put_calls": 0,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 272,
+            "batched_matmul_calls": 268
+          },
+          "after_operations": {
+            "key_float_copies": 4,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 4,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 502,
+            "stack_calls": 12,
+            "index_put_calls": 0,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 100,
+            "batched_matmul_calls": 96
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-long.json :: attention_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "selection": {
+          "before_median_ms": 1.951376,
+          "after_median_ms": 1.8070735,
+          "change_percent": -7.394910053213732,
+          "before_memory": {
+            "baseline_allocated_bytes": 54699008,
+            "peak_allocated_bytes": 54768128,
+            "extra_peak_allocated_bytes": 69120,
+            "peak_reserved_bytes": 62914560
+          },
+          "after_memory": {
+            "baseline_allocated_bytes": 54699008,
+            "peak_allocated_bytes": 54870528,
+            "extra_peak_allocated_bytes": 171520,
+            "peak_reserved_bytes": 62914560
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 0,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 0,
+            "stack_calls": 1,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 1,
+            "tolist_elements": 12336,
+            "tolist_bytes": 49344,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.float32",
+                "elements": 12336,
+                "bytes": 49344
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 0,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 0,
+            "stack_calls": 1,
+            "index_put_calls": 2,
+            "stable_sort_calls": 24,
+            "integer_float_casts": 0,
+            "tolist_calls": 2,
+            "tolist_elements": 7392,
+            "tolist_bytes": 44256,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 3672,
+                "bytes": 29376
+              },
+              {
+                "dtype": "torch.float32",
+                "elements": 3720,
+                "bytes": 14880
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-long.json :: selection_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "replay_mask": {
+          "before_median_ms": 33.414273,
+          "after_median_ms": 1.596244,
+          "change_percent": -95.22286778467394,
+          "before_memory": {
+            "baseline_allocated_bytes": 54699008,
+            "peak_allocated_bytes": 107838976,
+            "extra_peak_allocated_bytes": 53139968,
+            "peak_reserved_bytes": 117440512
+          },
+          "after_memory": {
+            "baseline_allocated_bytes": 54699008,
+            "peak_allocated_bytes": 108063744,
+            "extra_peak_allocated_bytes": 53364736,
+            "peak_reserved_bytes": 117440512
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 1,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 340,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 5772,
+            "stack_calls": 1,
+            "index_put_calls": 336,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 2,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 6,
+            "random_draw_calls": 0,
+            "random_draw_elements": 0,
+            "select_calls": 4,
+            "stack_calls": 0,
+            "index_put_calls": 1,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 0,
+            "tolist_calls": 0,
+            "tolist_elements": 0,
+            "tolist_bytes": 0,
+            "tolist_transfers": [],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-long.json :: replay_mask_{before,after}.milliseconds (all20rawtimes preserved)"
+        },
+        "dropout": {
+          "before_median_ms": 45.1420165,
+          "after_median_ms": 2.4281575,
+          "change_percent": -94.62106992938607,
+          "before_memory": {
+            "baseline_allocated_bytes": 54699008,
+            "peak_allocated_bytes": 76724224,
+            "extra_peak_allocated_bytes": 22025216,
+            "peak_reserved_bytes": 85983232
+          },
+          "after_memory": {
+            "baseline_allocated_bytes": 54699008,
+            "peak_allocated_bytes": 76724224,
+            "extra_peak_allocated_bytes": 22025216,
+            "peak_reserved_bytes": 85983232
+          },
+          "before_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 4,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 8,
+            "random_draw_elements": 4190976,
+            "select_calls": 36854,
+            "stack_calls": 4,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 8,
+            "tolist_calls": 8,
+            "tolist_elements": 73708,
+            "tolist_bytes": 589664,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 16371,
+                "bytes": 130968
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 16371,
+                "bytes": 130968
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2056,
+                "bytes": 16448
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2056,
+                "bytes": 16448
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2056,
+                "bytes": 16448
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2056,
+                "bytes": 16448
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 16371,
+                "bytes": 130968
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 16371,
+                "bytes": 130968
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "after_operations": {
+            "key_float_copies": 0,
+            "arange_calls": 4,
+            "scalar_reads": 0,
+            "candidate_index_tensors": 2,
+            "random_draw_calls": 8,
+            "random_draw_elements": 4190976,
+            "select_calls": 0,
+            "stack_calls": 0,
+            "index_put_calls": 2,
+            "stable_sort_calls": 0,
+            "integer_float_casts": 8,
+            "tolist_calls": 4,
+            "tolist_elements": 8,
+            "tolist_bytes": 64,
+            "tolist_transfers": [
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              },
+              {
+                "dtype": "torch.int64",
+                "elements": 2,
+                "bytes": 16
+              }
+            ],
+            "matmul_calls": 0,
+            "batched_matmul_calls": 0
+          },
+          "raw_timing_reference": "results/stage1-v5-gpu-utilization-20261018/candidate-cuda-long.json :: dropout_{before,after}.milliseconds (all20rawtimes preserved)"
+        }
+      },
+      "restored_original_failure_boundary": {
+        "query": [
+          1,
+          8125
+        ],
+        "before": [
+          289,
+          1235
+        ],
+        "after": [
+          289,
+          1235
+        ]
+      }
+    }
+  ],
+  "self_review": {
+    "code": "No runtime/test/benchmark source edits on resume. Existing actual module hashes/profile/admission tests reconcile to repaired source. Objective schema2/formula/coefficients, query semantics, sampler and rank behavior unchanged; historical files not migrated or rewritten.",
+    "numerics": "All four reports have exact ordered joint keys, direct selector keys, replay mask, dropout outputs/gradients/raw masks and unchanged RNG flags. CPU both/long CUDA attention bitwise; default CUDA attention close with maxabs4.656612873077393e-10 and exact selected tuples. Restored long cumulative_equal first query[289,1235].",
+    "performance": "Report each operator separately; do not average away CPU long attention+9.735282701998727% or CUDA default selection+52.2396337351678%. Preserve memory increases including long CUDA attention extra93,552,640->101,165,056bytes and reserved169,869,312->197,132,288bytes.",
+    "artifacts": "Original failure records and baseline/task2/task3 artifacts preserved. All4 complete JSON reports equal their complete stdout logs; current module/benchmark/fixture hashes, exactness cases, timing arrays, medians and paired order validated. Data/venv/checkpoint symlinks preserved; only metadata results and logs created."
+  },
+  "limitations": [
+    "Local synthetic bounded operator fixtures only; T8192/six replay blocks informed by audit T~16698/one-to-six blocks, not a production maximum or actual sample.",
+    "A32MiB score/probability workspace target is not total VRAM or actual extra-peak bound.",
+    "No production model loading, production BF16 training equivalence, multi-node training/evaluation, two-node speedup, bottleneck attribution or GPU utilization fix established.",
+    "Single20repetition paired measurement set per profile/device; no end-to-end aggregate or future-input exact-selection guarantee.",
+    "Root independent SPEC/QUALITY/final review and fresh full-suite verification/finish remain required."
+  ]
+}
