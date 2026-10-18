@@ -272,7 +272,7 @@ def test_original_sidecars_preserve_historical_absence_and_explicit_false_equiva
         summary_json=tmp_path/'summary.json')['success']==4
 
 
-@pytest.mark.parametrize('protocol,flags', [('continuous',['--static-inference-cache']),
+@pytest.mark.parametrize('protocol,flags', [
     ('original',['--static-inference-cache','--use-kv-cache']),
     ('original',['--static-inference-cache','--disable-latent-generation'])])
 def test_global_invalid_static_combinations_reject_before_sample_loop(tmp_path,monkeypatch,protocol,flags):
@@ -291,6 +291,31 @@ def test_global_invalid_static_combinations_reject_before_sample_loop(tmp_path,m
     with pytest.raises(ValueError,match='static inference cache|diagnostics require explicit continuous'):
         module.main()
     assert processor.conversations==[] and calls==[] and not output.exists()
+
+
+def test_continuous_invalid_static_option_stays_a_sample_error_and_failed_worker(tmp_path,monkeypatch):
+    from step_preference import capacity_evidence
+    from tests.stage2.helpers import tiny_stage2_qwen
+    module=importlib.import_module('eval')
+    model=tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage='stage1'
+    processor=NativeProcessor()
+    dataset=tmp_path/'test.jsonl'; dataset.write_text('{}\n')
+    output=tmp_path/'worker.jsonl'
+    monkeypatch.setattr(module,'load_evaluation_artifacts',lambda **kwargs:(model,processor))
+    monkeypatch.setattr(module,'publish_evaluation_runtime_identity',lambda *args,**kwargs:None)
+    monkeypatch.setattr(capacity_evidence,'git_identity',lambda:'a'*40)
+    argv=arguments(dataset,output,tmp_path/'runtime.json')
+    argv[argv.index('--evaluation-protocol')+1]='continuous'
+    argv[argv.index('--generation-limit-policy')+1]='bounded'
+    monkeypatch.setattr(sys,'argv',argv+['--static-inference-cache'])
+    assert module.main()==1
+    row,summary=[json.loads(line) for line in output.read_text().splitlines()]
+    assert row['index']==0 and row['match'] is False
+    assert row['error']=='static inference cache requires Stage 1 OFF with KV cache'
+    assert row['inference_time_sec'] is None
+    assert summary['num_samples']==1 and summary['success']==0
+    assert processor.conversations==[]
 
 
 def test_coordinator_cli_rejects_static_continuous_with_usage_error():

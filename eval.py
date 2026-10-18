@@ -581,10 +581,11 @@ def main():
     )
     protocol = resolve_protocol(args.evaluation_protocol, resolve_qwen2_5_vl_model(model).config.stage) if hasattr(args,"evaluation_protocol") else "continuous"
     args.repetition_penalty, args.generation_limit_policy = resolve_options(protocol,args.repetition_penalty,getattr(args,"generation_limit_policy",None))
-    validate_inference_options(protocol, resolve_qwen2_5_vl_model(model).config.stage,
-        disable_latent_generation=getattr(args,"disable_latent_generation",False),
-        use_kv_cache=getattr(args,"use_kv_cache",False),
-        static_inference_cache=getattr(args,"static_inference_cache",False))
+    if protocol == "original":
+        validate_inference_options(protocol, resolve_qwen2_5_vl_model(model).config.stage,
+            disable_latent_generation=getattr(args,"disable_latent_generation",False),
+            use_kv_cache=getattr(args,"use_kv_cache",False),
+            static_inference_cache=getattr(args,"static_inference_cache",False))
 
     # Load test data
     data = []
