@@ -145,3 +145,9 @@ untracked src __pycache__ directories, first asserting every entry was a
 regular .pyc file. No product source, checkpoints, user files, worktree or
 skill records were deleted. The only committed post-review changes are
 controller workflow/plan/verification evidence.
+
+The subsequent publication attempt failed for lack of original-repository
+write access. The user then explicitly instructed `Push는 생략해라`:
+publication is now skipped and the local branch/worktree are preserved.
+The previous pending integration/destination choice is resolved by that
+instruction; no remote action or further approval remains required.

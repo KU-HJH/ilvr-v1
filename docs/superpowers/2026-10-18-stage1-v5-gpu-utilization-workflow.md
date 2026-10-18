@@ -775,3 +775,17 @@ pending the target answer or original-repository write access. Product/test
 bytes still match reviewed3e51bf79 and the fresh range whitespace check is
 green. This authorization issue does not require repeating implementation
 reviews or the already green project suite.
+
+## User-directed local completion
+
+The user subsequently instructed `Push는 생략해라`. This supersedes the
+publication request and resolves the pending destination question: skip push
+and PR publication, preserve the existing local branch and host-managed
+worktree as-is. Do not retry remote publication, create a fork or request
+repository access. The prior permission failure and prepared PR body remain
+historical evidence, not pending work or a current blocker.
+
+Implementation, independent reviews and full-suite verification remain
+complete under their recorded scope. This handoff update changes controller
+documentation only; no runtime/test changes or repeated suite are needed.
+Finishing disposition is local preservation on the user's explicit direction.
