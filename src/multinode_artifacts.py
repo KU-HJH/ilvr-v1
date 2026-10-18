@@ -2076,6 +2076,7 @@ def validate_evaluation_sidecars(
     expected_model_identity: str,
     expected_sample_count: int,
     expected_generation_config: Mapping[str, object],
+    expected_evaluation_protocol: str | None = None,
 ) -> None:
     """Require four successful Task 7 sidecars before invoking its merger."""
     from src.multinode_runtime import _read_regular_file
@@ -2091,9 +2092,13 @@ def validate_evaluation_sidecars(
         _validate_generation_config,
     )
 
+    from evaluation.protocol import validate_execution_identity
     common_dataset_identity: object | None = None
+    common_execution_identity = None
+    execution_initialized = False
+    require_penalty = "repetition_penalty" in expected_generation_config
     generation_config = _validate_generation_config(
-        dict(expected_generation_config), include_default_vision_ablation=True
+        dict(expected_generation_config), include_default_vision_ablation=True, require_repetition_penalty=require_penalty
     )
     required = {
         "schema_version",
@@ -2115,7 +2120,18 @@ def validate_evaluation_sidecars(
             payload = json.loads(_read_regular_file(manifest_path))
         except (OSError, UnicodeError, json.JSONDecodeError) as error:
             raise ValueError(f"invalid evaluation sidecar for shard {shard_index}") from error
-        if type(payload) is not dict or set(payload) != required:
+        identity = payload.get("execution_identity") if isinstance(payload,dict) else None
+        wanted = required | {"execution_identity"} if identity is not None else required
+        if identity is not None:
+            validate_execution_identity(identity)
+        if not execution_initialized:
+            common_execution_identity = identity
+            execution_initialized = True
+        elif common_execution_identity != identity:
+            raise ValueError("evaluation execution identity mismatch across sidecars")
+        if expected_evaluation_protocol is not None and (identity is None or identity["evaluation_protocol"] != expected_evaluation_protocol):
+            raise ValueError("evaluation execution identity does not match requested protocol")
+        if type(payload) is not dict or set(payload) != wanted:
             raise ValueError(f"invalid evaluation sidecar fields for shard {shard_index}")
         if (
             type(payload["schema_version"]) is not int
@@ -2133,12 +2149,10 @@ def validate_evaluation_sidecars(
             raise ValueError(f"sidecar JSONL mismatch for shard {shard_index}")
         if payload["model_identity"] != expected_model_identity:
             raise ValueError("model identity mismatch across evaluation sidecars")
-        if (
-            _validate_generation_config(
-                payload["generation_config"], include_default_vision_ablation=True
-            )
-            != generation_config
-        ):
+        observed_generation = _validate_generation_config(payload["generation_config"],include_default_vision_ablation=True)
+        if not require_penalty:
+            observed_generation.pop("repetition_penalty",None)
+        if observed_generation != generation_config:
             raise ValueError("generation config mismatch across evaluation sidecars")
         dataset = payload["dataset_identity"]
         if (

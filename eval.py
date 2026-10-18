@@ -63,6 +63,9 @@ from evaluation.continuous_latent import (
     build_continuous_generation_config,
 )
 from evaluation.runtime import prepare_evaluation_input
+from evaluation import original_scoring
+from evaluation.original_ilvr import (generate_original, load_original_model, execution_identity, config_resolution)
+from evaluation.protocol import resolve_protocol, resolve_options
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -130,11 +133,12 @@ def get_eval_args():
                         help="Hugging Face cache directory.")
     parser.add_argument("--max_new_tokens", type=int, default=4096)
     parser.add_argument("--max_sequence_length", type=int, default=32768)
-    parser.add_argument("--repetition_penalty", type=float, default=1.05)
+    parser.add_argument("--repetition_penalty", type=float, default=None)
+    parser.add_argument("--evaluation-protocol", choices=("auto", "original", "continuous"), default="auto")
     parser.add_argument(
         "--generation-limit-policy",
-        choices=("bounded", "external_full_latent_block"),
-        default="bounded",
+        choices=("native", "bounded", "external_full_latent_block"),
+        default=None,
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
@@ -170,8 +174,10 @@ def load_processor(model_dir: str, cache_dir: str):
         return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
 
 
-def load_model(model_dir: str, cache_dir: str):
-    """Load the fixed authenticated SDPA-language/FlashAttention2-vision pair."""
+def load_model(model_dir: str, cache_dir: str, *, evaluation_protocol="continuous"):
+    """Load the selected protocol's model and attention implementation."""
+    if evaluation_protocol == "original":
+        return load_original_model(model_dir, cache_dir)
     model = load_qwen2_5_vl_with_attention(
         model_dir,
         attention_implementation="sdpa",
@@ -200,10 +206,16 @@ def load_model(model_dir: str, cache_dir: str):
 
 
 def load_evaluation_artifacts(
-    *, model_dir: str, base_model_dir: str | None, cache_dir: str
+    *, model_dir: str, base_model_dir: str | None, cache_dir: str,
+    evaluation_protocol="continuous",
 ):
     """Load one full artifact or a validated Stage 1/2 PEFT artifact."""
     artifact_path = Path(model_dir)
+    if evaluation_protocol == "auto":
+        stage = "stage1" if (artifact_path / STAGE1_PEFT_METADATA_FILENAME).is_file() else AutoConfig.from_pretrained(model_dir, cache_dir=cache_dir).stage
+        evaluation_protocol = resolve_protocol(evaluation_protocol, stage)
+    def selected_loader(source, cache):
+        return load_model(source, cache, **({"evaluation_protocol": "original"} if evaluation_protocol == "original" else {}))
     if (
         artifact_path.is_dir()
         and (artifact_path / STAGE1_PEFT_METADATA_FILENAME).is_file()
@@ -217,17 +229,16 @@ def load_evaluation_artifacts(
             )
         processor = AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
         model = load_stage1_peft_artifact(
-            load_model(base_model_dir, cache_dir),
+            selected_loader(base_model_dir, cache_dir),
             processor,
             artifact_path,
             requested_base_model_reference=base_model_dir,
             is_trainable=False,
         )
-        validate_qwen2_5_vl_attention_backends(
-            resolve_qwen2_5_vl_model(model),
-            attention_implementation="sdpa",
-            vision_attention_implementation="flash_attention_2",
-        )
+        if evaluation_protocol != "original":
+            validate_qwen2_5_vl_attention_backends(
+                resolve_qwen2_5_vl_model(model), attention_implementation="sdpa",
+                vision_attention_implementation="flash_attention_2")
         model.eval()
         return model, processor
 
@@ -235,7 +246,7 @@ def load_evaluation_artifacts(
     if artifact_inspection.artifact_kind is Stage2ArtifactKind.FULL:
         if base_model_dir is not None:
             raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
-        return load_model(model_dir, cache_dir), load_processor(model_dir, cache_dir)
+        return selected_loader(model_dir, cache_dir), load_processor(model_dir, cache_dir)
 
     if base_model_dir is None:
         raise ValueError("base_model_dir is required for a Stage 2 PEFT artifact")
@@ -360,7 +371,7 @@ def run_one_example(
     sample: Dict[str, Any],
     gen_kwargs: Dict[str, Any],
     *, disable_latent_generation: bool = False, use_kv_cache: bool = False,
-    static_inference_cache: bool = False,
+    static_inference_cache: bool = False, evaluation_protocol: str = "continuous",
 ) -> Dict[str, Any]:
     """
     Run inference on a single example and return raw output,
@@ -400,6 +411,14 @@ def run_one_example(
         raise ValueError("checkpoint config must contain a positive latent_size")
     token_ids = resolve_latent_token_ids(processor.tokenizer, qwen_model.config)
     stage = getattr(qwen_model.config, "stage", None)
+    evaluation_protocol = resolve_protocol(evaluation_protocol, stage)
+    if evaluation_protocol == "original":
+        if disable_latent_generation or use_kv_cache or static_inference_cache:
+            raise ValueError("Stage 1 OFF/cache diagnostics require explicit continuous evaluation")
+        resolve_options("original", gen_kwargs.get("repetition_penalty"), gen_kwargs.get("generation_limit_policy"))
+        max_sequence_length = gen_kwargs.get("max_sequence_length")
+        if max_sequence_length is not None and input_ids.shape[1] + gen_kwargs["max_new_tokens"] > max_sequence_length:
+            raise ValueError("original evaluation exceeds the max_sequence_length resource guard")
     if type(use_kv_cache) is not bool:
         raise TypeError("use_kv_cache must be a boolean")
     if use_kv_cache and (stage != "stage1" or not disable_latent_generation):
@@ -410,7 +429,7 @@ def run_one_example(
         raise ValueError("static inference cache requires Stage 1 OFF with KV cache")
     if disable_latent_generation and stage != "stage1":
         raise ValueError("disable_latent_generation is a Stage 1 diagnostic only")
-    if stage == "stage1":
+    if stage == "stage1" and evaluation_protocol != "original":
         if not isinstance(qwen_model, ContinuousLatentModelProtocol):
             raise TypeError(
                 "Stage 1 evaluation model does not satisfy the continuous latent interface"
@@ -431,7 +450,7 @@ def run_one_example(
             tokenizer=processor.tokenizer,
             generation_kwargs=gen_kwargs,
         )
-    else:
+    elif evaluation_protocol != "original":
         raise ValueError(f"unsupported evaluation stage: {stage!r}")
 
     # ---- Start inference timing (generation only) ----
@@ -440,7 +459,10 @@ def run_one_example(
     start_time = time.perf_counter()
 
     with torch.inference_mode():
-        if stage == "stage1":
+        if evaluation_protocol == "original":
+            generation_result = generate_original(model, inputs, gen_kwargs, tokenizer=processor.tokenizer)
+            out_ids = generation_result.sequences
+        elif stage == "stage1":
             generation_result = ContinuousLatentController().generate(
                 model=qwen_model,
                 input_ids=input_ids,
@@ -478,16 +500,15 @@ def run_one_example(
         out_ids, skip_special_tokens=False
     )[0].strip()
     suffix_ids = out_ids[:, prepared.prompt_token_length:]
-    assistant_text = processor.batch_decode(
-        suffix_ids, skip_special_tokens=False
-    )[0].strip()
-
-    # Extract the answer from the assistant's segment only — running the
-    # regex over the full decoded text (prompt included) can match text in
-    # the user prompt and keeps trailing special tokens like <|im_end|>.
-    assistant_only = extract_assistant_content(assistant_text)
-    extracted = extract_final_answer(assistant_only).extracted
+    if evaluation_protocol == "original":
+        assistant_only = original_scoring.extract_assistant_content(out_text)
+        extracted = original_scoring.extract_final_answer(assistant_only)
+    else:
+        assistant_text = processor.batch_decode(suffix_ids, skip_special_tokens=False)[0].strip()
+        assistant_only = extract_assistant_content(assistant_text)
+        extracted = extract_final_answer(assistant_only).extracted
     return {
+        **({"evaluation_protocol":evaluation_protocol} if evaluation_protocol=="original" else {}),
         "prompt_identity": prepared.prompt_identity,
         "prompt_token_length": prepared.prompt_token_length,
         "generated_suffix_token_ids": [
@@ -503,7 +524,18 @@ def run_one_example(
     }
 
 
-def publish_evaluation_runtime_identity(model, model_dir, output_path):
+def publish_evaluation_runtime_identity(model, model_dir, output_path, *, evaluation_protocol="continuous", base_model_dir=None, generation_kwargs=None):
+    if evaluation_protocol == "original":
+        from step_preference.capacity_evidence import git_identity
+        qwen = resolve_qwen2_5_vl_model(model)
+        value = dict(schema_version=1, kind="original-ilvr-evaluation-runtime-identity", git_commit=git_identity(),
+            model_dir=str(Path(model_dir).resolve(strict=True)),
+            execution_identity=execution_identity(qwen,"original",generation_kwargs or {}),
+            config_resolution=config_resolution(model_dir,base_model_dir,qwen))
+        with Path(output_path).open("x",encoding="utf-8") as stream:
+            json.dump(value,stream,sort_keys=True,allow_nan=False)
+            stream.write("\n")
+        return Path(output_path)
     from step_preference.capacity_evidence import EvaluationRuntimeIdentity, publish_json, git_identity
     from stage2.attention_backend import validate_qwen2_5_vl_attention_backends
     qwen = resolve_qwen2_5_vl_model(model)
@@ -553,9 +585,10 @@ def main():
         model_dir=args.model_dir,
         base_model_dir=args.base_model_dir,
         cache_dir=args.cache_dir,
+        **({"evaluation_protocol": args.evaluation_protocol} if hasattr(args,"evaluation_protocol") else {}),
     )
-    if runtime_identity_path is not None:
-        publish_evaluation_runtime_identity(model, args.model_dir, runtime_identity_path)
+    protocol = resolve_protocol(args.evaluation_protocol, resolve_qwen2_5_vl_model(model).config.stage) if hasattr(args,"evaluation_protocol") else "continuous"
+    args.repetition_penalty, args.generation_limit_policy = resolve_options(protocol,args.repetition_penalty,getattr(args,"generation_limit_policy",None))
 
     # Load test data
     data = []
@@ -573,13 +606,17 @@ def main():
     gen_kwargs = dict(
         max_new_tokens=args.max_new_tokens,
         max_sequence_length=args.max_sequence_length,
-        repetition_penalty=args.repetition_penalty,
-        generation_limit_policy=getattr(args, "generation_limit_policy", "bounded"),
+        **({"repetition_penalty":args.repetition_penalty} if args.repetition_penalty is not None else {}),
+        generation_limit_policy=args.generation_limit_policy,
         temperature=args.temperature,
         top_p=args.top_p,
         do_sample=(args.temperature > 0),
     )
 
+    actual_identity = execution_identity(resolve_qwen2_5_vl_model(model),protocol,gen_kwargs) if hasattr(args,"evaluation_protocol") else None
+    if runtime_identity_path is not None:
+        publish_evaluation_runtime_identity(model,args.model_dir,runtime_identity_path,
+            **(dict(evaluation_protocol=protocol,base_model_dir=args.base_model_dir,generation_kwargs=gen_kwargs) if protocol=="original" else {}))
     total = len(data)
     owned_samples = (
         list(iter_owned_samples(data, args.num_shards, args.shard_index))
@@ -605,6 +642,7 @@ def main():
             )
             pred = run_one_example(
                 model, processor, evaluation_sample, gen_kwargs,
+                **({"evaluation_protocol":protocol} if hasattr(args,"evaluation_protocol") else {}),
                 **({"disable_latent_generation": True}
                    if getattr(args, "disable_latent_generation", False) else {}),
                 **({"use_kv_cache": True}
@@ -644,7 +682,8 @@ def main():
                 # Default zebra-cot branch
                 gold = sample.get("original_final_answer")
                 answer_score = score_answer(assistant_only, gold)
-                ok = answer_score.match
+                legacy_score = original_scoring.score_original(assistant_only,sample) if protocol == "original" else None
+                ok = legacy_score["match"] if legacy_score is not None else answer_score.match
                 if ok:
                     success += 1
 
@@ -676,6 +715,11 @@ def main():
                     "inference_time_sec": sample_infer_time,
                 })
 
+            if protocol == "original" and args.task_name != "vsp-spatial-planning-cot":
+                diagnostic_keys = ("prediction_parse_status","prediction_parse_detail","prediction_normalized","gold_parse_status","gold_parse_detail","gold_normalized","invalid_gold_reason")
+                results[-1]["corrected_scoring_diagnostic"] = {key:results[-1].pop(key) for key in diagnostic_keys}
+                results[-1]["corrected_scoring_diagnostic"]["match"] = answer_score.match
+                results[-1].update(legacy_score)
             progress = local_index + 1 if sharded else i + 1
             progress_total = worker_total if sharded else total
             if progress % 10 == 0 or progress == progress_total:
@@ -719,6 +763,8 @@ def main():
                     "stop_reason": None,
                     "match": False,
                 })
+            if protocol == "original":
+                error_result.pop("invalid_gold_reason",None)
             results.append(error_result)
 
     import hashlib
@@ -735,11 +781,13 @@ def main():
           or getattr(args, "model_identity", None) is not None) else {}
     for row in results:
         row.update(diagnostic_identity)
+        if actual_identity is not None:
+            row["evaluation_protocol"] = protocol
 
     metric_total = worker_total if sharded else total
     score_summary = (
         EvaluationScoreSummary.from_rows(results, metric_total)
-        if args.task_name != "vsp-spatial-planning-cot"
+        if args.task_name != "vsp-spatial-planning-cot" and protocol != "original"
         else None
     )
     acc = (
@@ -764,6 +812,8 @@ def main():
                 "accuracy": acc,
                 "success": success,
             }
+            if actual_identity is not None:
+                summary.update(evaluation_protocol=protocol,execution_identity=actual_identity)
             if score_summary is not None:
                 summary.update({
                     "correct": score_summary.correct,
@@ -787,7 +837,7 @@ def main():
             generation_config={
                 "max_new_tokens": args.max_new_tokens,
                 "max_sequence_length": args.max_sequence_length,
-                "repetition_penalty": args.repetition_penalty,
+                "repetition_penalty": actual_identity["generation_config"]["repetition_penalty"] if protocol=="original" else args.repetition_penalty,
                 "generation_limit_policy": getattr(
                     args, "generation_limit_policy", "bounded"
                 ),
@@ -801,6 +851,7 @@ def main():
                 **({"static_inference_cache": True}
                    if getattr(args, "static_inference_cache", False) else {}),
             },
+            **({"execution_identity":actual_identity} if actual_identity is not None else {}),
             shard_index=args.shard_index,
             num_shards=args.num_shards,
             expected_source_indices=[index for index, _sample in owned_samples],

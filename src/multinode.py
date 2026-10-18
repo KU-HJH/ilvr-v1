@@ -2482,11 +2482,12 @@ def _evaluate_main(argv: list[str]) -> int:
     parser.add_argument("--cache-dir", default=str(_REPOSITORY_ROOT / "cache"))
     parser.add_argument("--max-new-tokens", type=int, default=4096)
     parser.add_argument("--max-sequence-length", type=int, default=32768)
-    parser.add_argument("--repetition-penalty", type=float, default=1.05)
+    parser.add_argument("--repetition-penalty", type=float, default=None)
+    parser.add_argument("--evaluation-protocol",choices=("auto","original","continuous"),default="auto")
     parser.add_argument(
         "--generation-limit-policy",
-        choices=("bounded", "external_full_latent_block"),
-        default="bounded",
+        choices=("native", "bounded", "external_full_latent_block"),
+        default=None,
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-p", type=float, default=1.0)
@@ -2511,6 +2512,7 @@ def _evaluate_main(argv: list[str]) -> int:
             max_new_tokens=args.max_new_tokens,
             max_sequence_length=args.max_sequence_length,
             repetition_penalty=args.repetition_penalty,
+            evaluation_protocol=args.evaluation_protocol,
             generation_limit_policy=args.generation_limit_policy,
             temperature=args.temperature,
             top_p=args.top_p,

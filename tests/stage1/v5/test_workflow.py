@@ -33,9 +33,10 @@ def test_recipe_dry_run_overrides_sourced_stale_profile(tmp_path):
     assert Path(prepare[prepare.index('--destination')+1]).is_relative_to(ROOT/'checkpoints')
     assert evaluate[evaluate.index('--test-data-path')+1]==str(ROOT/'data/TEST.jsonl')
     for flag,value in [('--max-new-tokens','4096'),('--max-sequence-length','128000'),
-        ('--repetition-penalty','1'),('--temperature','0'),('--top-p','1'),
-        ('--generation-limit-policy','external_full_latent_block'),('--vision-ablation','none')]:
+        ('--evaluation-protocol','original'),('--temperature','0'),('--top-p','1'),
+        ('--generation-limit-policy','native'),('--vision-ablation','none')]:
         assert evaluate[evaluate.index(flag)+1]==value
+    assert '--repetition-penalty' not in evaluate
     assert evaluate[evaluate.index('--run-id')+1]=='v5-flow-test-test400'
 
 @pytest.mark.parametrize('query_mode', ['legacy', 'adaptive'])

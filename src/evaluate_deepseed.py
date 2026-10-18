@@ -79,6 +79,7 @@ def get_eval_args():
     )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--evaluation-protocol",choices=("auto","continuous"),default="continuous")
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--model-identity", type=str)
@@ -357,6 +358,11 @@ def main():
         vision_ablation=vision_ablation,
     )
 
+    if hasattr(args,"evaluation_protocol"):
+        from evaluation.original_ilvr import execution_identity
+        actual_identity = execution_identity(resolve_stage2_qwen_model(model),"continuous",gen_kwargs)
+    else:
+        actual_identity = None
     total = len(data)
     owned_samples = (
         list(iter_owned_samples(data, args.num_shards, args.shard_index))
@@ -506,6 +512,9 @@ def main():
         score_summary.coverage_accuracy if score_summary is not None
         else success / metric_total if metric_total > 0 else 0.0
     )
+    if actual_identity is not None:
+        for row in results:
+            row["evaluation_protocol"] = "continuous"
     with open(args.output_json_path, "w", encoding="utf-8") as fout:
         for r in results:
             fout.write(json.dumps(r, ensure_ascii=False) + "\n")
@@ -529,6 +538,7 @@ def main():
                 "top_p": args.top_p,
                 "vision_ablation": vision_ablation,
             },
+            **({"execution_identity":actual_identity} if actual_identity is not None else {}),
             shard_index=args.shard_index,
             num_shards=args.num_shards,
             expected_source_indices=[index for index, _sample in owned_samples],

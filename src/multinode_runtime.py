@@ -1173,8 +1173,9 @@ class EvaluationPlan:
     cache_dir: Path = _REPOSITORY_ROOT / "cache"
     max_new_tokens: int = 4096
     max_sequence_length: int = 32768
-    repetition_penalty: float = 1.05
-    generation_limit_policy: str = "bounded"
+    repetition_penalty: float | None = None
+    generation_limit_policy: str | None = None
+    evaluation_protocol: str = "auto"
     temperature: float = 0.0
     top_p: float = 1.0
     vision_ablation: str = "none"
@@ -1239,15 +1240,16 @@ class EvaluationPlan:
             or self.max_sequence_length <= 0
         ):
             raise ValueError("max_sequence_length must be positive")
-        if (
+        if self.repetition_penalty is not None and (
             type(self.repetition_penalty) not in (int, float)
             or not math.isfinite(self.repetition_penalty)
             or self.repetition_penalty <= 0
         ):
             raise ValueError("repetition_penalty must be finite and positive")
+        if self.evaluation_protocol not in ("auto","original","continuous"):
+            raise ValueError("invalid evaluation protocol")
         if self.generation_limit_policy not in (
-            "bounded",
-            "external_full_latent_block",
+            None, "native", "bounded", "external_full_latent_block",
         ):
             raise ValueError(
                 "generation_limit_policy must be bounded or "
@@ -1294,6 +1296,7 @@ class EvaluationCommands:
     remote_pull: tuple[str, ...]
     merged_jsonl: Path
     summary_json: Path
+    evaluation_protocol: str = "continuous"
 
 
 def build_evaluation_assignments(
@@ -1348,6 +1351,9 @@ def _build_evaluation_commands_for_stage(
 
     if stage not in ("stage1", "stage2"):
         raise ValueError("observed inference stage must be stage1 or stage2")
+    from evaluation.protocol import resolve_protocol, resolve_options
+    protocol = resolve_protocol(plan.evaluation_protocol,stage)
+    penalty, limit_policy = resolve_options(protocol,plan.repetition_penalty,plan.generation_limit_policy)
     if stage == "stage1" and plan.vision_ablation != "none":
         raise ValueError("vision ablation is only supported for Stage 2 evaluation")
     _require_digest("model_identity", model_identity.removeprefix("task6:"))
@@ -1384,11 +1390,13 @@ def _build_evaluation_commands_for_stage(
             "--cache_dir", str(_evaluation_node_path(plan, plan.cache_dir, remote=remote)),
             "--max_new_tokens", str(plan.max_new_tokens),
             "--max_sequence_length", str(plan.max_sequence_length),
-            "--repetition_penalty", str(plan.repetition_penalty),
-            "--generation-limit-policy", plan.generation_limit_policy,
+            "--evaluation-protocol", protocol,
+            "--generation-limit-policy", limit_policy,
             "--temperature", str(plan.temperature),
             "--top_p", str(plan.top_p),
         ]
+        if penalty is not None:
+            evaluator_command.extend(("--repetition_penalty",str(penalty)))
         if stage == 'stage1':
             evaluator_command.extend(('--runtime_identity_path', str(_evaluation_node_path(
                 plan, plan.output_dir / f'shard-{assignment.shard_index}.runtime-identity.json', remote=remote))))
@@ -1472,6 +1480,7 @@ def _build_evaluation_commands_for_stage(
         ),
         merged_jsonl=plan.output_dir / "merged.jsonl",
         summary_json=plan.output_dir / "summary.json",
+        evaluation_protocol=protocol,
     )
 
 
@@ -3244,6 +3253,8 @@ class EvaluationSubprocessRunner:
     def validate_sidecars(self, commands: EvaluationCommands) -> None:
         from src.multinode_artifacts import validate_evaluation_sidecars
 
+        from evaluation.protocol import resolve_options
+        penalty, policy = resolve_options(commands.evaluation_protocol,self.plan.repetition_penalty,self.plan.generation_limit_policy)
         validate_evaluation_sidecars(
             commands.shard_manifests,
             commands.shard_jsonls,
@@ -3252,12 +3263,13 @@ class EvaluationSubprocessRunner:
             expected_generation_config={
                 "max_new_tokens": self.plan.max_new_tokens,
                 "max_sequence_length": self.plan.max_sequence_length,
-                "repetition_penalty": self.plan.repetition_penalty,
-                "generation_limit_policy": self.plan.generation_limit_policy,
+                **({"repetition_penalty":penalty} if penalty is not None else {}),
+                "generation_limit_policy": policy,
                 "temperature": self.plan.temperature,
                 "top_p": self.plan.top_p,
                 "vision_ablation": self.plan.vision_ablation,
             },
+            expected_evaluation_protocol=commands.evaluation_protocol,
         )
 
     def _expected_sample_count(self) -> int:

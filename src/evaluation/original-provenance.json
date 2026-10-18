@@ -1,0 +1,151 @@
+{
+  "baseline_commit": "65643f08cb6e61fbbb200de825d57086f5c7a127",
+  "files": [
+    {
+      "adaptation": "none; oracle selects original functions by AST",
+      "pinned_path": "src/evaluation/original_source/original_eval.py.txt",
+      "pinned_sha256": "481a300d2ecc4c29b6a2a772a9d7cae4d3a339a1a3b1b6fc7e3dd7cb2d8bf904",
+      "upstream_path": "eval.py",
+      "upstream_sha256": "481a300d2ecc4c29b6a2a772a9d7cae4d3a339a1a3b1b6fc7e3dd7cb2d8bf904"
+    },
+    {
+      "adaptation": "none; template class copied literally into original_template.py",
+      "pinned_path": "src/evaluation/original_source/utils_deepseed.py.txt",
+      "pinned_sha256": "d45dc3339fe1ad02836f1eeb7fa1f5171d32ec499460fe51e922d172e9e0cf9f",
+      "upstream_path": "src/utils_deepseed.py",
+      "upstream_sha256": "d45dc3339fe1ad02836f1eeb7fa1f5171d32ec499460fe51e922d172e9e0cf9f"
+    },
+    {
+      "adaptation": "private GenerationMixin subclasses current GenerationMixin for PreTrainedModel MRO; all original methods override it",
+      "pinned_path": "transformers/src/transformers/generation/_ilvr_original_utils.py",
+      "pinned_sha256": "1204eeb4d995220e6599d600416daf50c488a1b1f6df41cc5583b157464a5266",
+      "upstream_path": "transformers/src/transformers/generation/utils.py",
+      "upstream_sha256": "acc203e30739d40abd36f96b93c8110369a9742717f4db050075387e3a241863"
+    },
+    {
+      "adaptation": "GenerationMixin import points to private original snapshot",
+      "pinned_path": "transformers/src/transformers/models/qwen2_5_vl/_ilvr_original_modeling.py",
+      "pinned_sha256": "02ac2196577993fa275b479c44f431e90f7c0fe01d67277dd1f731da701e43ab",
+      "upstream_path": "transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py",
+      "upstream_sha256": "7961e7841bb5aae550e42ccb13e2de8e4802057a0e8878baf5fe224f97e37002"
+    }
+  ],
+  "license": "Original Hugging Face/Qwen Apache-2.0 notices are retained verbatim in both Transformer snapshots. Original ILVR eval/utils source is preserved with source commit attribution; no additional license is asserted.",
+  "representation_extension": "Existing validated Stage1 PEFT loader restores unmerged DoRA, trainable input token rows, sparse output rows; original adapter resolution loads base config/generation_config, not artifact training config.",
+  "runtime_dependencies": "No original checkout, git, or Reference dependency. Oracle uses inverse-hash-checked pristine source and independent source classes/functions; shared support is listed above.",
+  "scoring": "Five functions from original eval.py are copied literally to original_scoring.py with original yes/no sets. score_original reproduces original main default branch.",
+  "shared_support": [
+    {
+      "path": "transformers/src/transformers/activations.py",
+      "sha256": "5e45852b518ed3fdfbff4d8a44dc934b74f6606670fd90f2fb6c486172f9792c",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/cache_utils.py",
+      "sha256": "234e05f0b75281c045ba0988ca787d66e9e12b748945afab373bb29c985e42c2",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/__init__.py",
+      "sha256": "375d5ff3943ef6410dc0ef53dd7de808d9fceb3dd9244cce485dd86baffe6d23",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/beam_constraints.py",
+      "sha256": "62df5db500115444ff59a0b6e928a5e3d0cef9bd987e8b3284fd91c7920b45e2",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/beam_search.py",
+      "sha256": "ac68ca36628f6bad4f382904879566667f6851aa8cdde209d635e1927ec23d85",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/candidate_generator.py",
+      "sha256": "8946ea955ab4faba53d79b83d049a2288c63628f25d6ad89471a4f5eaa202a2d",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/configuration_utils.py",
+      "sha256": "2d734564d3a3bf48ec9a80a8731aac3a5fac197e390da928e2fe0fba64357756",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/flax_logits_process.py",
+      "sha256": "c3959a597ae9e90983e1aa8b62b5e08eaa5bdb5ae93d5debccbfdeb49d510612",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/flax_utils.py",
+      "sha256": "25e9339518f231cce04dd6eddd52f823fc5e30edaece0cea1c9ed0c5a5b2c76d",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/logits_process.py",
+      "sha256": "4ebdfb12b33113c2dab2f76a68ce762253b2c16fdb3da9683e66ac6382831a06",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/stopping_criteria.py",
+      "sha256": "11be87834790e96b96ddef0f9ccf4e273e9b14d6102c00a02c85816b59b8c55d",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/streamers.py",
+      "sha256": "4e7d663f74dbea34d2a09c46d307fa0db7f44a81c2d79febff024b3982541a4c",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/tf_logits_process.py",
+      "sha256": "a8bb46f84043e1280ae90692600a70a5e809e05ae547eaca77117414c8e1006f",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/tf_utils.py",
+      "sha256": "0af8f35042420d394d6f0183d5fc0fd42484f7229b8ebaaa3ea10863f4bd7eac",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/generation/watermarking.py",
+      "sha256": "fa4d93a3453074285aee3cd401558629e26a4410a51f18e6064fc3ca4d937d35",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/modeling_attn_mask_utils.py",
+      "sha256": "1572a88d6b6b1c267707af0bbeb7ddf1ee1b7ab265df3e5447f7b799d525ebcf",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/modeling_outputs.py",
+      "sha256": "098a638a3a9934e55473e922c432c8fa3305aeef4c8690d0be79dc49fa74c1be",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/modeling_rope_utils.py",
+      "sha256": "2903ff7b796dc6b0b8b676298b8c380cc3194fe2151241dff93375678570bd34",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/modeling_utils.py",
+      "sha256": "8bec82c80f32d823ddf305fef56b76c1ebac783a271bee60933092555ff57d73",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/models/qwen2_5_vl/configuration_qwen2_5_vl.py",
+      "sha256": "29d1d73fbebc9efeb2795d9dd5550a74124c89c54c140be458e05055eada1b85",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/models/qwen2_5_vl/processing_qwen2_5_vl.py",
+      "sha256": "d4297cae8894860de8d4f903d45499de5844f33664b4a26f37ef705f4291b687",
+      "status": "byte-identical to original"
+    },
+    {
+      "path": "transformers/src/transformers/models/qwen2_vl/image_processing_qwen2_vl.py",
+      "sha256": "1c16ceffaa3e5b70192be8f4ec8d43bee326754bc5b9e3278f70cee9d3321887",
+      "status": "byte-identical to original"
+    }
+  ],
+  "source_commit": "13a67ed2ee975d6ca56b4e9eba18d68b352b166b",
+  "source_repository": "ILVR"
+}

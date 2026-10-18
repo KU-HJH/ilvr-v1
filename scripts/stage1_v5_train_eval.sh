@@ -80,8 +80,8 @@ prepare=("$python" -m src.multinode prepare-inference --stage stage1 --tuning-me
     --run-id "$run_id" --main-process-port "$port" "${roots[@]}" --checkpoint-step "$max_steps" --destination "$prepared")
 evaluate=("$python" -m src.multinode evaluate --run-id "$eval_id" "${roots[@]}" --model-dir "$prepared" --base-model-dir "$base"
     --test-data-path "$repo_root/data/TEST.jsonl" --task-name zebra-cot --cache-dir "$repo_root/data/cache" --output-dir "$repo_root/results/$eval_id"
-    --max-new-tokens 4096 --max-sequence-length 128000 --repetition-penalty 1 --temperature 0 --top-p 1
-    --vision-ablation none --generation-limit-policy external_full_latent_block)
+    --evaluation-protocol original --max-new-tokens 4096 --max-sequence-length 128000 --temperature 0 --top-p 1
+    --vision-ablation none --generation-limit-policy native)
 if [[ $dry_run == true ]]; then
     for name in train prepare evaluate; do declare -n command=$name; printf '%q ' "${command[@]}"; printf '\n'; done
     exit 0

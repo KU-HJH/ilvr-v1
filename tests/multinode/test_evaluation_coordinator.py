@@ -179,18 +179,17 @@ def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
         ]
         for worker in commands.workers
     } == {"32768"}
-    assert {
-        worker.node_spec.command[
-            worker.node_spec.command.index("--repetition_penalty") + 1
-        ]
-        for worker in commands.workers
-    } == {"1.05"}
+    if stage=="stage1":
+        assert all("--repetition_penalty" not in worker.node_spec.command for worker in commands.workers)
+    else:
+        assert {worker.node_spec.command[worker.node_spec.command.index("--repetition_penalty")+1]
+                for worker in commands.workers} == {"1.05"}
 
 
 def test_worker_commands_forward_external_generation_limit_policy():
     """Losing the coordinator option would silently restore bounded generation."""
     plan = dataclasses.replace(
-        _plan(), generation_limit_policy="external_full_latent_block"
+        _plan(), evaluation_protocol="continuous", generation_limit_policy="external_full_latent_block"
     )
 
     commands = build_evaluation_commands(
@@ -992,7 +991,7 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
         "shard-0.runtime-identity.json",
         "shard-1.runtime-identity.json",
     ]
-    for commands in payload["worker_commands_by_observed_stage"].values():
+    for stage,commands in payload["worker_commands_by_observed_stage"].items():
         for command in commands:
             if "--max_sequence_length" in command:
                 option = command.index("--max_sequence_length")
@@ -1002,8 +1001,10 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
             if "--repetition_penalty" in command:
                 option = command.index("--repetition_penalty")
                 assert command[option + 1] == "1.05"
-            else:
+            elif stage=="stage2":
                 assert "--repetition_penalty 1.05" in command[-1]
+            else:
+                assert "--repetition_penalty" not in command[-1]
 
 
 def test_vision_ablation_dry_run_keeps_stage2_commands_and_marks_stage1_unsupported(

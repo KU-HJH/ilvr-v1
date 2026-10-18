@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from evaluation.scoring import EvaluationScoreSummary
+from evaluation.protocol import validate_execution_identity
 
 
 NUM_EVALUATION_SHARDS = 4
@@ -247,7 +248,7 @@ def _validate_generation_config(
         raise ValueError("invalid generation config top_p")
     if vision_ablation not in ("none", "all", "interleaved"):
         raise ValueError("invalid generation config vision_ablation")
-    if generation_limit_policy not in ("bounded", "external_full_latent_block"):
+    if generation_limit_policy not in ("native", "bounded", "external_full_latent_block"):
         raise ValueError("invalid generation config generation_limit_policy")
     normalized = {
         "max_new_tokens": max_new_tokens,
@@ -283,6 +284,7 @@ def write_shard_manifest(
     expected_source_indices: Sequence[int],
     processed_source_indices: Sequence[int],
     worker_exit_status: int,
+    execution_identity: Mapping[str, Any] | None = None,
 ) -> Path:
     manifest_path = Path(manifest_path)
     shard_jsonl = Path(shard_jsonl)
@@ -324,6 +326,8 @@ def write_shard_manifest(
         "worker_exit_status": worker_exit_status,
         "successful": worker_exit_status == 0,
     }
+    if execution_identity is not None:
+        manifest["execution_identity"] = validate_execution_identity(dict(execution_identity))
     with manifest_path.open("x", encoding="utf-8") as stream:
         stream.write(json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n")
     return manifest_path
@@ -368,6 +372,9 @@ def _validate_manifest(
         required_fields.add("generation_config")
     elif schema_version != LEGACY_MANIFEST_SCHEMA_VERSION:
         raise ValueError(f"unsupported shard manifest schema in {path}")
+    if "execution_identity" in manifest:
+        required_fields.add("execution_identity")
+        validate_execution_identity(manifest["execution_identity"])
     if set(manifest) != required_fields:
         raise ValueError(f"invalid shard manifest fields in {path}")
     if manifest["num_shards"] != NUM_EVALUATION_SHARDS or not _is_int(
@@ -539,10 +546,18 @@ def merge_shards(
     common_model_identity = None
     common_generation_config = None
     generation_config_initialized = False
+    common_execution_identity = None
+    execution_identity_initialized = False
     for manifest_path in manifest_paths:
         manifest, jsonl_path = _validate_manifest(
             manifest_path, expected_sample_count
         )
+        identity = manifest.get("execution_identity")
+        if not execution_identity_initialized:
+            common_execution_identity = identity
+            execution_identity_initialized = True
+        elif identity != common_execution_identity:
+            raise ValueError("evaluation execution identity mismatch across shards")
         shard_index = manifest["shard_index"]
         if shard_index in manifests:
             raise ValueError(f"duplicate shard index {shard_index}")
@@ -577,6 +592,11 @@ def merge_shards(
         rows = _read_shard_rows(jsonl_path)
         actual_indices = []
         for row in rows:
+            identity=manifest.get("execution_identity")
+            if identity is not None and row.get("evaluation_protocol") != identity["evaluation_protocol"]:
+                raise ValueError("evaluation execution identity mismatch between row and manifest")
+            if identity is None and row.get("evaluation_protocol","continuous") != "continuous":
+                raise ValueError("original protocol requires explicit evaluation execution identity")
             row_cache = row.get("use_kv_cache", False)
             manifest_cache = (manifest.get("generation_config") or {}).get("use_kv_cache", False)
             if type(row_cache) is not bool or row_cache != manifest_cache:
@@ -619,10 +639,9 @@ def merge_shards(
         ]:
             raise ValueError(f"processed indices incomplete for shard {shard_index}")
     rows = [rows_by_index[index] for index in range(expected_sample_count)]
-    score_summary = EvaluationScoreSummary.from_rows(
-        rows, expected_sample_count
-    )
-    successes = score_summary.correct
+    original = (common_execution_identity or {}).get("evaluation_protocol") == "original"
+    score_summary = None if original else EvaluationScoreSummary.from_rows(rows, expected_sample_count)
+    successes = sum(bool(row.get("match")) for row in rows) if original else score_summary.correct
     inference_times = [
         row.get("inference_time_sec")
         for row in rows
@@ -640,16 +659,22 @@ def merge_shards(
             else 0.0
         ),
         "total_inference_time_sec": total_inference_time,
-        "accuracy": score_summary.coverage_accuracy,
+        "accuracy": successes / expected_sample_count if expected_sample_count else 0.0,
         "success": successes,
-        "correct": score_summary.correct,
-        "source_count": score_summary.source_count,
-        "valid_gold_count": score_summary.valid_gold_count,
-        "invalid_gold_count": score_summary.invalid_gold_count,
-        "invalid_gold": score_summary.invalid_gold,
-        "coverage_accuracy": score_summary.coverage_accuracy,
-        "valid_gold_accuracy": score_summary.valid_gold_accuracy,
     }
+    if score_summary is not None:
+        summary.update({
+            "correct": score_summary.correct,
+            "source_count": score_summary.source_count,
+            "valid_gold_count": score_summary.valid_gold_count,
+            "invalid_gold_count": score_summary.invalid_gold_count,
+            "invalid_gold": score_summary.invalid_gold,
+            "coverage_accuracy": score_summary.coverage_accuracy,
+            "valid_gold_accuracy": score_summary.valid_gold_accuracy,
+        })
+    if common_execution_identity is not None:
+        summary["execution_identity"] = common_execution_identity
+        summary["evaluation_protocol"] = common_execution_identity["evaluation_protocol"]
     if common_generation_config is not None:
         summary["generation_config"] = common_generation_config
     _publish_outputs(rows, summary, Path(output_jsonl), Path(summary_json))

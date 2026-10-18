@@ -420,8 +420,8 @@ def test_eval_cli_defaults_to_legacy_single_worker_mode(module_name, monkeypatch
     assert args.model_identity is None
     assert args.max_new_tokens == 4096
     assert args.max_sequence_length == 32768
-    assert args.repetition_penalty == 1.05
-    assert args.generation_limit_policy == "bounded"
+    assert args.repetition_penalty == (None if module_name=="eval" else 1.05)
+    assert args.generation_limit_policy == (None if module_name=="eval" else "bounded")
 
 
 def _run_main_with_fake_sample(
