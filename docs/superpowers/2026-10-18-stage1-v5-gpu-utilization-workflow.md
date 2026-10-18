@@ -465,3 +465,139 @@ CPU selector/joint/chunk tests30pass/3skip reproduced exact keys/maxerror/chunks
 Task3 review gates closed; Task4 may proceed. Reviewer command requested for
 the durable record without another run. No final performance claim from the
 one-repetition CPU acceptance report.
+
+Task3 quality review command (exit0,30pass/3skip/131deselected,3.32s), stdout
+captured in tool transcript6787e5 without a separate log:
+
+```bash
+env CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s -p no:cacheprovider tests/stage1/v5/test_gpu_utilization.py -k 'selector_ordered or selector_transfers or joint_attention or attention_dispatches' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-quality-review
+```
+
+## Task 4 active implementation
+
+Fresh implementer `/root/gpu_util_t4_impl`, base
+ffec431b6abac35e470667a2e9d0a049b91c43c6, received full identity/admission/
+actual-train-dispatch TDD requirements and final paired CPU/CUDA default/long
+measurement task. Exact source keys/profile/policy are fixed in the plan;
+actual module files must be hashed, not decorator-wrapper files. Historical
+read-only parsing stays distinct from strict new runtime resume. Existing
+operator algorithms, losses, sampler, rank allocation and training artifacts
+are outside this task's changes. No new training is authorized.
+
+## Task4 exactness failure and stopped progression
+
+Task4 implementer parked WIP commitb3e13a4abcc237e10c397eb076be8bd3b79a9f55
+at the first real long-profile exact-selection failure. It includes runtime
+identity/admission/resume and long-geometry controls/tests, not operator
+algorithm changes. Root control edits were excluded. Source/profile causal
+REDs precede code; current focused result is266pass/88skip/1fail,exit1,19.02s.
+Exactness is red; Task4, final review, full-suite finishing and performance
+completion have NOT passed. No final CPU/CUDA measurements or training ran.
+
+Failure: CPU B2/T8192/H8/D32/L2/Q67per sample/candidates2048 per query,
+chunks32/32/3. Ten failed case/query pairs: nine adjacent-order mismatches
+across three queries, and cumulative_equal at(1,8125) changed the selected
+set from[289,1235] to[289,1235,2493]. This is not accepted floating drift.
+Both query-GEMM and head-reduction shapes differ; the existing trace alone
+does not localize the earliest numerical difference. Do not assume a cause
+from method names or reclassify set differences as harmless ordering.
+
+Committed task evidence:
+`results/stage1-v5-gpu-utilization-20261018/task4-evidence.json`, SHA256
+be033964bab41b85ae1b2e82470cb5c8c3fcae5448894be4e4aea1ec970a0875;
+full failure and parsed diagnosis `task4-cpu-long-discrete-failure.json`, SHA256
+cdb66d95c382c13e71db07958d855a2f2bbed248af8ea4b84190858d3ba4a27e.
+Raw t4-green.log preserved, SHA256
+768f485b123e75e8c7f6606f8fd73d84c653f4a15def53f2eb11513640a890dc.
+Root inspected actual failure, summary/source hashes and actual runtime diff.
+The original Task3 passes remain scoped historical evidence, not clean
+approval over this newly falsified long-input claim.
+
+User informed of failed selected set and stopped integration/measurements.
+Root routed a single narrow causal diagnosis to original implementer
+`/root/gpu_util_t3_impl`, with Task4 parked. First localize scores versus
+softmax/head/layer reduction and compare the unchanged selector on the same
+changed rows. No production fix until a concrete numerical repair is
+adjudicated. Keep geometry/tolerance/seed/thresholds/oracles unchanged.
+Assess whether original matrix-vector arithmetic can be retained within the
+approved bounded query chunks and memory, without large K duplication,
+fallback, quantization, global backend changes or new framework. A routine
+internal correction may proceed under the existing approval; if it requires
+a material architecture change, return to the design gate. No silent drop of
+the attention path or weakening of exact selection is authorized.
+
+## Narrow numerical diagnosis and authorized correction
+
+Original implementer `/root/gpu_util_t3_impl` reproduced the exact recorded
+long failure under CPU. Actual old/new Q and K are bitwise equal; earliest
+observed difference is raw batched dot score (up to9.5367431640625e-7), before
+softmax/head/layer accumulation. Both selectors agree on identical changed
+rows across all seven configs. Thus the selector is not canceling a trace
+error. Diagnosis/evidence JSONs and two logs are preserved under the existing
+results/logs tree. First observer-only diagnostic attempt failed because the
+observer returned an expanded result; corrected observer-only run passed1test.
+Neither changed production code or thresholds.
+
+The one assessed repair retains query chunks32/32/3 and batches independent
+M=1 matrix-vector products per head with zero-stride K views, then stacks
+heads. CPU test-only probe restored bitwise-equal candidate rows at all134
+long queries and exact seven-config selections, maxrowerror0. This is finite
+CPU evidence; CUDA behavior/performance is not inferred from it.
+
+Root adjudication: replacing only the dot expression this way stays within
+approved per-sample/layer bounded query chunks, same heads, native math,
+memory target and exact discrete policy. It introduces no fallback, K repeat,
+backend, formula, input or scope change. Root authorized the original
+implementer to apply this narrow corrective change under existing approval,
+using the preserved long case as causal RED and fresh CPU/CUDA gates. The
+plan's kernel-count witness must reflect heads*chunks/M=1 operands instead of
+the failed single all-head GEMM assumption; no functional test is relaxed.
+Independent spec and quality fix re-review remain required. Task4 stays
+parked; final performance/full-suite/finishing remain unpassed.
+
+## Numerical correction implementation and fix review
+
+Original implementer `/root/gpu_util_t3_impl` committed the narrow correction
+at4440fe78b72b71303ab30f29b1b73aa11183c1f2, based onb3e13a4. Root inspected
+the exact production diff: only the trace score construction changes to
+per-head M=1 BMM with expanded K views. Root verified the evidence digest
+`2ce0a9216a4123605e356c7ae7bb3b6fdde6655a0337c752679820ba0242116d`
+for `results/stage1-v5-gpu-utilization-20261018/task3-numerical-repair-evidence.json`.
+That artifact records commands, exits, source/log/report hashes, diagnosis,
+RED/GREEN, unchanged oracles and finite-case numerical limits. Root control
+edits were excluded from the implementation commit.
+
+Additional causal RED: five failures/one pass/two skips before the production
+repair, exposing M>1 operands and the same long discrete mismatch. After
+repair, early CPU10pass/5skip and idle-checked CUDA10pass. Native CPU focused
+integration95pass/2skip includes the previously failing default/long benchmark
+acceptance and the unchanged loss/gradient oracle/checkpoint modes. Long
+CPU/CUDA rows and seven-config tuples match exactly; `(1,8125)` is restored
+to[289,1235]. CUDA default rows are close rather than bitwise, max absolute
+error4.656612873077393e-10, with all tested ordered tuples exact. No final
+timing, actual peak-memory or distributed/BF16-equivalence claim is made.
+
+Independent fix spec reviewer `/root/gpu_util_t3_spec`: SPEC PASS over
+b3e13a4..4440fe7. It independently checked every recorded source/log/report
+hash and unchanged failure artifact, fully parsed diagnostic and acceptance
+JSON plus the7,746,141-byte native log, and inspected the remaining text.
+It verified M=1, head*chunk dispatch, remainders, one current-sample FP32 K
+copy/storage alias, unchanged subsequent arithmetic and the restored causal
+boundary. No missing requirements or unauthorized changes. QUALITY fix
+re-review has been dispatched to `/root/gpu_util_t3_quality` after SPEC PASS;
+Task4 remains parked until that gate closes. Fresh final verification and
+whole-change review are still pending.
+
+Independent fix quality reviewer `/root/gpu_util_t3_quality`: QUALITY PASS
+at4440fe7; no Critical/Important/Minor findings. It traced actual memory
+lifetimes and current-sample K alias, checked source/oracle/report/log hashes,
+fully parsed the native log and reran the narrow CPU dispatch/long/default
+regressions:6pass/164deselected, exit0, stdout tool chunkdbed42. Exact command:
+
+```bash
+env CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s -p no:cacheprovider tests/stage1/v5/test_gpu_utilization.py -k 'attention_dispatches or (joint_matrix_vector and cpu)' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-repair-quality-review
+```
+
+The original numerical failure is resolved for the checked cases and both
+fix-review gates close. Resume the same parked Task4 implementer; no new
+scope approval, input/tolerance change or training launch is involved.

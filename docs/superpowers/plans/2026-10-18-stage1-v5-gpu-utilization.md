@@ -196,10 +196,16 @@ tests GREEN before proceeding to attention.
 ```python
 positions = torch.tensor([key[1] for key, _ in queries_chunk],
                          device=q.device, dtype=torch.long)
-scores = q[row].index_select(1, positions).float() @ sample_k
+q_chunk = q[row].index_select(1, positions).float()
+scores = torch.stack([
+    torch.bmm(q_chunk[head, :, None, :],
+              sample_k[head][None].expand(q_chunk.shape[1], -1, -1)).squeeze(1)
+    for head in range(q_chunk.shape[0])
+])
 visible = (coordinates[None] <= positions[:, None]) & sample_padding[row][None]
-weights = (scores * attn.scaling).masked_fill(~visible[None],
+weights = scores.mul_(attn.scaling).masked_fill_(~visible[None],
              float('-inf')).softmax(-1).mean(0)
+del scores, visible, q_chunk
 for index, (key, candidates) in enumerate(queries_chunk):
     values = weights[index, candidate_indices[candidates]] / len(decoder.layers)
     trace.attention_rows[key] = trace.attention_rows.get(key, 0) + values
@@ -210,6 +216,19 @@ layer accumulation. This bounds transient score/probability tensors, not total
 VRAM. Do not truncate causal denominator. Any exact selected-key mismatch
 must be reported immediately with the input and error; stop this activation
 and contact root. Never loosen tolerance or silently adopt a partial scope.
+
+Correction after the Task4 long-input regression: the initial multirow GEMM
+inside each chunk perturbed raw dots and changed a selected set. The replacement
+above retains M=1 matrix-vector products and groups independent queries per
+head using zero-stride K views. The unchanged long8192 failing test is the
+causal RED; a test-only CPU diagnostic restored bitwise rows before production
+edits. Actual kernel-call expectations now scale with heads*query chunks,
+rather than assuming a single all-head multirow GEMM per chunk. Keep a causal
+dispatch bound and operand-shape/K-view assertions; exact token comparisons,
+thresholds, chunk32/workspace33554432 and full input coverage are unchanged.
+This is a routine internal arithmetic repair within the approved chunked
+architecture, not a scope or numerical-policy change. Fix requires independent
+spec then quality re-review before Task4 resumes.
 
 - [x] **5. Run CPU GREEN and one idle CUDA joint operator comparison**, including boundary cases, before accepting attention. Run `test_gpu_utilization.py test_throughput_attention.py test_selection.py test_execution.py test_replay.py test_trainer.py`. CPU-only model integration uses current tiny fixtures and existing FP32 gradient tolerances. Benchmark report must include both attention closeness and joint exact selected keys; no production-BF16 equivalence claim.
 - [x] **6. Self-review and commit.** Report exact discrete results, maximum floating error, policy bounds, relevant operator counts and logs. Root obtains sequential spec and quality review.
