@@ -368,3 +368,40 @@ issues; independently checked all four source bytes, JSON/full-log identity,
 script/fixture hashes, paired order/medians/memory arithmetic and equality/RNG
 flags. No GPU or test rerun. Task1 is complete; Task2 may start. Final quality
 response and any minor observations will be retained when received.
+
+Task1 final quality response confirmed no Minor corrections either; all task
+reviews closed. Control record commit43d71f3 precedes Task2.
+
+## Task 2 implementation and review evidence
+
+Implementer `/root/gpu_util_t2_impl`, base43d71f37872ad0294e0bd465fd0b2a167c1ff31a,
+headb15fa466c3fc69d5b371788e6af531e556cb22bd. Root inspected the production
+diff, read the complete causal RED and implementation-evidence JSON, confirmed
+HEAD and clean status, and read focused GREEN's final result. Actual evidence,
+commands/exits, content/log hashes, dispatch counts and caveats are committed
+in `results/stage1-v5-gpu-utilization-20261018/task2-implementation-evidence.json`.
+Raw fixed CUDA fixture report is `task2-operators-cuda.json` in the same tree.
+
+RED task2-red.log:43pass/30CUDA-skip/2expected operation-count failures, exit1,
+before production edits. GREEN task2-green.log:75pass/30CUDA-skip, exit0,
+existing native loss/gradients and checkpoint off/full/early unchanged at
+ATOL1e-5/RTOL1e-4. Actual dispatch growth with suffix/token count is removed:
+replay select/copy230/32->3/0 at suffix32; dropout select/stack256/1->0/0,
+ordinary host list elements512->3 at256requested tokens/3sources.
+
+Freshly idle-checked CUDA operator benchmark exit0, warmup3/paired20:
+mask6.885023->0.955306ms, dropout4.471019->2.1165875ms. Exact mask/raw dropout/
+outputs/gradients and global CPU/CUDA RNG agree on that fixed fixture.
+Mask extra allocated peak1115648->1129472B; dropout1414144B unchanged.
+Native model integration remains CPU; CUDA edge parametrizations were skipped.
+Do not infer production BF16 or distributed-throughput equivalence.
+
+Independent spec reviewer `/root/gpu_util_t2_spec`: SPEC PASS atb15fa466;
+actual source/paths, padding/escape/body/branch/gradient semantics, complete
+RED/GREEN, source656 bytes and recorded CUDA identities checked. No gaps or
+extras. Quality reviewer `/root/gpu_util_t2_quality`: QUALITY PASS atb15fa46,
+no Critical/Important/Minor issues. It traced actual Trainer->replay->native
+checkpoint/dropout and prefix gradients; independently ran CPU mask/dropout/
+dispatch cases38pass/30CUDA-skip/7deselected and checked complete logs/hashes.
+Task2 review gates closed; Task3 may proceed. Exact reviewer command requested
+for this record without rerunning the test.

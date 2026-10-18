@@ -109,7 +109,7 @@ do not load production weights or save model-bearing artifacts.
 
 **Files:** Modify replay/execution; add test_gpu_utilization exact and dispatched-operation witnesses; retain existing execution/replay tests.
 
-- [ ] **1. Add tests that compare actual bias and raw masks to the pinned modules**, with padding, V-only/Text-only/both, inactive blocks, repeated/permuted multi-source coordinates, variable lengths, empty input and unchanged global CPU/CUDA RNG. Add an actual dispatched-operation count witness that fails the old per-query bias assignments and token-length-dependent select/stack assembly. Do not time pytest to decide correctness. For example, evaluate raw masks on both implementations in their own F/checkpoint/backward scopes, then:
+- [x] **1. Add tests that compare actual bias and raw masks to the pinned modules**, with padding, V-only/Text-only/both, inactive blocks, repeated/permuted multi-source coordinates, variable lengths, empty input and unchanged global CPU/CUDA RNG. Add an actual dispatched-operation count witness that fails the old per-query bias assignments and token-length-dependent select/stack assembly. Do not time pytest to decide correctness. For example, evaluate raw masks on both implementations in their own F/checkpoint/backward scopes, then:
 
 ```python
 assert torch.equal(actual_mask, frozen_mask)
@@ -120,8 +120,8 @@ assert torch.equal(torch.get_rng_state(), rng_state_before)
 Reuse the existing real native replay oracle for gradients; do not derive the
 expected mask from a newly shared helper. Establish any new fixture before
 the causal operation-count assertion so RED reflects the missing optimization.
-- [ ] **2. Run the causal new tests on the old code and read their RED output.** Expect excess per-token/select or per-query assignment operations; exact baseline comparisons should pass.
-- [ ] **3. Replace replay query loops with broadcast fill and indexed exclusions.** The core replacement uses one floating output bias, row/prefix and suffix visibility, and no second dense floating workspace:
+- [x] **2. Run the causal new tests on the old code and read their RED output.** Expect excess per-token/select or per-query assignment operations; exact baseline comparisons should pass.
+- [x] **3. Replace replay query loops with broadcast fill and indexed exclusions.** The core replacement uses one floating output bias, row/prefix and suffix visibility, and no second dense floating workspace:
 
 ```python
 row_ends = torch.tensor([b.end for _, b in rows], device=x.device)
@@ -166,8 +166,8 @@ return result
 
 Keep debug bounds validation and native division/packed multiplication exactly.
 Do not assert that remaining unique/nonzero calls eliminate every CUDA sync.
-- [ ] **4. Run focused GREEN:** `tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_execution.py tests/stage1/v5/test_replay.py`. Include full/early-stop checkpoint tests and the existing FP32 loss/gradient tolerance `1e-5/1e-4`. Use one idle CUDA operator-only exact-mask comparison after CPU checks; no model training on CUDA.
-- [ ] **5. Self-review and commit.** Return source diff, causal logs and exact-mask/RNG evidence. Root obtains spec then quality review; resolve findings with this implementer before task3.
+- [x] **4. Run focused GREEN:** `tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_execution.py tests/stage1/v5/test_replay.py`. Include full/early-stop checkpoint tests and the existing FP32 loss/gradient tolerance `1e-5/1e-4`. Use one idle CUDA operator-only exact-mask comparison after CPU checks; no model training on CUDA.
+- [x] **5. Self-review and commit.** Return source diff, causal logs and exact-mask/RNG evidence. Root obtains spec then quality review; resolve findings with this implementer before task3.
 
 ## Task 3: Stable selector ranking and bounded attention observation
 
