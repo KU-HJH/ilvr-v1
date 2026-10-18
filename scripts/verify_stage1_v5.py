@@ -21,6 +21,10 @@ RUNTIME_SOURCE_PATHS = {
     'history_attention': 'src/stage1/history_attention.py',
     'history_teacher': 'src/stage1/history_teacher.py',
     'history_metric': 'src/stage1/history_metric.py',
+    'v5_execution': 'src/stage1/v5_execution.py',
+    'v5_selection': 'src/stage1/v5_selection.py',
+    'v5_trace': 'transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py',
+    'v5_replay': 'transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py',
 }
 
 GEOMETRY_DIMENSIONS = ('branch_count','prefix_length','suffix_length','selected_queries','clean_length',
@@ -189,6 +193,8 @@ def validate_contract_profile(contract, audited):
         latent_size=8,max_sequence_length=32768,lora_r=32,lora_alpha=64,lora_dropout=.05,
         lora_target_modules='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',loss_chunk_positions=128,
         compress_strategy='average',coverage_p=.9,image_pool_k=8,helper_group_L=256,textual_states='previous',
+        operator_profile={'id':'stage1_v5_vectorized_ops_v1','attention_query_chunk_max':32,
+                          'attention_score_probability_target_bytes':33554432},
         model=audited['profile_identity']['base_content_sha256'])
     for key,value in fixed.items():
         if execution.get(key)!=value: raise ValueError(f'different resolved execution {key}')

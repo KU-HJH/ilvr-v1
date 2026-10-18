@@ -479,7 +479,8 @@ def test_actual_native_helper_builder_shares_snapshot_with_own_input_reference(t
     assert len(backs)==1 and backs[0].state=='CLOSED'
 
 
-def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejects_drift(tmp_path,monkeypatch):
+@pytest.mark.parametrize('drift', ['lr', 'old_sources', 'missing_profile', 'changed_source', 'changed_profile'])
+def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejects_drift(tmp_path,monkeypatch,drift):
     from torch.utils.data import DataLoader
     from stage1.trainer import CustomTrainerStage1
     from stage1.v5_reference import V5ReferenceIdentity,_state_identity
@@ -515,20 +516,40 @@ def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejec
         assert saved['execution']['packages']['accelerate']=='1.10.1'
         assert saved['execution']['lora_target_modules']==','.join(DEFAULT_STAGE1_TARGET_SUFFIXES)
         assert set(saved['execution']['source_sha256'])=={'v5_trainer','stage1_trainer','transformers_trainer',
-            'query','targets','history_attention','history_teacher','history_metric'}
+            'query','targets','history_attention','history_teacher','history_metric',
+            'v5_execution','v5_selection','v5_trace','v5_replay'}
+        assert saved['execution']['operator_profile']=={'id':'stage1_v5_vectorized_ops_v1',
+            'attention_query_chunk_max':32,'attention_score_probability_target_bytes':33554432}
         parent_calls.append(kw)
         return 'parent-result'
     monkeypatch.setattr(CustomTrainerStage1,'train',parent)
     assert trainer.train()=='parent-result'
     saved=load_v5_contract(tmp_path)
+    if drift=='lr': trainer.args.learning_rate*=2
+    elif drift=='old_sources':
+        for key in ('v5_execution','v5_selection','v5_trace','v5_replay'):
+            saved['execution']['source_sha256'].pop(key)
+    elif drift=='missing_profile': saved['execution'].pop('operator_profile')
+    elif drift=='changed_source': saved['execution']['source_sha256']['v5_replay']='0'*64
+    else: saved['execution']['operator_profile']['attention_query_chunk_max']=16
+    import json
+    sidecar=tmp_path/'stage1_v5.json'
+    sidecar.write_text(json.dumps(saved))
+    original_bytes=sidecar.read_bytes()
+    assert load_v5_contract(tmp_path)==saved  # Historical inspection remains read-only.
     trainer.v5_saved_contract=saved
-    trainer.args.learning_rate*=2
-    with pytest.raises(ValueError,match='conflicts'):
+    forbidden=[]
+    trainer._publish_v5_files=lambda *a:forbidden.append('publish')
+    trainer.create_optimizer=lambda *a:forbidden.append('optimizer')
+    with pytest.raises(ValueError,match='conflicts.*original reviewed revision'):
         trainer.train(resume_from_checkpoint=str(tmp_path))
-    assert len(parent_calls)==1 and calls==[]
+    assert len(parent_calls)==1 and calls==[] and forbidden==[]
+    assert not trainer._v5_contract_ready and sidecar.read_bytes()==original_bytes
+    print(f'RESUME_DISPATCH drift={drift} parent_calls=1 optimizer_calls=0 publication_calls=0 historical_bytes_unchanged=True')
 
 
-@pytest.mark.parametrize('changed', ['objective','lr','packages','source','base','processor','deepspeed','query'])
+@pytest.mark.parametrize('changed', ['objective','lr','packages','source','base','processor','deepspeed','query',
+                                    'v5_execution','v5_selection','v5_trace','v5_replay','operator_profile'])
 def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,monkeypatch,changed):
     from tests.stage1.v5.test_resume import contract
     from stage1.trainer import CustomTrainerStage1
@@ -536,13 +557,18 @@ def test_every_rank_rejects_divergent_effective_contract_before_ready(tmp_path,m
     contracts=[deepcopy(contract()) for _ in range(4)]
     for rank,value in enumerate(contracts):
         value['execution'].update(model=f'/node{rank//2}/models/base',learning_rate=5e-5,
-            packages={'torch':'pinned'},source_sha256={'trainer':'a'*64},
+            packages={'torch':'pinned'},source_sha256={'trainer':'a'*64,'v5_execution':'b'*64,
+                'v5_selection':'c'*64,'v5_trace':'d'*64,'v5_replay':'e'*64},
+            operator_profile={'id':'stage1_v5_vectorized_ops_v1','attention_query_chunk_max':32,
+                              'attention_score_probability_target_bytes':33554432},
             deepspeed_profile={'config_path':f'/node{rank//2}/repo/configs/zero1.json','config_digest':'d'*64})
     bad=contracts[2]
     if changed == 'objective': bad['config']['lambda_topk_entropy']=.2
     elif changed == 'lr': bad['execution']['learning_rate']=1e-4
     elif changed == 'packages': bad['execution']['packages']['torch']='other'
     elif changed == 'source': bad['execution']['source_sha256']['trainer']='e'*64
+    elif changed.startswith('v5_'): bad['execution']['source_sha256'][changed]='0'*64
+    elif changed == 'operator_profile': bad['execution']['operator_profile']['attention_query_chunk_max']=16
     elif changed == 'base': bad['reference']['base_content_sha256']='e'*64
     elif changed == 'deepspeed': bad['execution']['deepspeed_profile']['config_digest']='e'*64
     elif changed == 'query':

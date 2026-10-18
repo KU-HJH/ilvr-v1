@@ -16,11 +16,12 @@ BASELINE_SHA256 = {
 }
 
 
-def test_benchmark_reports_four_paired_operators(tmp_path, monkeypatch):
+@pytest.mark.parametrize('profile', ['default', 'long'])
+def test_benchmark_reports_four_paired_operators(tmp_path, monkeypatch, profile):
     from scripts.benchmark_stage1_v5_attention_selection import main
     output = tmp_path / 'operators.json'
     monkeypatch.setattr('sys.argv', ['benchmark', '--device', 'cpu', '--warmup', '0',
-                                  '--repetitions', '1', '--output', str(output)])
+                                  '--repetitions', '1', '--profile', profile, '--output', str(output)])
     main()
     report = json.loads(output.read_text())
     for name in ('attention', 'selection', 'replay_mask', 'dropout'):
@@ -46,11 +47,33 @@ def test_benchmark_reports_four_paired_operators(tmp_path, monkeypatch):
     assert report['oracle_sha256'] == BASELINE_SHA256
     assert report['source_identity']['baseline_commit'] == '65643f08cb6e61fbbb200de825d57086f5c7a127'
     assert set(report['source_identity']['candidate_sha256']) == set(BASELINE_SHA256)
-    assert report['replay_mask_fixture']['mask_shape'] == [8, 1, 24, 344]
-    assert report['dropout_fixture']['source_lengths'] == [512, 499]
+    assert report['operator_profile'] == {'id': 'stage1_v5_vectorized_ops_v1',
+        'attention_query_chunk_max': 32, 'attention_score_probability_target_bytes': 33554432}
+    assert report['geometry_profile'] == profile
+    assert report['attention_fixture']['length'] == (512 if profile == 'default' else 8192)
+    assert report['attention_fixture']['queries'] == (64 if profile == 'default' else 134)
+    assert report['selection_fixture']['candidates_per_query'] == (128 if profile == 'default' else 512)
+    assert report['replay_mask_fixture']['blocks'] == (4 if profile == 'default' else 6)
+    assert report['replay_mask_fixture']['mask_shape'] == (
+        [8, 1, 24, 344] if profile == 'default' else [12, 1, 96, 6240])
+    assert report['dropout_fixture']['source_lengths'] == ([512, 499] if profile == 'default' else [8192, 8179])
     assert report['dropout_fixture']['checkpoint'] == 'non-reentrant early-stop'
+    assert report['dropout_global_rng_unchanged'] is True
     assert 'dummy decoder' in report['replay_mask_fixture']['scope']
     assert 'backward' in report['dropout_fixture']['scope']
+
+
+def test_benchmark_long_geometry_is_bounded_and_uses_six_actual_replay_blocks():
+    from scripts import benchmark_stage1_v5_attention_selection as benchmark
+    geometry = getattr(benchmark, 'benchmark_geometry', None)
+    assert callable(geometry), 'missing bounded long benchmark geometry'
+    assert geometry('long') == {'length':8192,'queries':67,'heads':8,'dim':32,'layers':2,
+        'selection_count':6,'selection_candidates':512,
+        'replay_blocks':[(1,1024,96),(0,2048,80),(1,3072,64),
+                         (0,4096,48),(1,5120,32),(0,6144,16)],
+        'dropout_packed_per_source':1024}
+    with pytest.raises(ValueError, match='geometry profile'):
+        geometry('unknown')
 
 
 @pytest.mark.parametrize('name,expected', BASELINE_SHA256.items())

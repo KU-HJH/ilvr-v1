@@ -254,7 +254,7 @@ class ReplayMaskDecoder(nn.Module):
         return SimpleNamespace(last_hidden_state=inputs_embeds)
 
 
-def replay_fixture(device, length=512):
+def replay_fixture(device, length=512, *, block_geometry=None):
     generator = torch.Generator().manual_seed(419)
     x = torch.randn(2, length, 32, generator=generator).to(device)
     padding = torch.ones(2, length, device=device, dtype=torch.long)
@@ -264,7 +264,9 @@ def replay_fixture(device, length=512):
                      for _ in range(2)) for _ in range(2))
     trace = V5Trace(inputs_embeds=x, position_ids=positions, padding=padding, key_values=kv)
     blocks = []
-    for sample, end, suffix in ((1, 128, 24), (0, 192, 19), (1, 256, 13), (0, 320, 7)):
+    if block_geometry is None:
+        block_geometry = ((1, 128, 24), (0, 192, 19), (1, 256, 13), (0, 320, 7))
+    for sample, end, suffix in block_geometry:
         targets = tuple(range(end + 1, end + suffix + 1))
         blocked = tuple((q % 16, 32 + q % 16) for q in range(suffix))
         blocks.append(V5ReplayBlock(sample, end - 9, end, targets, (0,) * suffix, blocked))
@@ -324,15 +326,15 @@ def run_raw_dropout(execution_type, spec, samples, positions, *, p=.05, hidden_s
     return tuple(results), owner
 
 
-def dropout_fixture(device):
+def dropout_fixture(device, *, length=512, packed_per_source=96):
     generator = torch.Generator().manual_seed(521)
-    spec = Stage1StochasticContext(42, 17, ((7, 512), (19, 499)), ('operator.dropout',))
-    samples = torch.arange(2, device=device).repeat_interleave(96)
-    positions = torch.arange(96, device=device).flip(0).repeat(2)
+    spec = Stage1StochasticContext(42, 17, ((7, length), (19, length - 13)), ('operator.dropout',))
+    samples = torch.arange(2, device=device).repeat_interleave(packed_per_source)
+    positions = torch.arange(packed_per_source, device=device).flip(0).repeat(2)
     samples, positions = torch.cat((samples, samples[:8])), torch.cat((positions, positions[:8]))
     return SimpleNamespace(spec=spec, p=.05, site='operator.dropout', packed_samples=samples,
                            packed_positions=positions,
-                           native=torch.randn(2, 512, 64, generator=generator).to(device),
+                           native=torch.randn(2, length, 64, generator=generator).to(device),
                            packed=torch.randn(samples.numel(), 64, generator=generator).to(device))
 
 

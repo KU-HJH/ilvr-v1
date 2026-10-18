@@ -25,6 +25,7 @@ from stage1.v5_execution import V5Execution
 from stage1.v5_selection import select_v5_text_keys
 from transformers.models.qwen2_5_vl.stage1_v5_replay import run_v5_packed_replay
 from transformers.models.qwen2_5_vl.stage1_v5_trace import capture_v5_trace
+from transformers.models.qwen2_5_vl import stage1_v5_trace
 from tests.stage1.v5.gpu_utilization_fixtures import (
     ATTENTION_ATOL, ATTENTION_RTOL, BASELINE_COMMIT, SOURCE_PATHS, OperatorCounts,
     dropout_fixture, joint_metadata, joint_selection_comparison, original_module,
@@ -114,19 +115,37 @@ def source_identity():
                     'tests/stage1/v5/gpu_utilization_fixtures.py').read_bytes()).hexdigest())
 
 
+def benchmark_geometry(profile):
+    """Synthetic bounded profiles; observed data reached T~16698 and 1--6 blocks."""
+    if profile == 'default':
+        return dict(length=512,queries=32,heads=8,dim=32,layers=2,
+            selection_count=8,selection_candidates=128,
+            replay_blocks=[(1,128,24),(0,192,19),(1,256,13),(0,320,7)],
+            dropout_packed_per_source=96)
+    if profile == 'long':
+        return dict(length=8192,queries=67,heads=8,dim=32,layers=2,
+            selection_count=6,selection_candidates=512,
+            replay_blocks=[(1,1024,96),(0,2048,80),(1,3072,64),
+                           (0,4096,48),(1,5120,32),(0,6144,16)],
+            dropout_packed_per_source=1024)
+    raise ValueError(f'unknown geometry profile: {profile}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--device', default='cpu')
     parser.add_argument('--warmup', type=int, default=3)
     parser.add_argument('--repetitions', type=int, default=20)
+    parser.add_argument('--profile', choices=('default','long'), default='default')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     if args.warmup < 0 or args.repetitions < 1:
         parser.error('warmup must be nonnegative and repetitions must be positive')
     device = torch.device(args.device)
     torch.set_num_threads(1)
+    geometry = benchmark_geometry(args.profile)
     decoder, inputs, keys, candidates = observation_fixture(
-        length=512, queries=32, heads=8, dim=32, layers=2)
+        **{key:geometry[key] for key in ('length','queries','heads','dim','layers')})
     decoder.to(device)
     inputs = {key:value.to(device) for key,value in inputs.items()}
     original_capture = original_module('stage1_v5_trace').capture_v5_trace
@@ -154,7 +173,9 @@ def main():
                for case,result in joint_selection.items() if not result['exact']}
     assert joint_equal, f'joint attention/selection changed discrete keys: {changed}'
     del before_rows, after_rows
-    metadata_, attention, clean, reference = selector_fixture(count=8, candidates=128, length=4096)
+    selection_length = 4096 if args.profile == 'default' else geometry['length']
+    metadata_, attention, clean, reference = selector_fixture(count=geometry['selection_count'],
+        candidates=geometry['selection_candidates'],length=selection_length)
     attention = {key:(value*.25).to(device) for key,value in attention.items()}
     clean, reference = clean.to(device), reference.to(device)
     compact = {(b.batch_index,q):attention[(b.batch_index,q)][list(b.candidate_positions)]
@@ -172,7 +193,7 @@ def main():
     # from making both timed paths agree on the same incorrect candidates.
     selection_equal = original_select(metadata_,attention,clean,reference,config,
                                      validate=False) == select_before() == select_after()
-    mask = replay_fixture(device)
+    mask = replay_fixture(device,geometry['length'],block_geometry=geometry['replay_blocks'])
     original_replay = original_module('stage1_v5_replay').run_v5_packed_replay
     def mask_before():
         return run_replay_mask(original_replay, mask)
@@ -182,7 +203,8 @@ def main():
     mask_equal = torch.equal(before_mask, after_mask)
     mask_geometry = list(before_mask.shape)
     del before_mask, after_mask
-    dropout = dropout_fixture(device)
+    dropout = dropout_fixture(device,length=geometry['length'],
+                              packed_per_source=geometry['dropout_packed_per_source'])
     original_execution = original_module('v5_execution').V5Execution
     def dropout_before():
         return run_dropout(original_execution, dropout)
@@ -210,15 +232,22 @@ def main():
         seed_attention=211, seed_selection=311, seed_replay=419, seed_dropout_fixture=521,
         dropout_base_seed=42, dropout_optimizer_step=17,
         threads=1, warmup=args.warmup, repetitions=args.repetitions,
-        attention_fixture=dict(batch=2,length=512,queries=64,heads=8,head_dim=32,layers=2,
+        geometry_profile=args.profile,
+        geometry_note='Synthetic bounded geometry informed by audit T~16698 and 1-6 blocks; not an actual dataset sample or production maximum.',
+        operator_profile={'id':'stage1_v5_vectorized_ops_v1',
+            'attention_query_chunk_max':stage1_v5_trace.V5_ATTENTION_QUERY_CHUNK_MAX,
+            'attention_score_probability_target_bytes':stage1_v5_trace.V5_ATTENTION_WORKSPACE_BYTES},
+        attention_fixture=dict(batch=2,length=geometry['length'],queries=len(keys),heads=geometry['heads'],
+                               head_dim=geometry['dim'],layers=geometry['layers'],
                                dtype='bfloat16 projections, float32 observation',
                                scope='projection/hook fixture with fixed decoder callbacks; no model load'),
-        selection_fixture=dict(queries=32,candidates_per_query=128,full_row_length=4096,vocab=17,
+        selection_fixture=dict(queries=len(metadata_.query_keys),candidates_per_query=geometry['selection_candidates'],
+                               full_row_length=selection_length,vocab=17,
                                dtype='float32',validation=False,input='identical prebuilt compact candidate rows'),
-        replay_mask_fixture=dict(batch=2,length=512,blocks=4,rows=8,mask_shape=mask_geometry,
-            suffix_lengths=[24,19,13,7],dtype='float32',validation=False,
+        replay_mask_fixture=dict(batch=2,length=geometry['length'],blocks=len(mask.blocks),rows=2*len(mask.blocks),
+            mask_shape=mask_geometry,suffix_lengths=[row[2] for row in geometry['replay_blocks']],dtype='float32',validation=False,
             scope='actual packed replay bias, prefix concatenation, binding, dummy decoder callback and identity head; no attention/model forward'),
-        dropout_fixture=dict(source_lengths=[512,499],hidden_size=64,native_shape=list(dropout.native.shape),
+        dropout_fixture=dict(source_lengths=[geometry['length'],geometry['length']-13],hidden_size=64,native_shape=list(dropout.native.shape),
             packed_shape=list(dropout.packed.shape),probability=dropout.p,sites=1,
             checkpoint='non-reentrant early-stop',dtype='float32',validation=False,
             scope='actual private-generator F/packed dropout, checkpoint recomputation and backward; includes owner/checkpoint/sin/reduction/output-detach overhead; no train step'),
@@ -229,7 +258,7 @@ def main():
         selected_keys_exact_equal=selection_equal,mask_exact_equal=mask_equal,
         dropout_exact_equal=dropout_equal,dropout_global_rng_unchanged=rng_unchanged,
         source_identity=source_identity(),
-        limitations='Local bounded operator fixtures only; CPU memory is Python-only. No production BF16/four-rank equivalence, stage bottleneck attribution or utilization fix established.',
+        limitations='Local bounded operator fixtures only; CPU memory is Python-only. The 32 MiB score/probability target is not a total VRAM bound. No production BF16/four-rank equivalence, stage bottleneck attribution or utilization fix established.',
         oracle_sha256={name:hashlib.sha256(Path(original_module(name).__file__).read_bytes()).hexdigest()
                        for name in SOURCE_PATHS})
     if device.type == 'cuda':
@@ -243,7 +272,7 @@ def main():
         before_result, after_result, order = measure_pair(before,after,device,args.warmup,args.repetitions)
         report[name + '_paired_order'] = order
         for suffix, function, result in [('before',before,before_result),('after',after,after_result)]:
-            with OperatorCounts((8,512,32)) as counts, count_host_lists() as lists:
+            with OperatorCounts((geometry['heads'],geometry['length'],geometry['dim'])) as counts, count_host_lists() as lists:
                 function()
             result['operations'] = {key:getattr(counts,key) for key in (
                 'key_float_copies','arange_calls','scalar_reads','candidate_index_tensors',

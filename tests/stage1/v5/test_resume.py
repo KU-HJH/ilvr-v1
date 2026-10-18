@@ -174,6 +174,9 @@ def test_runtime_contract_records_effective_topology_and_independent_query_seman
     assert saved['execution']['source_sha256'] == {
         key: hashlib.sha256((root / path).read_bytes()).hexdigest()
         for key, path in RUNTIME_SOURCE_PATHS.items()}
+    assert saved['execution']['operator_profile'] == {
+        'id': 'stage1_v5_vectorized_ops_v1', 'attention_query_chunk_max': 32,
+        'attention_score_probability_target_bytes': 33554432}
     if mode == 'adaptive':
         from tests.stage1.test_history_query import NEW_QUERY
         assert query == {**NEW_QUERY, 'text_gamma': .55}
@@ -229,6 +232,10 @@ RUNTIME_SOURCE_PATHS = {
     'history_attention': 'src/stage1/history_attention.py',
     'history_teacher': 'src/stage1/history_teacher.py',
     'history_metric': 'src/stage1/history_metric.py',
+    'v5_execution': 'src/stage1/v5_execution.py',
+    'v5_selection': 'src/stage1/v5_selection.py',
+    'v5_trace': 'transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py',
+    'v5_replay': 'transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py',
 }
 
 

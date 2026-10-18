@@ -225,8 +225,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
     def _build_v5_runtime_contract(self, loader):
         """Describe the prepared loader and effective profile without changing it."""
         import hashlib
-        import inspect
-        from transformers import Trainer
+        from importlib import import_module
         from .equivalence import read_stage1_backend_settings
         gas, microbatches = self.args.gradient_accumulation_steps, len(loader)
         qualified = lambda obj: type(obj).__module__+'.'+type(obj).__qualname__
@@ -269,13 +268,20 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         query_config = getattr(self, 'query_config', Stage1QueryConfig())
         execution['query_config'] = query_execution_config(query_config, ())
         execution['source_sha256'] = {
-            key:hashlib.sha256(Path(inspect.getsourcefile(cls)).read_bytes()).hexdigest()
-            for key,cls in (('v5_trainer',CustomTrainerStage1V5),
-                            ('stage1_trainer',CustomTrainerStage1),('transformers_trainer',Trainer),
-                            ('query',Stage1QueryConfig),('targets',Stage1TeacherTargetBuilder),
-                            ('history_attention',ReducedHistoryAttentionObserver),
-                            ('history_teacher',HistoryPrefixAdapter),
-                            ('history_metric',ContentHistory))}
+            key:hashlib.sha256(Path(import_module(module).__file__).read_bytes()).hexdigest()
+            for key,module in (('v5_trainer',__name__),
+                ('stage1_trainer','stage1.trainer'),('transformers_trainer','transformers.trainer'),
+                ('query','stage1.query'),('targets','stage1.targets'),
+                ('history_attention','stage1.history_attention'),
+                ('history_teacher','stage1.history_teacher'),('history_metric','stage1.history_metric'),
+                ('v5_execution','stage1.v5_execution'),('v5_selection','stage1.v5_selection'),
+                ('v5_trace','transformers.models.qwen2_5_vl.stage1_v5_trace'),
+                ('v5_replay','transformers.models.qwen2_5_vl.stage1_v5_replay'))}
+        from transformers.models.qwen2_5_vl import stage1_v5_trace
+        execution['operator_profile'] = {
+            'id':'stage1_v5_vectorized_ops_v1',
+            'attention_query_chunk_max':stage1_v5_trace.V5_ATTENTION_QUERY_CHUNK_MAX,
+            'attention_score_probability_target_bytes':stage1_v5_trace.V5_ATTENTION_WORKSPACE_BYTES}
         return build_v5_contract(self.v5_config,self.v5_reference_identity,
             ce_weight=self.ce_weight,sim_weight=self.sim_weight,schedule=schedule,execution=execution)
 
@@ -329,7 +335,8 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         self._agree_v5_contract(contract)
         if (self.v5_saved_contract is not None and self._effective_v5_contract(self.v5_saved_contract)
                 != self._effective_v5_contract(contract)):
-            raise ValueError('saved v5 schedule/execution/reference conflicts with runtime')
+            raise ValueError('saved v5 schedule/execution/reference conflicts with runtime; '
+                             'use its original reviewed revision or start a fresh run')
         self._v5_contract = contract
         self._publish_v5_files(Path(self.args.output_dir))
         self._v5_contract_ready = True

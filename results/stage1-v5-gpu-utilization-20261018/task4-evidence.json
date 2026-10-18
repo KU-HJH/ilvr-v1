@@ -1,0 +1,81 @@
+{
+  "task": "Task4 execution identity/integration and final local measurements",
+  "status": "CONCERNS: blocked at exact joint selection gate; no final measurements run",
+  "base_commit": "ffec431b6abac35e470667a2e9d0a049b91c43c6",
+  "owner_agent": "/root/gpu_util_t4_impl",
+  "approved_spec": "docs/superpowers/specs/2026-10-18-stage1-v5-gpu-utilization-commitment-v1.md",
+  "approved_spec_sha256": "843832ae9b09c10f28dea3dea60ceaa8d845f77f103f98259d4f26304cbe659a",
+  "authorization": "Root delegated approved Task4 under retained SDD/TDD; root owns approval/workflow/phase records and independent review.",
+  "skill_read": "/root/.codex/plugins/cache/openai-curated/superpowers/bd2122cb/skills/test-driven-development/SKILL.md",
+  "tdd": "Tests added and causal RED observed before the corresponding production binding/profile/geometry implementation. All recorded RED logs were parsed completely; focused output has one exactness failure.",
+  "changed_sha256": {
+    "src/stage1/v5_trainer.py": "f74aeb92ba95f49c23f8815a380beb4180ecb657e7090816ec81275d53d80fc6",
+    "scripts/verify_stage1_v5.py": "18a6ca1f6bf18242b94568f50363fe248fdc60b1d34eee7cb9b7af02cd395f85",
+    "scripts/benchmark_stage1_v5_attention_selection.py": "a02177a75f6dbcfc04a9addbd54bff736cca8fbe58a549961b8961ee09396cc0",
+    "tests/stage1/v5/gpu_utilization_fixtures.py": "28c37143d0df5145f67f16f364e53072a22be6298b2b38ea581107adc681acb6",
+    "tests/stage1/v5/test_resume.py": "4f5c32e9b6731ab6829860aaf81b2def5c068a2b80dc08de6c825ffbea96597a",
+    "tests/stage1/v5/test_protocol.py": "86f334f0cfd6522d1ecaa924f9fcde2064d46241493d20dec6917c9066d9be24",
+    "tests/stage1/v5/test_trainer.py": "16e07a9359526ff70ed775a3df599c64f6385ac22534e6748221f7143b3bb71a",
+    "tests/stage1/v5/test_gpu_utilization.py": "989dfe2372f51fc79c0acf9b97c32e333d64830715505650ddd9c951c37ff85d"
+  },
+  "unchanged_algorithm_and_parser_sha256": {
+    "src/stage1/v5_execution.py": "d18a3a41c74d741228442100a471ab208dce8e3c0912fc33361a79e26a4f0ad1",
+    "src/stage1/v5_selection.py": "a534cf7184c43575ca8fca610df0f14325ed221db3dceb1564b34802c891b43c",
+    "transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py": "45e286bfef7314e855e06812ede9f729124d3eb61ec6b53891a2c2036c51d36b",
+    "transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py": "27d42a8f03e9a547a01d7b4538bdd17409662bf74e2cee998da7eb9aba670797",
+    "src/stage1/v5_resume.py": "027e00961105d4a438226008c3aacd3202c873575f003038a8f95f1769f5439c"
+  },
+  "commands": [
+    {
+      "command": "PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES= ./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/v5/test_resume.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_trainer.py tests/stage1/v5/test_gpu_utilization.py -k 'runtime_contract_records or runtime_binding_rejects or train_publishes or benchmark_long_geometry' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t4-red",
+      "exit_code": 1,
+      "log": "logs/stage1-v5-gpu-utilization-20261018/t4-red.log",
+      "sha256": "3cd35dae0de5f6617bffe352fbeb20c490e5e2cfaa553b279472692e97e97755",
+      "bytes": 117251,
+      "result": "29 failed, 2 passed, 315 deselected in 10.47s",
+      "interpretation": "Missing four literal runtime bindings and bounded geometry; protocol expected-map mismatch is missing production bindings, not an import fixture error."
+    },
+    {
+      "command": "PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES= ./venv/ilvr-venv/bin/python -m pytest -q --tb=short tests/stage1/v5/test_protocol.py -k 'runtime_binding_rejects and (missing_operator_profile or operator_id or operator_chunk or operator_bytes)' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t4-profile-red",
+      "exit_code": 1,
+      "log": "logs/stage1-v5-gpu-utilization-20261018/t4-profile-red.log",
+      "sha256": "98259330ad694736272c23635ede0bdbcec829367e37bdfdf9e26f3ce848fc52",
+      "bytes": 2109,
+      "result": "4 failed, 88 deselected in 2.66s",
+      "interpretation": "After source bindings only, four profile mutations each fail DID NOT RAISE ValueError."
+    },
+    {
+      "command": "PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES= ./venv/ilvr-venv/bin/python -m pytest -q --tb=short tests/stage1/v5/test_gpu_utilization.py -k benchmark_reports --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t4-benchmark-red",
+      "exit_code": 1,
+      "log": "logs/stage1-v5-gpu-utilization-20261018/t4-benchmark-red.log",
+      "sha256": "8a578304c9e1ade23b3b722019e241ad850cefa90cfd83a9b6adc221dd92c795",
+      "bytes": 2180,
+      "result": "2 failed, 164 deselected in 3.10s",
+      "interpretation": "Both benchmark profile invocations reject the missing --profile option."
+    },
+    {
+      "command": "PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES= ./venv/ilvr-venv/bin/python -m pytest -q --tb=short tests/stage1/v5/test_resume.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_trainer.py tests/stage1/v5/test_history_integration.py tests/stage1/v5/test_gpu_utilization.py --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t4-green",
+      "exit_code": 1,
+      "log": "logs/stage1-v5-gpu-utilization-20261018/t4-green.log",
+      "sha256": "768f485b123e75e8c7f6606f8fd73d84c653f4a15def53f2eb11513640a890dc",
+      "bytes": 50889,
+      "result": "1 failed, 266 passed, 88 skipped in 19.02s",
+      "interpretation": "Runtime identity/admission/resume and existing focused integration passed; bounded long joint exactness failed. This is not GREEN completion."
+    }
+  ],
+  "failure_evidence": "results/stage1-v5-gpu-utilization-20261018/task4-cpu-long-discrete-failure.json",
+  "failure_evidence_sha256": "cdb66d95c382c13e71db07958d855a2f2bbed248af8ea4b84190858d3ba4a27e",
+  "self_review": {
+    "runtime": "Actual imported module.__file__ bytes bind twelve literal source keys; no inspect wrapper source identity. Operator profile reads actual trace constants. Effective comparison preserves hashes/profile and rejects old/changed identities before publication and parent dispatch.",
+    "historical": "v5_resume.py is byte-identical to base; test load-only historical sidecars and unchanged bytes remain valid. Objective/schema/formula/query/sampler/rank code unchanged.",
+    "benchmark": "Default fixture geometry preserved; long synthetic profile T8192, 67 queries/sample, six replay blocks. Paired alternating timing, synchronization, dtype-aware bytes, frozen oracles, dummy replay prefix/head and checkpoint/dropout overhead labels retained.",
+    "blocker": "Full log parsing reveals three selected-order swaps and a cumulative_equal selected-set change (2 keys versus 3). Candidate violates exact discrete acceptance; geometry and algorithms have not been adjusted to mask the failure."
+  },
+  "remaining": [
+    "Controller decision and separately routed attention correction/design handling",
+    "Focused correctness must become GREEN before final CPU/CUDA default/long warmup3/repetitions20 measurements",
+    "Independent SPEC and QUALITY reviews, final review, root fresh full suite/finish gates"
+  ],
+  "limitations": "No CUDA access, training, production model loading, optimizer run, final benchmark timing, throughput or production equivalence claim in Task4. No final candidate-{cpu,cuda}-{default,long}.json was created.",
+  "controller_stop": "Root confirmed stop, no geometry/tolerance/algorithm changes or further performance measurements; commit owned WIP diagnostic checkpoint and park. Read-only diagnosis uses existing failures/sources only."
+}

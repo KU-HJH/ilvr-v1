@@ -488,6 +488,8 @@ def binding_fixture():
         lora_r=32,lora_alpha=64,lora_dropout=.05,
         lora_target_modules='q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj',
         loss_chunk_positions=128,compress_strategy='average',coverage_p=.9,image_pool_k=8,helper_group_L=256,textual_states='previous',model='a'*64,source_sha256={key:'f'*64 for key in RUNTIME_SOURCE_PATHS},query_config=query_execution_config(Stage1QueryConfig(),()),packages=dict(torch='actual-torch',accelerate='actual-accelerate'),
+        operator_profile={'id':'stage1_v5_vectorized_ops_v1','attention_query_chunk_max':32,
+                          'attention_score_probability_target_bytes':33554432},
         deepspeed_profile=dict(enabled=True,zero_stage=1,world_size=4,config_path='d'*64,config_digest='d'*64))
     payload['execution']=execution
     payload['schedule']=dict(dataset_samples=37,prepared_microbatches_per_rank=10,
@@ -512,7 +514,9 @@ def binding_fixture():
     return audit,binding
 
 
-@pytest.mark.parametrize('mutation',['coefficient','r','warmup','package','sampler','budget','occurrences','tail','input','helper_group','code_profile','dil_denominator','auxiliary_denominator'])
+@pytest.mark.parametrize('mutation',['coefficient','r','warmup','package','sampler','budget','occurrences','tail','input','helper_group','code_profile','dil_denominator','auxiliary_denominator',
+                                    'missing_operator_profile','operator_id','operator_chunk','operator_bytes',
+                                    'missing_v5_execution','changed_v5_selection','missing_v5_trace','changed_v5_replay'])
 def test_runtime_binding_rejects_stale_audit_or_different_effective_profile(mutation):
     audited,binding=binding_fixture()
     assert hasattr(api(),'validate_runtime_binding'), 'expected-bound original loader/profile missing'
@@ -526,6 +530,15 @@ def test_runtime_binding_rejects_stale_audit_or_different_effective_profile(muta
     elif mutation=='occurrences': audited['sampler_occurrences']=list(reversed(audited['sampler_occurrences']))
     elif mutation=='tail': audited['final_window_microbatches']=1
     elif mutation=='code_profile': binding['contract']['execution']['source_sha256']['v5_trainer']='0'*64
+    elif mutation=='missing_operator_profile': binding['contract']['execution'].pop('operator_profile')
+    elif mutation.startswith('operator_'):
+        field={'operator_id':'id','operator_chunk':'attention_query_chunk_max',
+               'operator_bytes':'attention_score_probability_target_bytes'}[mutation]
+        binding['contract']['execution']['operator_profile'][field]='changed'
+    elif mutation.startswith(('missing_v5_', 'changed_v5_')):
+        action, source = mutation.split('_', 1)
+        if action == 'missing': binding['contract']['execution']['source_sha256'].pop(source)
+        else: binding['contract']['execution']['source_sha256'][source]='0'*64
     elif mutation=='helper_group': binding['contract']['execution']['helper_group_L']=128
     elif mutation in ('dil_denominator','auxiliary_denominator'):
         binding['contract']['schedule'][mutation]='wrong_denominator'
