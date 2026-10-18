@@ -1,0 +1,808 @@
+{
+  "device": "cuda:0",
+  "torch": "2.7.1+cu128",
+  "python": "3.11.15",
+  "packages": {
+    "torch": "2.7.1+cu128",
+    "transformers": "4.50.0.dev0",
+    "peft": "0.17.1",
+    "flash-attn": "2.8.3",
+    "deepspeed": "0.18.7"
+  },
+  "cuda_runtime": "12.8",
+  "transformers_runtime": "4.50.0.dev0",
+  "seed_attention": 211,
+  "seed_selection": 311,
+  "seed_replay": 419,
+  "seed_dropout_fixture": 521,
+  "dropout_base_seed": 42,
+  "dropout_optimizer_step": 17,
+  "threads": 1,
+  "warmup": 3,
+  "repetitions": 20,
+  "attention_fixture": {
+    "batch": 2,
+    "length": 512,
+    "queries": 64,
+    "heads": 8,
+    "head_dim": 32,
+    "layers": 2,
+    "dtype": "bfloat16 projections, float32 observation",
+    "scope": "projection/hook fixture with fixed decoder callbacks; no model load"
+  },
+  "selection_fixture": {
+    "queries": 32,
+    "candidates_per_query": 128,
+    "full_row_length": 4096,
+    "vocab": 17,
+    "dtype": "float32",
+    "validation": false,
+    "input": "identical prebuilt compact candidate rows"
+  },
+  "replay_mask_fixture": {
+    "batch": 2,
+    "length": 512,
+    "blocks": 4,
+    "rows": 8,
+    "mask_shape": [
+      8,
+      1,
+      24,
+      344
+    ],
+    "suffix_lengths": [
+      24,
+      19,
+      13,
+      7
+    ],
+    "dtype": "float32",
+    "validation": false,
+    "scope": "actual packed replay bias, prefix concatenation, binding, dummy decoder callback and identity head; no attention/model forward"
+  },
+  "dropout_fixture": {
+    "source_lengths": [
+      512,
+      499
+    ],
+    "hidden_size": 64,
+    "native_shape": [
+      2,
+      512,
+      64
+    ],
+    "packed_shape": [
+      200,
+      64
+    ],
+    "probability": 0.05,
+    "sites": 1,
+    "checkpoint": "non-reentrant early-stop",
+    "dtype": "float32",
+    "validation": false,
+    "scope": "actual private-generator F/packed dropout, checkpoint recomputation and backward; includes owner/checkpoint/sin/reduction/output-detach overhead; no train step"
+  },
+  "attention_exact_equal": true,
+  "attention_close": true,
+  "attention_atol": 1e-07,
+  "attention_rtol": 1e-05,
+  "attention_max_absolute_error": 0.0,
+  "selected_keys_exact_equal": true,
+  "mask_exact_equal": true,
+  "dropout_exact_equal": true,
+  "dropout_global_rng_unchanged": true,
+  "source_identity": {
+    "baseline_commit": "65643f08cb6e61fbbb200de825d57086f5c7a127",
+    "candidate_commit": "91a1440b199548afd387d76cf7a303a5e59a24a2",
+    "candidate_sha256": {
+      "v5_execution": "0abd7e9fb51f327916b735b74d7cad53dd0d4b7242d3dc74725dc43257c19a69",
+      "v5_selection": "1b285303a6da390c4de2635aff46c57582272f952d75efc72b52a67eddce2850",
+      "stage1_v5_trace": "33f55a0f6480bbfc50b9256cceb71c6ab61a968cbf4b6815c5dee8f80f5f7efb",
+      "stage1_v5_replay": "bf15d87ea7d6f9a2dd7775c6e1ab4d4b4edb3750bc4096213b8b3e310135fa5e"
+    },
+    "candidate_paths": {
+      "v5_execution": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_execution.py",
+      "v5_selection": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_selection.py",
+      "stage1_v5_trace": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py",
+      "stage1_v5_replay": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py"
+    },
+    "benchmark_sha256": "e23793429993045f8cdb8b745852d8b62a240783fb8079e42650cecaf4435522",
+    "fixtures_sha256": "f9db303fb9b92c613f059d149eb76da282c3d4d05472822bf2971114a772a0c3"
+  },
+  "limitations": "Local bounded operator fixtures only; CPU memory is Python-only. No production BF16/four-rank equivalence, stage bottleneck attribution or utilization fix established.",
+  "oracle_sha256": {
+    "v5_execution": "0abd7e9fb51f327916b735b74d7cad53dd0d4b7242d3dc74725dc43257c19a69",
+    "v5_selection": "1b285303a6da390c4de2635aff46c57582272f952d75efc72b52a67eddce2850",
+    "stage1_v5_trace": "33f55a0f6480bbfc50b9256cceb71c6ab61a968cbf4b6815c5dee8f80f5f7efb",
+    "stage1_v5_replay": "bf15d87ea7d6f9a2dd7775c6e1ab4d4b4edb3750bc4096213b8b3e310135fa5e"
+  },
+  "gpu": "NVIDIA H100 NVL",
+  "gpu_identity": {
+    "name": "NVIDIA H100 NVL",
+    "total_memory_bytes": 99949674496,
+    "capability": [
+      9,
+      0
+    ]
+  },
+  "attention_paired_order": [
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ]
+  ],
+  "attention_before": {
+    "milliseconds": [
+      10.779141,
+      10.764596,
+      10.849175,
+      10.863007,
+      10.829443,
+      10.817258,
+      10.799054,
+      10.825788,
+      10.795995,
+      10.776131,
+      10.888752,
+      10.805575,
+      10.766413,
+      10.773275,
+      10.749161,
+      10.797535,
+      10.807941,
+      10.799545,
+      10.784344,
+      10.834268
+    ],
+    "median_ms": 10.7992995,
+    "memory": {
+      "baseline_allocated_bytes": 35879936,
+      "peak_allocated_bytes": 41691136,
+      "extra_peak_allocated_bytes": 5811200,
+      "peak_reserved_bytes": 44040192
+    },
+    "operations": {
+      "key_float_copies": 4,
+      "arange_calls": 2,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 2,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 158,
+      "stack_calls": 0,
+      "index_put_calls": 0,
+      "tolist_calls": 0,
+      "tolist_elements": 0
+    }
+  },
+  "attention_after": {
+    "milliseconds": [
+      10.821428,
+      10.845011,
+      10.804979,
+      10.838639,
+      10.794049,
+      10.738476,
+      10.74146,
+      10.737055,
+      10.825873,
+      10.821928,
+      10.758532,
+      10.820341,
+      10.800125,
+      10.734999,
+      10.759774,
+      10.738239,
+      10.75323,
+      10.846146,
+      10.790098,
+      10.836293
+    ],
+    "median_ms": 10.797087,
+    "memory": {
+      "baseline_allocated_bytes": 35879936,
+      "peak_allocated_bytes": 41691136,
+      "extra_peak_allocated_bytes": 5811200,
+      "peak_reserved_bytes": 44040192
+    },
+    "operations": {
+      "key_float_copies": 4,
+      "arange_calls": 2,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 2,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 158,
+      "stack_calls": 0,
+      "index_put_calls": 0,
+      "tolist_calls": 0,
+      "tolist_elements": 0
+    }
+  },
+  "selection_paired_order": [
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ]
+  ],
+  "selection_before": {
+    "milliseconds": [
+      1.065559,
+      1.04273,
+      1.03575,
+      1.037588,
+      1.102262,
+      1.04586,
+      1.036552,
+      1.042581,
+      1.058031,
+      1.037013,
+      1.05172,
+      1.040344,
+      1.033642,
+      1.050539,
+      1.04342,
+      1.033891,
+      1.03443,
+      1.0405,
+      1.030272,
+      1.046036
+    ],
+    "median_ms": 1.0415405,
+    "memory": {
+      "baseline_allocated_bytes": 35879936,
+      "peak_allocated_bytes": 35921408,
+      "extra_peak_allocated_bytes": 41472,
+      "peak_reserved_bytes": 37748736
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 0,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 6,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 0,
+      "stack_calls": 1,
+      "index_put_calls": 2,
+      "tolist_calls": 1,
+      "tolist_elements": 4160
+    }
+  },
+  "selection_after": {
+    "milliseconds": [
+      1.055084,
+      1.049709,
+      1.033753,
+      1.047797,
+      1.06864,
+      1.045079,
+      1.05598,
+      1.03934,
+      1.054872,
+      1.046579,
+      1.044787,
+      1.035895,
+      1.027571,
+      1.072286,
+      1.033393,
+      1.034281,
+      1.052067,
+      1.034357,
+      1.036008,
+      1.050099
+    ],
+    "median_ms": 1.045829,
+    "memory": {
+      "baseline_allocated_bytes": 35879936,
+      "peak_allocated_bytes": 35921408,
+      "extra_peak_allocated_bytes": 41472,
+      "peak_reserved_bytes": 37748736
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 0,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 6,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 0,
+      "stack_calls": 1,
+      "index_put_calls": 2,
+      "tolist_calls": 1,
+      "tolist_elements": 4160
+    }
+  },
+  "replay_mask_paired_order": [
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ]
+  ],
+  "replay_mask_before": {
+    "milliseconds": [
+      6.942633,
+      6.95235,
+      6.949975,
+      6.975763,
+      6.999942,
+      6.927001,
+      6.945899,
+      6.945082,
+      6.951029,
+      6.936614,
+      7.001276,
+      6.978669,
+      6.979089,
+      6.94116,
+      6.966851,
+      6.92595,
+      7.001916,
+      6.950364,
+      6.949796,
+      6.953769
+    ],
+    "median_ms": 6.9506965,
+    "memory": {
+      "baseline_allocated_bytes": 35879936,
+      "peak_allocated_bytes": 36995584,
+      "extra_peak_allocated_bytes": 1115648,
+      "peak_reserved_bytes": 37748736
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 1,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 67,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 1111,
+      "stack_calls": 1,
+      "index_put_calls": 63,
+      "tolist_calls": 0,
+      "tolist_elements": 0
+    }
+  },
+  "replay_mask_after": {
+    "milliseconds": [
+      6.930914,
+      6.916653,
+      6.955401,
+      7.018761,
+      6.99546,
+      6.946609,
+      6.99518,
+      6.988993,
+      6.931582,
+      6.938173,
+      7.038133,
+      6.990476,
+      6.966143,
+      6.934955,
+      6.943718,
+      6.957279,
+      6.920819,
+      6.943483,
+      6.938514,
+      6.936785
+    ],
+    "median_ms": 6.9451635,
+    "memory": {
+      "baseline_allocated_bytes": 35879936,
+      "peak_allocated_bytes": 36995584,
+      "extra_peak_allocated_bytes": 1115648,
+      "peak_reserved_bytes": 37748736
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 1,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 67,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 1111,
+      "stack_calls": 1,
+      "index_put_calls": 63,
+      "tolist_calls": 0,
+      "tolist_elements": 0
+    }
+  },
+  "dropout_paired_order": [
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ]
+  ],
+  "dropout_before": {
+    "milliseconds": [
+      4.64925,
+      4.613122,
+      4.603917,
+      4.635392,
+      4.645194,
+      4.6025,
+      4.609914,
+      4.557632,
+      4.569836,
+      4.6224,
+      4.617924,
+      4.612047,
+      4.658572,
+      4.615395,
+      4.562512,
+      4.566343,
+      4.580425,
+      4.60984,
+      4.587978,
+      4.622806
+    ],
+    "median_ms": 4.6109805,
+    "memory": {
+      "baseline_allocated_bytes": 35879936,
+      "peak_allocated_bytes": 37294080,
+      "extra_peak_allocated_bytes": 1414144,
+      "peak_reserved_bytes": 37748736
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 4,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 2,
+      "random_draw_calls": 8,
+      "random_draw_elements": 258816,
+      "select_calls": 2422,
+      "stack_calls": 4,
+      "index_put_calls": 2,
+      "tolist_calls": 8,
+      "tolist_elements": 4844
+    }
+  },
+  "dropout_after": {
+    "milliseconds": [
+      4.628756,
+      4.62905,
+      4.608596,
+      4.679229,
+      4.573511,
+      4.616345,
+      4.59259,
+      4.623455,
+      4.574813,
+      4.686175,
+      4.677079,
+      4.629433,
+      4.610066,
+      4.622681,
+      4.639717,
+      4.660119,
+      4.626034,
+      4.650913,
+      4.589548,
+      4.595996
+    ],
+    "median_ms": 4.6247445,
+    "memory": {
+      "baseline_allocated_bytes": 35879936,
+      "peak_allocated_bytes": 37294080,
+      "extra_peak_allocated_bytes": 1414144,
+      "peak_reserved_bytes": 37748736
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 4,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 2,
+      "random_draw_calls": 8,
+      "random_draw_elements": 258816,
+      "select_calls": 2422,
+      "stack_calls": 4,
+      "index_put_calls": 2,
+      "tolist_calls": 8,
+      "tolist_elements": 4844
+    }
+  }
+}

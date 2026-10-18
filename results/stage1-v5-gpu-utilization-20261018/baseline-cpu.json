@@ -1,0 +1,783 @@
+{
+  "device": "cpu",
+  "torch": "2.7.1+cu128",
+  "python": "3.11.15",
+  "packages": {
+    "torch": "2.7.1+cu128",
+    "transformers": "4.50.0.dev0",
+    "peft": "0.17.1",
+    "flash-attn": "2.8.3",
+    "deepspeed": "0.18.7"
+  },
+  "cuda_runtime": "12.8",
+  "transformers_runtime": "4.50.0.dev0",
+  "seed_attention": 211,
+  "seed_selection": 311,
+  "seed_replay": 419,
+  "seed_dropout_fixture": 521,
+  "dropout_base_seed": 42,
+  "dropout_optimizer_step": 17,
+  "threads": 1,
+  "warmup": 3,
+  "repetitions": 20,
+  "attention_fixture": {
+    "batch": 2,
+    "length": 512,
+    "queries": 64,
+    "heads": 8,
+    "head_dim": 32,
+    "layers": 2,
+    "dtype": "bfloat16 projections, float32 observation",
+    "scope": "projection/hook fixture with fixed decoder callbacks; no model load"
+  },
+  "selection_fixture": {
+    "queries": 32,
+    "candidates_per_query": 128,
+    "full_row_length": 4096,
+    "vocab": 17,
+    "dtype": "float32",
+    "validation": false,
+    "input": "identical prebuilt compact candidate rows"
+  },
+  "replay_mask_fixture": {
+    "batch": 2,
+    "length": 512,
+    "blocks": 4,
+    "rows": 8,
+    "mask_shape": [
+      8,
+      1,
+      24,
+      344
+    ],
+    "suffix_lengths": [
+      24,
+      19,
+      13,
+      7
+    ],
+    "dtype": "float32",
+    "validation": false,
+    "scope": "actual packed replay bias, prefix concatenation, binding, dummy decoder callback and identity head; no attention/model forward"
+  },
+  "dropout_fixture": {
+    "source_lengths": [
+      512,
+      499
+    ],
+    "hidden_size": 64,
+    "native_shape": [
+      2,
+      512,
+      64
+    ],
+    "packed_shape": [
+      200,
+      64
+    ],
+    "probability": 0.05,
+    "sites": 1,
+    "checkpoint": "non-reentrant early-stop",
+    "dtype": "float32",
+    "validation": false,
+    "scope": "actual private-generator F/packed dropout, checkpoint recomputation and backward; includes owner/checkpoint/sin/reduction/output-detach overhead; no train step"
+  },
+  "attention_exact_equal": true,
+  "attention_close": true,
+  "attention_atol": 1e-07,
+  "attention_rtol": 1e-05,
+  "attention_max_absolute_error": 0.0,
+  "selected_keys_exact_equal": true,
+  "mask_exact_equal": true,
+  "dropout_exact_equal": true,
+  "dropout_global_rng_unchanged": true,
+  "source_identity": {
+    "baseline_commit": "65643f08cb6e61fbbb200de825d57086f5c7a127",
+    "candidate_commit": "91a1440b199548afd387d76cf7a303a5e59a24a2",
+    "candidate_sha256": {
+      "v5_execution": "0abd7e9fb51f327916b735b74d7cad53dd0d4b7242d3dc74725dc43257c19a69",
+      "v5_selection": "1b285303a6da390c4de2635aff46c57582272f952d75efc72b52a67eddce2850",
+      "stage1_v5_trace": "33f55a0f6480bbfc50b9256cceb71c6ab61a968cbf4b6815c5dee8f80f5f7efb",
+      "stage1_v5_replay": "bf15d87ea7d6f9a2dd7775c6e1ab4d4b4edb3750bc4096213b8b3e310135fa5e"
+    },
+    "candidate_paths": {
+      "v5_execution": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_execution.py",
+      "v5_selection": "/root/.codex/worktrees/d3c8/ILVR/src/stage1/v5_selection.py",
+      "stage1_v5_trace": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py",
+      "stage1_v5_replay": "/root/.codex/worktrees/d3c8/ILVR/transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py"
+    },
+    "benchmark_sha256": "e23793429993045f8cdb8b745852d8b62a240783fb8079e42650cecaf4435522",
+    "fixtures_sha256": "f9db303fb9b92c613f059d149eb76da282c3d4d05472822bf2971114a772a0c3"
+  },
+  "limitations": "Local bounded operator fixtures only; CPU memory is Python-only. No production BF16/four-rank equivalence, stage bottleneck attribution or utilization fix established.",
+  "oracle_sha256": {
+    "v5_execution": "0abd7e9fb51f327916b735b74d7cad53dd0d4b7242d3dc74725dc43257c19a69",
+    "v5_selection": "1b285303a6da390c4de2635aff46c57582272f952d75efc72b52a67eddce2850",
+    "stage1_v5_trace": "33f55a0f6480bbfc50b9256cceb71c6ab61a968cbf4b6815c5dee8f80f5f7efb",
+    "stage1_v5_replay": "bf15d87ea7d6f9a2dd7775c6e1ab4d4b4edb3750bc4096213b8b3e310135fa5e"
+  },
+  "attention_paired_order": [
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ]
+  ],
+  "attention_before": {
+    "milliseconds": [
+      9.299796,
+      9.301655,
+      9.354462,
+      9.262679,
+      9.293228,
+      9.287464,
+      9.308219,
+      9.315437,
+      9.261347,
+      9.294075,
+      9.239907,
+      9.284429,
+      9.288097,
+      9.299796,
+      9.234545,
+      9.308031,
+      9.209197,
+      9.312566,
+      9.276111,
+      9.244455
+    ],
+    "median_ms": 9.2906625,
+    "memory": {
+      "peak_python_bytes": 31557,
+      "note": "Python allocations only; excludes CPU tensor storage"
+    },
+    "operations": {
+      "key_float_copies": 4,
+      "arange_calls": 2,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 2,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 158,
+      "stack_calls": 0,
+      "index_put_calls": 0,
+      "tolist_calls": 0,
+      "tolist_elements": 0
+    }
+  },
+  "attention_after": {
+    "milliseconds": [
+      9.289754,
+      9.325464,
+      9.277823,
+      9.276352,
+      9.236984,
+      9.271509,
+      9.273999,
+      9.24758,
+      9.329131,
+      9.280253,
+      9.274779,
+      9.303527,
+      9.253987,
+      9.272624,
+      9.275725,
+      9.281349,
+      9.258238,
+      9.277553,
+      9.290464,
+      9.2771
+    ],
+    "median_ms": 9.276726,
+    "memory": {
+      "peak_python_bytes": 31557,
+      "note": "Python allocations only; excludes CPU tensor storage"
+    },
+    "operations": {
+      "key_float_copies": 4,
+      "arange_calls": 2,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 2,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 158,
+      "stack_calls": 0,
+      "index_put_calls": 0,
+      "tolist_calls": 0,
+      "tolist_elements": 0
+    }
+  },
+  "selection_paired_order": [
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ]
+  ],
+  "selection_before": {
+    "milliseconds": [
+      0.747271,
+      0.733363,
+      0.729014,
+      0.725297,
+      0.725794,
+      0.724135,
+      0.747623,
+      0.716412,
+      0.719634,
+      0.714735,
+      0.719318,
+      0.742173,
+      0.72101,
+      0.724575,
+      0.723248,
+      0.719393,
+      0.721406,
+      0.753123,
+      0.724407,
+      0.721769
+    ],
+    "median_ms": 0.724271,
+    "memory": {
+      "peak_python_bytes": 193501,
+      "note": "Python allocations only; excludes CPU tensor storage"
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 0,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 6,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 0,
+      "stack_calls": 1,
+      "index_put_calls": 2,
+      "tolist_calls": 1,
+      "tolist_elements": 4160
+    }
+  },
+  "selection_after": {
+    "milliseconds": [
+      0.732872,
+      0.7381,
+      0.740916,
+      0.728355,
+      0.7279,
+      0.738258,
+      0.726553,
+      0.718262,
+      0.709086,
+      0.717343,
+      0.739204,
+      0.739383,
+      0.720094,
+      0.714066,
+      0.747078,
+      0.746293,
+      0.72262,
+      0.722291,
+      0.713777,
+      0.743742
+    ],
+    "median_ms": 0.7281275,
+    "memory": {
+      "peak_python_bytes": 193428,
+      "note": "Python allocations only; excludes CPU tensor storage"
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 0,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 6,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 0,
+      "stack_calls": 1,
+      "index_put_calls": 2,
+      "tolist_calls": 1,
+      "tolist_elements": 4160
+    }
+  },
+  "replay_mask_paired_order": [
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ]
+  ],
+  "replay_mask_before": {
+    "milliseconds": [
+      2.714248,
+      2.708923,
+      2.715894,
+      2.693978,
+      2.722354,
+      2.699449,
+      2.700714,
+      2.709671,
+      2.703431,
+      2.705633,
+      2.706225,
+      2.724403,
+      2.723758,
+      2.706758,
+      2.705612,
+      2.699078,
+      2.691751,
+      2.683104,
+      2.691616,
+      2.691632
+    ],
+    "median_ms": 2.7056225,
+    "memory": {
+      "peak_python_bytes": 31140,
+      "note": "Python allocations only; excludes CPU tensor storage"
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 1,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 67,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 1111,
+      "stack_calls": 1,
+      "index_put_calls": 63,
+      "tolist_calls": 0,
+      "tolist_elements": 0
+    }
+  },
+  "replay_mask_after": {
+    "milliseconds": [
+      2.721906,
+      2.719338,
+      2.731978,
+      2.706701,
+      2.712524,
+      2.691083,
+      2.758426,
+      2.709148,
+      2.69191,
+      2.758127,
+      2.707327,
+      2.71806,
+      2.709068,
+      2.69512,
+      2.721973,
+      2.702845,
+      2.70952,
+      2.69432,
+      2.687718,
+      2.681509
+    ],
+    "median_ms": 2.7091079999999996,
+    "memory": {
+      "peak_python_bytes": 31306,
+      "note": "Python allocations only; excludes CPU tensor storage"
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 1,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 67,
+      "random_draw_calls": 0,
+      "random_draw_elements": 0,
+      "select_calls": 1111,
+      "stack_calls": 1,
+      "index_put_calls": 63,
+      "tolist_calls": 0,
+      "tolist_elements": 0
+    }
+  },
+  "dropout_paired_order": [
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ],
+    [
+      "before",
+      "after"
+    ],
+    [
+      "after",
+      "before"
+    ]
+  ],
+  "dropout_before": {
+    "milliseconds": [
+      4.525408,
+      4.511127,
+      4.528696,
+      4.557422,
+      4.583893,
+      4.539218,
+      4.517166,
+      4.492632,
+      4.508116,
+      4.475367,
+      4.571568,
+      4.512784,
+      4.501815,
+      4.505144,
+      4.53109,
+      4.509598,
+      4.508219,
+      4.503611,
+      4.53249,
+      4.536869
+    ],
+    "median_ms": 4.514975,
+    "memory": {
+      "peak_python_bytes": 148354,
+      "note": "Python allocations only; excludes CPU tensor storage"
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 4,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 2,
+      "random_draw_calls": 8,
+      "random_draw_elements": 258816,
+      "select_calls": 2422,
+      "stack_calls": 4,
+      "index_put_calls": 2,
+      "tolist_calls": 8,
+      "tolist_elements": 4844
+    }
+  },
+  "dropout_after": {
+    "milliseconds": [
+      4.544563,
+      4.555823,
+      4.512407,
+      4.51126,
+      4.497857,
+      4.477153,
+      4.526818,
+      4.483875,
+      4.536086,
+      4.512953,
+      4.503233,
+      4.530141,
+      4.543345,
+      4.541898,
+      4.505076,
+      4.515611,
+      4.512282,
+      4.515166,
+      4.54881,
+      4.542232
+    ],
+    "median_ms": 4.5153885,
+    "memory": {
+      "peak_python_bytes": 148354,
+      "note": "Python allocations only; excludes CPU tensor storage"
+    },
+    "operations": {
+      "key_float_copies": 0,
+      "arange_calls": 4,
+      "scalar_reads": 0,
+      "candidate_index_tensors": 2,
+      "random_draw_calls": 8,
+      "random_draw_elements": 258816,
+      "select_calls": 2422,
+      "stack_calls": 4,
+      "index_put_calls": 2,
+      "tolist_calls": 8,
+      "tolist_elements": 4844
+    }
+  }
+}
