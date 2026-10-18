@@ -146,23 +146,27 @@ class V5Execution:
                 or sample_indices.dtype!=torch.long or token_positions.dtype!=torch.long
                 or type(hidden_size) is not int or hidden_size<=0):
             raise ValueError('v5 dropout requires aligned int64 source coordinates')
-        samples,positions = sample_indices.tolist(),token_positions.tolist()
-        if self.debug and any(not 0<=r<len(self.spec.rows) or not 0<=t<self.spec.rows[r][1] for r,t in zip(samples,positions)):
-            raise ValueError('v5 dropout coordinates outside source valid length')
+        if self.debug:
+            samples,positions = sample_indices.tolist(),token_positions.tolist()
+            if any(not 0<=r<len(self.spec.rows) or not 0<=t<self.spec.rows[r][1] for r,t in zip(samples,positions)):
+                raise ValueError('v5 dropout coordinates outside source valid length')
         role,unit,phase = frame
         if self.debug and role=='F' and phase=='original':
             if site in self._original_sites: raise RuntimeError('duplicate v5 original F stochastic site')
             self._original_sites.add(site)
         if self.debug:
             self.events.append(dict(role=role,unit=unit,phase=phase,site=site))
-        masks = {}
-        for row in set(samples):
+        source_indices = sample_indices.to(device=device)
+        source_positions = token_positions.to(device=device)
+        result = torch.empty((source_indices.numel(),hidden_size),device=device,dtype=torch.float32)
+        for row in source_indices.unique().tolist():
             slot,length = self.spec.rows[row]
             generator = torch.Generator(device=device)
             generator.manual_seed(stage1_sample_seed(self.spec.base_seed,self.spec.optimizer_global_step,slot,site))
-            masks[row] = torch.rand((length,hidden_size),device=device,dtype=torch.float32,generator=generator).ge(p).float()
-        return (torch.stack([masks[r][t] for r,t in zip(samples,positions)]) if samples
-                else torch.empty((0,hidden_size),device=device,dtype=torch.float32))
+            mask = torch.rand((length,hidden_size),device=device,dtype=torch.float32,generator=generator).ge(p).float()
+            indices = (source_indices==row).nonzero(as_tuple=True)[0]
+            result.index_copy_(0,indices,mask.index_select(0,source_positions[indices]))
+        return result
 
     def native_dropout(self, site, p, x):
         if (not isinstance(x,Tensor) or x.ndim!=3 or not x.is_floating_point()

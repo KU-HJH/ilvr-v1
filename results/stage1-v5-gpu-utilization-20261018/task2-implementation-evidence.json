@@ -1,0 +1,219 @@
+{
+  "task": "Task 2: exact replay-mask and source-coordinate dropout tensor assembly",
+  "base_commit": "43d71f37872ad0294e0bd465fd0b2a167c1ff31a",
+  "baseline_commit": "65643f08cb6e61fbbb200de825d57086f5c7a127",
+  "approved_spec": "docs/superpowers/specs/2026-10-18-stage1-v5-gpu-utilization-commitment-v1.md",
+  "approved_spec_sha256": "843832ae9b09c10f28dea3dea60ceaa8d845f77f103f98259d4f26304cbe659a",
+  "implementation_method": "Subagent-driven Task 2 implementer; root owns independent specification and quality reviews",
+  "tdd_skill": "/root/.codex/plugins/cache/openai-curated/superpowers/bd2122cb/skills/test-driven-development/SKILL.md",
+  "candidate_content_sha256": {
+    "src/stage1/v5_execution.py": "d18a3a41c74d741228442100a471ab208dce8e3c0912fc33361a79e26a4f0ad1",
+    "transformers/src/transformers/models/qwen2_5_vl/stage1_v5_replay.py": "27d42a8f03e9a547a01d7b4538bdd17409662bf74e2cee998da7eb9aba670797",
+    "tests/stage1/v5/test_gpu_utilization.py": "d307e909210cc39a9c76152199e94e7558d8fc5bbb47e75cfdb290e1e5e0b8ae",
+    "tests/stage1/v5/gpu_utilization_fixtures.py": "5fb072395ab2cb63f878e191deaa05d236b738c1dc990f01e5d19821f0535bd0"
+  },
+  "verification": [
+    {
+      "phase": "causal RED, before production changes",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t2-red",
+      "exit": 1,
+      "passed": 43,
+      "skipped": 30,
+      "failed": 2,
+      "failure_cause": "Actual dispatched operations grow with suffix queries and requested dropout tokens; exact fixtures pass",
+      "log": "logs/stage1-v5-gpu-utilization-20261018/task2-red.log",
+      "log_sha256": "1eb6446013912b87407e8a9e5b0d140ef71ecc62f835f23c428a2857e927c852"
+    },
+    {
+      "phase": "focused GREEN",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_execution.py tests/stage1/v5/test_replay.py --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t2-green",
+      "exit": 0,
+      "passed": 75,
+      "skipped": 30,
+      "scope": "Independent exact CPU masks/raw dropout including padding, sparse queries, branch combinations, inactive/empty blocks, empty/permuted/duplicate coordinates, multiple sources/sites/probabilities and debug rejection; existing native FP32 loss/gradient full-sequence oracle, checkpoint off/early/full, lifecycle and negative controls",
+      "loss_gradient_atol": 1e-05,
+      "loss_gradient_rtol": 0.0001,
+      "maximum_total_gradient_error": 2.2351741790771484e-08,
+      "maximum_raw_K_gradient_error": 2.4783730623312294e-09,
+      "log": "logs/stage1-v5-gpu-utilization-20261018/task2-green.log",
+      "log_sha256": "9fb1dc3fb20767c6ce31340e0893d2b43d1174002b226c503d4975a87151170d"
+    },
+    {
+      "phase": "CUDA resource preflight",
+      "command": "nvidia-smi --query-gpu=index,uuid,name,utilization.gpu,memory.used,memory.total --format=csv; nvidia-smi --query-compute-apps=gpu_uuid,pid,process_name,used_memory --format=csv",
+      "exit": 0,
+      "scope": "Both H100 NVL GPUs: zero utilization, zero used MiB, no compute processes; immediately before operator check",
+      "log": "logs/stage1-v5-gpu-utilization-20261018/task2-cuda-idle.log",
+      "log_sha256": "6db3f8668f3e04aca0c59ebf16cf7895c51a2f2f573e91f8f68a02ed1796e3a8"
+    },
+    {
+      "phase": "one local CUDA operator comparison",
+      "command": "CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python scripts/benchmark_stage1_v5_attention_selection.py --device cuda:0 --warmup 3 --repetitions 20 --output results/stage1-v5-gpu-utilization-20261018/task2-operators-cuda.json",
+      "exit": 0,
+      "mask_exact_equal": true,
+      "dropout_exact_equal": true,
+      "cpu_and_cuda_global_rng_unchanged": true,
+      "scope": "Existing four-operator script; attention/selection remain unchanged; dummy replay decoder plus actual private-generator native/packed checkpoint dropout with backward. No model loading, training or optimizer step",
+      "report": "results/stage1-v5-gpu-utilization-20261018/task2-operators-cuda.json",
+      "report_sha256": "9dbb3bc601a72334f836f244a1f18c337ab129420dff2ef175a8d06b1556bf39",
+      "log": "logs/stage1-v5-gpu-utilization-20261018/task2-operators-cuda.log",
+      "log_sha256": "9dbb3bc601a72334f836f244a1f18c337ab129420dff2ef175a8d06b1556bf39"
+    },
+    {
+      "phase": "self-review whitespace",
+      "command": "git diff --check",
+      "exit": 0
+    },
+    {
+      "phase": "result validation",
+      "scope": "Assert exactness/RNG flags, paired raw timing lengths/order, and unchanged complete private-generator draw calls/elements",
+      "exit": 0
+    }
+  ],
+  "causal_dispatch_evidence": {
+    "replay_suffix_lengths": [
+      4,
+      32
+    ],
+    "replay_frozen_select_copy": [
+      [
+        34,
+        4
+      ],
+      [
+        230,
+        32
+      ]
+    ],
+    "replay_candidate_select_copy": [
+      [
+        3,
+        0
+      ],
+      [
+        3,
+        0
+      ]
+    ],
+    "dropout_token_counts": [
+      16,
+      256
+    ],
+    "dropout_frozen_select_stack_tolist_sizes": [
+      [
+        16,
+        1,
+        [
+          16,
+          16
+        ]
+      ],
+      [
+        256,
+        1,
+        [
+          256,
+          256
+        ]
+      ]
+    ],
+    "dropout_candidate_select_stack_tolist_sizes": [
+      [
+        0,
+        0,
+        [
+          3
+        ]
+      ],
+      [
+        0,
+        0,
+        [
+          3
+        ]
+      ]
+    ]
+  },
+  "cuda_summary": {
+    "replay_mask": {
+      "median_ms_before": 6.885023,
+      "median_ms_after": 0.955306,
+      "extra_peak_allocated_bytes_before": 1115648,
+      "extra_peak_allocated_bytes_after": 1129472,
+      "peak_reserved_bytes_before": 37748736,
+      "peak_reserved_bytes_after": 37748736,
+      "operations_before": {
+        "key_float_copies": 0,
+        "arange_calls": 1,
+        "scalar_reads": 0,
+        "candidate_index_tensors": 67,
+        "random_draw_calls": 0,
+        "random_draw_elements": 0,
+        "select_calls": 1111,
+        "stack_calls": 1,
+        "index_put_calls": 63,
+        "tolist_calls": 0,
+        "tolist_elements": 0
+      },
+      "operations_after": {
+        "key_float_copies": 0,
+        "arange_calls": 2,
+        "scalar_reads": 0,
+        "candidate_index_tensors": 6,
+        "random_draw_calls": 0,
+        "random_draw_elements": 0,
+        "select_calls": 4,
+        "stack_calls": 0,
+        "index_put_calls": 1,
+        "tolist_calls": 0,
+        "tolist_elements": 0
+      }
+    },
+    "dropout": {
+      "median_ms_before": 4.471019,
+      "median_ms_after": 2.1165875,
+      "extra_peak_allocated_bytes_before": 1414144,
+      "extra_peak_allocated_bytes_after": 1414144,
+      "peak_reserved_bytes_before": 37748736,
+      "peak_reserved_bytes_after": 37748736,
+      "operations_before": {
+        "key_float_copies": 0,
+        "arange_calls": 4,
+        "scalar_reads": 0,
+        "candidate_index_tensors": 2,
+        "random_draw_calls": 8,
+        "random_draw_elements": 258816,
+        "select_calls": 2422,
+        "stack_calls": 4,
+        "index_put_calls": 2,
+        "tolist_calls": 8,
+        "tolist_elements": 4844
+      },
+      "operations_after": {
+        "key_float_copies": 0,
+        "arange_calls": 4,
+        "scalar_reads": 0,
+        "candidate_index_tensors": 2,
+        "random_draw_calls": 8,
+        "random_draw_elements": 258816,
+        "select_calls": 0,
+        "stack_calls": 0,
+        "index_put_calls": 2,
+        "tolist_calls": 4,
+        "tolist_elements": 8
+      }
+    }
+  },
+  "self_review": {
+    "verdict": "No unresolved Task 2 implementation concerns identified; independent root reviews pending",
+    "mask": "One floating output bias. Visibility intermediates are rows/prefix, suffix/suffix, and rows/suffix; no second full rows/query/keys float or bool workspace. V rows precede Text rows; sparse predictor exclusions are flattened once. Position IDs, prefix concatenation/gradient attachment, logits projection and context cleanup unchanged",
+    "dropout": "Private FP32 full-source draws and seed inputs retained per source/site; source indexing preserves requested order/duplicates. Native division and packed multiplication unchanged. Debug-only coordinate lists/validation, event ownership and lifecycle retained. No persistent mask cache",
+    "preserved_files": "All immutable frozen sources, native replay oracle, attention and selector production files unchanged"
+  },
+  "limitations": [
+    "Unique-source identity host reads and per-source nonzero may synchronize; no zero-synchronization claim",
+    "CUDA edge-case pytest variants skipped in CPU run; CUDA exactness/performance witness is existing fixed operator geometry",
+    "Local bounded operator timings do not establish production BF16 equivalence, actual stage bottleneck attribution or two-node/four-rank training speed",
+    "Independent specification/quality reviews and later completion gates belong to root and remain pending"
+  ]
+}

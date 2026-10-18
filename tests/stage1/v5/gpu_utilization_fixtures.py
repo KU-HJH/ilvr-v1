@@ -46,6 +46,7 @@ class OperatorCounts(ThroughputCounts):
         super().__init__(key_shape)
         self.random_draw_calls = self.random_draw_elements = 0
         self.select_calls = self.stack_calls = self.index_put_calls = 0
+        self.copy_calls = self.masked_fill_calls = 0
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         if func == torch.ops.aten.rand.generator:
@@ -57,6 +58,10 @@ class OperatorCounts(ThroughputCounts):
             self.stack_calls += 1
         if func == torch.ops.aten.index_put_.default:
             self.index_put_calls += 1
+        if func == torch.ops.aten.copy_.default:
+            self.copy_calls += 1
+        if func == torch.ops.aten.masked_fill_.Scalar:
+            self.masked_fill_calls += 1
         return super().__torch_dispatch__(func, types, args, kwargs)
 
 
@@ -66,9 +71,11 @@ class ReplayMaskDecoder(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList([nn.Identity(), nn.Identity()])
         self.bias = None
+        self.arguments = None
 
     def forward(self, *, inputs_embeds, attention_mask, **kwargs):
         self.bias = attention_mask
+        self.arguments = dict(inputs_embeds=inputs_embeds, **kwargs)
         return SimpleNamespace(last_hidden_state=inputs_embeds)
 
 
@@ -93,11 +100,53 @@ def replay_fixture(device, length=512):
 
 
 @torch.no_grad()
-def run_replay_mask(replay, fixture):
+def run_replay_mask(replay, fixture, *, need_voff=True, need_textoff=True):
     replay(fixture.decoder, fixture.head, fixture.trace, fixture.blocks, execution=fixture.execution,
-           need_voff=True, need_textoff=True)
+           need_voff=need_voff, need_textoff=need_textoff)
     bias, fixture.decoder.bias = fixture.decoder.bias, None
+    fixture.decoder.arguments = None
     return bias
+
+
+def replay_edge_fixture(device, dtype=torch.float32):
+    """Unequal source/suffix lengths, sparse targets, padding and empty body/block.
+
+    Values and coordinates are inputs only: expected masks come from the pinned
+    original replay, never from a candidate visibility formula.
+    """
+    generator = torch.Generator().manual_seed(619)
+    length = 40
+    x = torch.randn(3, length, 8, generator=generator).to(device=device, dtype=dtype)
+    padding = (torch.arange(length, device=device)[None] <
+               torch.tensor([37, 31, 23], device=device)[:, None]).long()
+    padding[0, [1, 5]], padding[1, [0, 2]], padding[2, [3, 6]] = 0, 0, 0
+    positions = torch.stack((torch.arange(length) * 2, torch.arange(length) * 3 + 1,
+                             torch.arange(length) + 5))[:, None].expand(-1, 3, -1).to(device)
+    kv = tuple(tuple(torch.randn(3, 2, length, 4, generator=generator).to(device=device, dtype=dtype)
+                     for _ in range(2)) for _ in range(2))
+    trace = V5Trace(inputs_embeds=x, position_ids=positions, padding=padding, key_values=kv)
+    blocks = (
+        V5ReplayBlock(2, 10, 11, (12, 14, 17), (0, 1, 2), ((5, 1, 5), (), (0, 4))),
+        V5ReplayBlock(0, 4, 7, (), (), ()),
+        V5ReplayBlock(0, 15, 21, (22, 25, 29), (3, 4, 5), ((0, 8), (9,), (8, 2))),
+        V5ReplayBlock(1, 4, 9, (10, 13), (6, 7), ((), (3, 1))),
+    )
+    return SimpleNamespace(decoder=ReplayMaskDecoder().to(device), head=nn.Identity(), trace=trace,
+                           blocks=blocks, execution=SimpleNamespace(debug=False, dropout_mask=None))
+
+
+def run_raw_dropout(execution_type, spec, samples, positions, *, p=.05, hidden_size=5, debug=False):
+    """Exercise real graph/unit ownership around each stochastic site."""
+    results = []
+    with execution_type(spec, debug=debug) as owner:
+        with owner.graph('F'):
+            with owner.checkpoint_contexts('F', ('decoder', 0))[0]:
+                for site in spec.expected_sites:
+                    results.append(owner.dropout_mask(site, p, sample_indices=samples,
+                        token_positions=positions, hidden_size=hidden_size, device=samples.device))
+        with owner.backward():
+            pass
+    return tuple(results), owner
 
 
 def dropout_fixture(device):

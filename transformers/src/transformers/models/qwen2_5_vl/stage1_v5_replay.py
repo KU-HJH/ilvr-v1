@@ -52,25 +52,34 @@ def run_v5_packed_replay(decoder: nn.Module,lm_head: nn.Module,trace: V5Trace,
     prefix_length = max(b.end for b in active)
     length = max(max(b.target_positions)-b.end for b in active)
     samples = torch.tensor([b.batch_index for _,b in rows],device=x.device)[:,None].expand(-1,length)
-    starts = torch.tensor([b.end for _,b in rows],device=x.device)[:,None]
-    positions = starts+torch.arange(length,device=x.device)[None]
-    valid = torch.stack([positions[i]<max(b.target_positions) for i,(_,b) in enumerate(rows)])
+    row_ends = torch.tensor([b.end for _,b in rows],device=x.device)
+    suffix_keys = torch.arange(length,device=x.device)
+    positions = row_ends[:,None]+suffix_keys[None]
+    last_targets = torch.tensor([max(b.target_positions) for _,b in rows],device=x.device)
+    valid = positions<last_targets[:,None]
     positions = positions.clamp_max(x.shape[1]-1)
     embeds = x[samples,positions]*valid[:,:,None]
     ids = trace.position_ids[:,samples,positions]
+    prefix_keys = torch.arange(prefix_length,device=x.device)
+    prefix_valid = prefix_keys[None]<row_ends[:,None]
+    prefix_valid &= trace.padding[samples[:,0],:prefix_length].bool()
+    causal = suffix_keys[None]<=suffix_keys[:,None]
     bias = x.new_full((len(rows),1,length,prefix_length+length),float('-inf'))
-    for i,(kind,b) in enumerate(rows):
-        actual = max(b.target_positions)-b.end
-        for q in range(actual):
-            bias[i,0,q,:b.end] = torch.where(trace.padding[b.batch_index,:b.end].bool(),0.,float('-inf')).to(x.dtype)
-            bias[i,0,q,prefix_length:prefix_length+q+1] = 0
-        # Padded queries cannot influence valid suffix queries or selected scores.
-        bias[i,0,actual:,0] = 0
-        if kind=='v':
-            bias[i,0,:actual,b.start+1:b.end] = float('-inf')
-        else:
-            for target,blocked in zip(b.target_positions,b.blocked_text_keys):
-                bias[i,0,target-1-b.end,list(blocked)] = float('-inf')
+    bias[...,:prefix_length].masked_fill_(prefix_valid[:,None,None,:],0.)
+    bias[...,prefix_length:].masked_fill_(causal[None,None],0.)
+    bias.masked_fill_(~valid[:,None,:,None],float('-inf'))
+    # Padded queries cannot influence valid suffix queries or selected scores.
+    bias[:,0,:,0].masked_fill_(~valid,0.)
+    row_starts = torch.tensor([b.start for _,b in rows],device=x.device)
+    voff_rows = torch.tensor([kind=='v' for kind,_ in rows],device=x.device)
+    body_keys = (prefix_keys[None]>row_starts[:,None]) & (prefix_keys[None]<row_ends[:,None])
+    body_keys &= voff_rows[:,None]
+    bias[...,:prefix_length].masked_fill_(body_keys[:,None,None,:],float('-inf'))
+    exclusions = [(i,target-1-b.end,key) for i,(kind,b) in enumerate(rows) if kind=='text'
+                  for target,blocked in zip(b.target_positions,b.blocked_text_keys) for key in blocked]
+    if exclusions:
+        row_indices,queries,keys_to_block = torch.tensor(exclusions,device=x.device).unbind(1)
+        bias[row_indices,0,queries,keys_to_block] = float('-inf')
     prefixes = tuple(tuple(torch.cat([
         torch.nn.functional.pad(value[b.batch_index:b.batch_index+1,:,:b.end],(0,0,0,prefix_length-b.end))
         for _,b in rows],dim=0) for value in pair) for pair in trace.key_values)
