@@ -79,3 +79,15 @@ Root's reviewed `1b2e690` restored/optimized run completed exit 0 in 73.66638455
 Instrumented generation times: baseline 14.531080/9.376896/12.138811 seconds, optimized 6.088484/4.088840/5.308616 seconds. Total **36.046787 → 15.485939 seconds, 2.327711x**, about 57.04% less generation time for these three measured samples. These single-pass times include decoder tracing and are not a full benchmark throughput claim. Supported DoRA norm calls fall from 40,320/27,216/35,280 to 252 per sample; embedding materializations fall from 152/100/132 to one per sample, witnessing the intended removed repetition. The unchanged original native KV/config and effective weights remain the baseline.
 
 Root read both complete comparison reports and independently compared all observations. `results/eval-correction-20261018/verification-summary.json` records numbers, exact revisions, budgets and limits. Total approved validation process time used is 124.10598294483498 seconds of 600; only source indices 0,3,12 were used, caps 256/512. No full TEST400 or training was launched. Whole-branch final review, fresh project-suite completion evidence and branch handoff remain pending.
+
+## Final review and selected completion witnesses
+
+Whole-branch independent reviewer `/root/original_eval_final_review` returned PASS for `65643f0..d887905` (product `1b2e690`), no unresolved findings. It traced actual loader/generation/cache/CLI/shard/scoring/error paths and independently checked four snapshot hashes, 22 shared support hashes, all recorded exact observations/parameters/config/decoder inputs, natural coverage and the 2.32771x timing arithmetic. No new tests/GPU were run by this reviewer; it reused the applicable evidenced task reviews. Snapshot-preserved whitespace warnings are distinguished from authored changes.
+
+Root now invokes verification-before-completion and finishing-a-development-branch. Finishing applies immediately after verification to this named, externally managed worktree, with human-owned merge/PR/keep/discard choice and no automatic cleanup. One project full-suite command supplies the overlapping CPU test-pass witness for both gates:
+
+```bash
+env CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/eval-correction-20261018/final-pytest-r1 > logs/eval-correction-20261018/final-full-suite.log 2>&1
+```
+
+CPU masking keeps this verification separate from the approved trained GPU budget. Root must read the complete output and resolve any actual failures before a test-pass/branch-completion claim. Separate claim-specific witnesses already run on the unchanged product: trained source/restored first nail, restored/static exact comparison and timings, and command-construction-only full400 dry-run. They establish only their recorded scope. No duplicate broad suite, build/lint claim, full400 parity or remote runtime readiness is inferred.
