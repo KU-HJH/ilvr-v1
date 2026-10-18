@@ -52,6 +52,8 @@ class OperatorCounts(ThroughputCounts):
         self.copy_calls = self.masked_fill_calls = 0
         self.integer_float_casts = self.stable_sort_calls = 0
         self.matmul_shapes = []
+        self.bmm_inputs = []
+        self.latest_key_float_storage = None
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -62,6 +64,10 @@ class OperatorCounts(ThroughputCounts):
             self.stable_sort_calls += 1
         if func in (torch.ops.aten.mm.default, torch.ops.aten.bmm.default):
             self.matmul_shapes.append((tuple(args[0].shape), tuple(args[1].shape)))
+        if func == torch.ops.aten.bmm.default:
+            self.bmm_inputs.append(dict(left_shape=tuple(args[0].shape), right_shape=tuple(args[1].shape),
+                right_stride=tuple(args[1].stride()), right_storage=args[1].untyped_storage().data_ptr(),
+                key_float_storage=self.latest_key_float_storage))
         if func == torch.ops.aten.rand.generator:
             self.random_draw_calls += 1
             self.random_draw_elements += math.prod(args[0])
@@ -75,7 +81,11 @@ class OperatorCounts(ThroughputCounts):
             self.copy_calls += 1
         if func == torch.ops.aten.masked_fill_.Scalar:
             self.masked_fill_calls += 1
-        return super().__torch_dispatch__(func, types, args, kwargs)
+        output = super().__torch_dispatch__(func, types, args, kwargs)
+        if (func == torch.ops.aten._to_copy.default and tuple(args[0].shape) == self.key_shape
+                and kwargs.get('dtype') == torch.float32):
+            self.latest_key_float_storage = output.untyped_storage().data_ptr()
+        return output
 
 
 def selector_boundary_fixture(case='normal', *, attention_device='cpu', logits_device='cpu'):
@@ -218,7 +228,9 @@ def joint_selection_comparison(metadata, before_rows, after_rows, clean, referen
     for case, config in configs.items():
         expected = original(metadata, before_rows, clean, reference, config, compact_attention=True)
         actual = select_v5_text_keys(metadata, after_rows, clean, reference, config, compact_attention=True)
+        identical_after_rows = original(metadata, after_rows, clean, reference, config, compact_attention=True)
         results[case] = dict(exact=list(actual.items()) == list(expected.items()),
+            selector_on_identical_after_rows_exact=list(actual.items()) == list(identical_after_rows.items()),
             keys=[dict(query=list(key), before=list(expected[key]), after=list(actual[key]))
                   for key in metadata.query_keys],
             rho_min=config.rho_min, rho_max=config.rho_max, low_attention_mass=config.low_attention_mass)

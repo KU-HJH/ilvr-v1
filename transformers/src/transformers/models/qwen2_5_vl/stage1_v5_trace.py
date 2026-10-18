@@ -221,7 +221,15 @@ def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
                 sample_k = k[row].float().transpose(-2,-1)
                 for start in range(0,len(queries),chunk):
                     positions = query_indices[row][start:start+chunk]
-                    scores = q[row].index_select(1,positions).float() @ sample_k
+                    query = q[row].index_select(1,positions).float()
+                    # Keep each dot product's original M=1 reduction shape.
+                    # Batch independent queries per head; expanded K is a view.
+                    # Head outputs plus their stack fit the same two-workspace
+                    # target, and the temporary head list ends before softmax.
+                    scores = torch.stack([torch.bmm(query[head,:,None],
+                        sample_k[head][None].expand(positions.numel(),-1,-1)).squeeze(1)
+                        for head in range(query.shape[0])])
+                    del query
                     visible = (coordinates[None]<=positions[:,None]) & sample_padding[row][None]
                     weights = scores.mul_(attn.scaling).masked_fill_(
                         ~visible[None],float('-inf')).softmax(-1).mean(0)

@@ -241,18 +241,67 @@ def test_attention_dispatches_bounded_query_chunks_with_remainders(monkeypatch, 
     if budget_chunks is not None:
         monkeypatch.setattr(trace_module, 'V5_ATTENTION_WORKSPACE_BYTES', budget, raising=False)
     chunk = max(1, min(32, budget // (2 * fixture.heads * fixture.length * 4)))
-    with OperatorCounts() as counts:
+    with OperatorCounts((fixture.heads, fixture.length, fixture.dim)) as counts:
         observe_joint(trace_module.capture_v5_trace, fixture)
-    matmuls = [a for a, b in counts.matmul_shapes if b == (fixture.heads, fixture.dim, fixture.length)]
-    expected = 2 * fixture.layers * ((queries + chunk - 1) // chunk)
-    print(f'ATTENTION_CHUNKS queries_per_sample={queries} chunk={chunk} dispatched={matmuls}')
-    assert len(matmuls) == expected, 'attention still dispatches one GEMM per query'
-    assert [shape[-2] for shape in matmuls] == [
+    matmuls = [entry for entry in counts.bmm_inputs
+               if entry['right_shape'][-2:] == (fixture.dim, fixture.length)]
+    expected = 2 * fixture.layers * fixture.heads * ((queries + chunk - 1) // chunk)
+    shapes = [entry['left_shape'] for entry in matmuls]
+    print(f'ATTENTION_MATRIX_VECTORS queries_per_sample={queries} chunk={chunk} count={len(matmuls)} '
+          f'shapes={sorted(set(shapes))} batched_K_zero_stride=True')
+    assert all(shape[-2] == 1 for shape in shapes), 'score dot product changed from original M=1 shape'
+    assert len(matmuls) == expected, 'score dispatch must be bounded by heads times query chunks'
+    assert [shape[0] for shape in shapes] == [
         min(chunk, queries - offset) for _ in range(fixture.layers) for _ in range(2)
-        for offset in range(0, queries, chunk)]
-    assert all(2 * fixture.heads * shape[-2] * fixture.length * 4 <= budget for shape in matmuls)
+        for offset in range(0, queries, chunk) for _ in range(fixture.heads)]
+    assert all(2 * fixture.heads * shape[0] * fixture.length * 4 <= budget for shape in shapes)
+    assert counts.key_float_copies == 2 * fixture.layers
+    for entry in matmuls:
+        assert entry['right_shape'][0] == entry['left_shape'][0]
+        assert entry['right_shape'][0] == 1 or entry['right_stride'][0] == 0
+        assert entry['right_storage'] == entry['key_float_storage'], 'score path copied/replicated current sample K storage'
     assert trace_module.V5_ATTENTION_QUERY_CHUNK_MAX == 32
     assert trace_module.V5_ATTENTION_WORKSPACE_BYTES == budget
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('profile', ['default', 'long'])
+def test_joint_matrix_vector_repair_matches_frozen_original_geometry(device, profile):
+    from types import SimpleNamespace
+    from scripts.benchmark_stage1_v5_attention_selection import benchmark_geometry
+    from tests.stage1.v5.throughput_fixtures import observation_fixture
+    from tests.stage1.v5.gpu_utilization_fixtures import (
+        ATTENTION_ATOL, ATTENTION_RTOL, joint_metadata, joint_selection_comparison, observe_joint, original_module,
+    )
+    from transformers.models.qwen2_5_vl.stage1_v5_trace import capture_v5_trace
+    geometry = benchmark_geometry(profile)
+    decoder, inputs, keys, candidates = observation_fixture(
+        **{name: geometry[name] for name in ('length', 'queries', 'heads', 'dim', 'layers')})
+    fixture = SimpleNamespace(decoder=decoder.to(device), inputs={key: value.to(device) for key, value in inputs.items()},
+                              keys=keys, candidates=candidates)
+    before, original_projections = observe_joint(original_module('stage1_v5_trace').capture_v5_trace, fixture)
+    after, current_projections = observe_joint(capture_v5_trace, fixture)
+    assert len(original_projections) == len(current_projections) == 2 * geometry['layers']
+    assert all(torch.equal(a, b) for a, b in zip(original_projections, current_projections))
+    for key in keys:
+        torch.testing.assert_close(after[key], before[key], atol=ATTENTION_ATOL, rtol=ATTENTION_RTOL)
+    generator = torch.Generator().manual_seed(809)
+    clean, reference = (torch.randn(len(keys), 17, generator=generator).to(device) for _ in range(2))
+    joint = joint_selection_comparison(joint_metadata(keys, candidates), before, after, clean, reference)
+    changed = {case: [entry for entry in result['keys'] if entry['before'] != entry['after']]
+               for case, result in joint.items() if not result['exact']}
+    assert all(result['selector_on_identical_after_rows_exact'] for result in joint.values())
+    if profile == 'long' and device == 'cpu':
+        restored = next(entry for entry in joint['cumulative_equal']['keys'] if entry['query'] == [1, 8125])
+        assert restored['before'] == restored['after'] == [289, 1235]
+        print(f'LONG_CAUSAL_RESTORED query=(1,8125) before={restored["before"]} after={restored["after"]}')
+    absolute = max(float((before[key] - after[key]).abs().max()) for key in keys)
+    relative = max(float(((before[key] - after[key]).abs() /
+        before[key].abs().clamp_min(torch.finfo(torch.float32).tiny)).max()) for key in keys)
+    print(f'JOINT_MATRIX_VECTOR device={device} profile={profile} queries={len(keys)} '
+          f'rows_exact={all(torch.equal(before[key], after[key]) for key in keys)} '
+          f'max_abs={absolute} max_rel={relative} exact_keys={not changed} changed={changed}')
+    assert not changed, f'changed discrete selections: {changed}'
 
 
 @pytest.mark.parametrize('device', DEVICES)

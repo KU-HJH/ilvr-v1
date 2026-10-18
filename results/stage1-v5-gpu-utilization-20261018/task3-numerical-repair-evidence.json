@@ -1,0 +1,292 @@
+{
+  "task": "Task3 numerical repair after Task4 exact-selection failure",
+  "base_commit": "b3e13a4abcc237e10c397eb076be8bd3b79a9f55",
+  "agent": "/root/gpu_util_t3_impl",
+  "active_phase": "Implemented and self-reviewed; independent SPEC then QUALITY fix reviews pending",
+  "authorization": "Root explicitly authorized only the diagnosed per-head M=1 bmm/zero-stride-K numerical correction within the already approved max32/33554432 chunks. No new final human approval or whole-task completion is claimed.",
+  "candidate_content_sha256": {
+    "transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py": "c13d5007b40fa0892281fc9be7ec338d955375183712700fa41ce987ec641049",
+    "tests/stage1/v5/gpu_utilization_fixtures.py": "cddf312bee884ddc2eb977f611807ba2f3a1c28d76e620c65c7d88165c48b475",
+    "tests/stage1/v5/test_gpu_utilization.py": "7b11763e0e944888b2cdb1033890761d414765253413c6a649e7972628404c07",
+    "tests/stage1/v5/test_attention_numerics_diagnostic.py": "bf99ba1ff8a5307930d8ccee851d38da34ed052ed7d49686dff5d4d9682e80e3"
+  },
+  "verification": [
+    {
+      "phase": "additional causal RED before repair",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py -k 'attention_dispatches or joint_matrix_vector' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-repair-red > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-red.log 2>&1",
+      "exit": 1,
+      "result": "5 failed,1 passed,2 skipped; M>1 score operands and same exact long choices fail",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-red.log",
+      "log_sha256": "2d5ae1df0cca40483bf41138968ed490569da643f657c0c20a87b77781af6e8b"
+    },
+    {
+      "phase": "early narrow CPU gate",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_attention_numerics_diagnostic.py -k 'joint_attention or attention_dispatches or joint_matrix_vector or original_matrix_vector' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-repair-early-cpu > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-early-cpu.log 2>&1",
+      "exit": 0,
+      "result": "10 passed,5 skipped",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-early-cpu.log",
+      "log_sha256": "9f9adf65d4f1ade720d0838553571d3fdd29e166ab9f2b13d0eeec83f43d0f1d"
+    },
+    {
+      "phase": "immediately preceding CUDA idle check",
+      "commands": [
+        "nvidia-smi --query-gpu=index,name,uuid,memory.used,memory.total,utilization.gpu --format=csv",
+        "nvidia-smi --query-compute-apps=pid,gpu_uuid,used_gpu_memory --format=csv"
+      ],
+      "exit": 0,
+      "result": "Both H100 NVLs0MiB/0%, no compute apps",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-cuda-idle.log",
+      "log_sha256": "4b71ee603e08fe795e77a4d0b439744b4962965d2606e939b08a2f69965f9a84"
+    },
+    {
+      "phase": "freshly idlechecked CUDA operator gate",
+      "command": "CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py -k 'joint_attention or joint_matrix_vector' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-repair-early-cuda > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-early-cuda.log 2>&1",
+      "exit": 0,
+      "result": "10 passed",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-early-cuda.log",
+      "log_sha256": "d90d4cc2b036db444abe2260f71f15fccea294e52eb725d52bacff282a6ebbf7"
+    },
+    {
+      "phase": "one focused CPU native integration and original-symptom GREEN",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_execution.py tests/stage1/v5/test_replay.py tests/stage1/v5/test_trainer.py tests/stage1/v5/test_throughput_attention.py tests/stage1/v5/test_gpu_utilization.py::test_benchmark_reports_four_paired_operators tests/stage1/v5/test_gpu_utilization.py::test_attention_dispatches_bounded_query_chunks_with_remainders --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-repair-native-green > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-native-green.log 2>&1",
+      "exit": 0,
+      "result": "95 passed,2 skipped in25.20s",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-native-green.log",
+      "log_sha256": "b4a4f51eeb7ca189276461435fbe31b4b3ea28281caa45069aa004ba23a270aa"
+    }
+  ],
+  "diagnosis": {
+    "evidence": "/root/.codex/worktrees/d3c8/ILVR/results/stage1-v5-gpu-utilization-20261018/task3-long-numerics-diagnosis-evidence.json",
+    "evidence_sha256": "f3cbd896a74fba1876b4c5be02a4ba2205b6d266e389bf15397db2320febcc14",
+    "report": "/root/.codex/worktrees/d3c8/ILVR/results/stage1-v5-gpu-utilization-20261018/task3-long-numerics-diagnosis.json",
+    "report_sha256": "03ebdc7881428979795ad8e54a77243ef2dc616a0e95698881fb103da512434c",
+    "executed_diagnostic_source": "/root/.codex/worktrees/d3c8/ILVR/results/stage1-v5-gpu-utilization-20261018/task3-long-numerics-diagnostic-before-repair.py",
+    "executed_source_sha256": "abb0ff7ffbb7576b4e33ad6c80b8251c87d9f0ab87d7aeddf0d5c38e0b8ea942",
+    "earliest_divergence": "Raw multirow bmm scores from bitwise-identical actual Q/K inputs",
+    "maximum_score_absolute_error": 9.5367431640625e-07,
+    "same_changed_rows_selectors_exact_all_seven_configs": true,
+    "original_task4_failure": "/root/.codex/worktrees/d3c8/ILVR/results/stage1-v5-gpu-utilization-20261018/task4-cpu-long-discrete-failure.json",
+    "original_failure_sha256": "cdb66d95c382c13e71db07958d855a2f2bbed248af8ea4b84190858d3ba4a27e",
+    "observer_only_failed_attempt": {
+      "exit": 1,
+      "cause": "Observer returned an expanded mean tensor. Corrected observer variable; no production edit. Preserved original failed log.",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-long-numeric-diagnosis.log",
+      "log_sha256": "f1770e0865448d6e1224b0691b3d5c56b18c87bab0e50f2a504904b782bc59be"
+    }
+  },
+  "dispatch": {
+    "batch": 2,
+    "layers": 2,
+    "heads": 4,
+    "keys": 128,
+    "head_dim": 12,
+    "cases": [
+      {
+        "queries": 1,
+        "chunk": 32,
+        "calls": 16,
+        "left_shapes": [
+          [
+            1,
+            1,
+            12
+          ]
+        ]
+      },
+      {
+        "queries": 35,
+        "chunk": 32,
+        "calls": 32,
+        "left_shapes": [
+          [
+            32,
+            1,
+            12
+          ],
+          [
+            3,
+            1,
+            12
+          ]
+        ]
+      },
+      {
+        "queries": 67,
+        "chunk": 32,
+        "calls": 48,
+        "left_shapes": [
+          [
+            32,
+            1,
+            12
+          ],
+          [
+            3,
+            1,
+            12
+          ]
+        ]
+      },
+      {
+        "queries": 35,
+        "chunk": 3,
+        "calls": 192,
+        "left_shapes": [
+          [
+            3,
+            1,
+            12
+          ],
+          [
+            2,
+            1,
+            12
+          ]
+        ]
+      }
+    ],
+    "bound": "samples*layers*heads*ceil(queries/chunk)",
+    "right_shapes": "[chunk,D,K]",
+    "right_batch_stride_zero_when_chunk_gt_one": true,
+    "right_storage_equals_current_sample_fp32_K": true,
+    "key_fp32_copies_per_sample_layer": 1
+  },
+  "cpu_acceptance": {
+    "default": {
+      "report_path": "/root/.codex/worktrees/d3c8/ILVR/checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-repair-native-green/test_benchmark_reports_four_pa0/operators.json",
+      "report_sha256": "0cace5f20040cce5436b651e35101fb3d24301d886fe0ce022e76cff200be1b9",
+      "rows_exact": true,
+      "max_absolute_error": 0.0,
+      "max_relative_error": 0.0,
+      "all_seven_ordered_joint_selection_configs_exact": true,
+      "selectors_agree_on_identical_current_rows": true,
+      "query_count": 64,
+      "bmm_calls_before": 128,
+      "bmm_calls_after": 32,
+      "joint_keys_sha256": {
+        "default": "6d5d92f0783edd1b3f300852747ee4560c0ffed032027400add8b169a39f4163",
+        "cumulative_below": "1e1047b9c7d2e24e55552217549e6bbf6d0d7a6f9c6e8172051a3cf580d2683e",
+        "lowmass_below": "dad1c02df347204b71317b1bd43dd64d4f607efaf7a898426c7ee374eacd38ed",
+        "cumulative_equal": "3f672d3f71d41cb3eaf7b2c19cb9f98eeeed13a781008c3875e6388036cb6a60",
+        "lowmass_equal": "dad1c02df347204b71317b1bd43dd64d4f607efaf7a898426c7ee374eacd38ed",
+        "cumulative_above": "3f672d3f71d41cb3eaf7b2c19cb9f98eeeed13a781008c3875e6388036cb6a60",
+        "lowmass_above": "ae9a93cd753d807e98dd1cdfd4b571c4e7d528f2cbeb3e4401a1e7a1d4132857"
+      }
+    },
+    "long": {
+      "report_path": "/root/.codex/worktrees/d3c8/ILVR/checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-repair-native-green/test_benchmark_reports_four_pa1/operators.json",
+      "report_sha256": "e4cce41b52d9ce07c2ae1e724e80cb885c6de57f42d5ed93fdd8821b9b180955",
+      "rows_exact": true,
+      "max_absolute_error": 0.0,
+      "max_relative_error": 0.0,
+      "all_seven_ordered_joint_selection_configs_exact": true,
+      "selectors_agree_on_identical_current_rows": true,
+      "query_count": 134,
+      "bmm_calls_before": 268,
+      "bmm_calls_after": 96,
+      "joint_keys_sha256": {
+        "default": "2be544ae5d13f2713cfdbfb81d90ab6446abfa1f40755db349962dd5bf7553e3",
+        "cumulative_below": "ad353c948b9ba3d95a8230d101c38b787499507fff1d67bf4ea7bad5eca305f6",
+        "lowmass_below": "58e013c8da23efeb5e6821d01e3a7fd5b1084cbb3ce0dc645c439fdc25ba07fd",
+        "cumulative_equal": "ad353c948b9ba3d95a8230d101c38b787499507fff1d67bf4ea7bad5eca305f6",
+        "lowmass_equal": "58e013c8da23efeb5e6821d01e3a7fd5b1084cbb3ce0dc645c439fdc25ba07fd",
+        "cumulative_above": "9fbbc7ddc9170ee31a65411de9f7adf2103cb6340e53a2f3943f67e979e899fb",
+        "lowmass_above": "37bf8cbc9a5ed82ede0178c190c1abf679f9fd1bf1d36f11c031e97b2cb6bfa1"
+      },
+      "causal_boundary_restored": {
+        "query": [
+          1,
+          8125
+        ],
+        "before": [
+          289,
+          1235
+        ],
+        "after": [
+          289,
+          1235
+        ]
+      }
+    }
+  },
+  "cuda_gate": {
+    "long8192": {
+      "queries": 134,
+      "rows_exact": true,
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "ordered_joint_keys_exact": true
+    },
+    "default512": {
+      "queries": 64,
+      "rows_exact": false,
+      "max_abs": 4.656612873077393e-10,
+      "max_rel": 2.3570058260702353e-07,
+      "ordered_joint_keys_exact": true
+    },
+    "short_boundary_cases": {
+      "cases": [
+        "normal",
+        "ties",
+        "near_ties"
+      ],
+      "nontrivial_mrope": true,
+      "gqa": true,
+      "source_padding": true,
+      "row_error": 0.0,
+      "ordered_joint_keys_exact": true
+    },
+    "atol": 1e-07,
+    "rtol": 1e-05
+  },
+  "native_cpu": {
+    "nonzero_dora": true,
+    "loss_gradient_atol": 1e-05,
+    "loss_gradient_rtol": 0.0001,
+    "max_raw_K_gradient_error": 2.4783730623312294e-09,
+    "max_total_gradient_error": 2.2351741790771484e-08,
+    "full_sequence_oracle_unchanged": true,
+    "checkpoint_modes": [
+      "off",
+      "early",
+      "full"
+    ],
+    "reference_immutability_and_one_F_reference_packed_ordinary_backward_and_negative_controls_pass": true
+  },
+  "memory": {
+    "chunk_max": 32,
+    "target_bytes": 33554432,
+    "formula": "max(1,min(32,33554432//(2*heads*keys*4)))",
+    "long8192_score_bytes": 8388608,
+    "long_two_score_or_score_probability_bytes": 16777216,
+    "scope": "Head outputs+stack transiently occupy two full score workspaces; head list ends before softmax. Two full score/probability target excludes query/K copies, visibility/head-mean/output and backend workspace; no total VRAM cap or actual peak claim. One-query minimum retained."
+  },
+  "immutable_sha256": {
+    "tests/stage1/v5/frozen_gpu_utilization/stage1_v5_replay.py": "bf15d87ea7d6f9a2dd7775c6e1ab4d4b4edb3750bc4096213b8b3e310135fa5e",
+    "tests/stage1/v5/frozen_gpu_utilization/stage1_v5_trace.py": "33f55a0f6480bbfc50b9256cceb71c6ab61a968cbf4b6815c5dee8f80f5f7efb",
+    "tests/stage1/v5/frozen_gpu_utilization/v5_execution.py": "0abd7e9fb51f327916b735b74d7cad53dd0d4b7242d3dc74725dc43257c19a69",
+    "tests/stage1/v5/frozen_gpu_utilization/v5_selection.py": "1b285303a6da390c4de2635aff46c57582272f952d75efc72b52a67eddce2850",
+    "tests/stage1/v5/frozen_throughput/stage1_data.py": "d132b34f4a2a79403b7f850b9d667a4e947bf368a807da31856591fb81e2a183",
+    "tests/stage1/v5/frozen_throughput/stage1_v5_trace.py": "1a7d4bfb8b1d968e0a40541642b78e8fa5dbf61d4570af4c8effe3fe42441724",
+    "tests/stage1/v5/frozen_throughput/v5_selection.py": "3530678a6f9f7673d91d8305c2895e5904ca648f2dbbb8d34019e446e3f99827",
+    "tests/stage1/v5/test_replay.py": "451be588cf98945aa982f461145e2444f7ea4f37e2fc487d85d8723868f55679"
+  },
+  "self_review": {
+    "verdict": "No unresolved implementation findings; mandatory independent fix reviews pending",
+    "product_change": "Only trace score construction changes to bounded per-head independent M=1 bmm with K expand views. Same scaling/masking/full softmax/head mean/candidate gather/sequential layer addition.",
+    "preserved": "Selector/mask/dropout/loss/RNG/sampler/ranks/runtime/sourceidentity/profile code and original frozen/full-sequence oracle unchanged. Root workflow and plan edits excluded.",
+    "tests": "Retained long exact-selection and staged arithmetic regression; default+long CPU/CUDA joint choices; frozen selector on same current rows; >32/remainder/forcedchunk3 plus M1/current-K-storage alias witnesses."
+  },
+  "metadata_only_failed_attempt": {
+    "exit": 1,
+    "cause": "Evidence-writer SyntaxError from missing space in else96; no report written and no production change. Corrected metadata writer only.",
+    "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-repair-result-validation.log",
+    "log_sha256": "3882e16eeb06184f1adee697b9bca183ddecea42b4493b3a57196e2cbf72f96b"
+  },
+  "limitations": [
+    "Finite fixtures do not prove future discrete choices or production BF16/distributed equivalence. CUDA default rows are close rather than bitwise; all tested ordered tuples are exact.",
+    "One-repetition CPU benchmark reports are acceptance evidence only. Final timing and actual peak memory remain Task4. No CUDA model training/backward/optimizer, downloads, packages or environment changes.",
+    "CPU native checks ran once after repair; final stronger current-sample K alias test passed there. Literal restored-boundary assertion was validated directly against the same native long report.",
+    "SPEC/QUALITY fix re-reviews and root final verification/finish remain outstanding."
+  ]
+}

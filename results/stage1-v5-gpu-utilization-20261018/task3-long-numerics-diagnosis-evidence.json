@@ -1,0 +1,29 @@
+{
+  "base_commit": "b3e13a4abcc237e10c397eb076be8bd3b79a9f55",
+  "phase": "read-only numerical diagnosis; production repair awaiting root authorization",
+  "same_recorded_failure_reproduced_exactly": true,
+  "production_files_unchanged": true,
+  "diagnostic_test": "tests/stage1/v5/test_attention_numerics_diagnostic.py",
+  "diagnostic_test_sha256": "abb0ff7ffbb7576b4e33ad6c80b8251c87d9f0ab87d7aeddf0d5c38e0b8ea942",
+  "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_attention_numerics_diagnostic.py --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-long-numeric-diagnosis-02",
+  "exit": 0,
+  "result": "1 passed in 6.13s",
+  "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-long-numeric-diagnosis-02.log",
+  "log_sha256": "2f601545bbcdc7b486d63a3adf18f69a827a241da9dcf29ec9e3e822eec35a64",
+  "report": "/root/.codex/worktrees/d3c8/ILVR/results/stage1-v5-gpu-utilization-20261018/task3-long-numerics-diagnosis.json",
+  "report_sha256": "03ebdc7881428979795ad8e54a77243ef2dc616a0e95698881fb103da512434c",
+  "initial_observer_bug": {
+    "exit": 1,
+    "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-long-numeric-diagnosis.log",
+    "log_sha256": "f1770e0865448d6e1224b0691b3d5c56b18c87bab0e50f2a504904b782bc59be",
+    "cause": "Diagnostic dispatch observer returned a reshaped mean tensor; corrected observer to retain original return. No production change."
+  },
+  "proposed_repair": "Within each existing bounded query chunk, batch independent M=1 matrix-vector products for each head, reuse zero-stride expanded sample K views, stack score heads, retain all remaining arithmetic",
+  "observed_probe": "CPU-only full candidate rows bitwise equal and all seven joint-selection configurations exact for all134 queries; no CUDA/model/training launch, no performance or production claim",
+  "unchanged_sha256": {
+    "src/stage1/v5_selection.py": "a534cf7184c43575ca8fca610df0f14325ed221db3dceb1564b34802c891b43c",
+    "transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py": "45e286bfef7314e855e06812ede9f729124d3eb61ec6b53891a2c2036c51d36b",
+    "tests/stage1/v5/frozen_gpu_utilization/stage1_v5_trace.py": "33f55a0f6480bbfc50b9256cceb71c6ab61a968cbf4b6815c5dee8f80f5f7efb",
+    "tests/stage1/v5/frozen_gpu_utilization/v5_selection.py": "1b285303a6da390c4de2635aff46c57582272f952d75efc72b52a67eddce2850"
+  }
+}
