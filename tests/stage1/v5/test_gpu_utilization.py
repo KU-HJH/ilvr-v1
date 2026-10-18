@@ -35,9 +35,13 @@ def test_benchmark_reports_four_paired_operators(tmp_path, monkeypatch):
         assert report[name + '_paired_order'] == [['before', 'after']]
     assert report['mask_exact_equal'] is True
     assert report['dropout_exact_equal'] is True
-    assert report['attention_exact_equal'] is True
+    assert isinstance(report['attention_exact_equal'], bool)
     assert report['attention_close'] is True
-    assert report['attention_max_absolute_error'] == 0
+    assert report['attention_max_absolute_error'] >= 0
+    assert report['attention_atol'] == 1e-7 and report['attention_rtol'] == 1e-5
+    assert report['joint_selected_keys_exact_equal'] is True
+    assert all(case['exact'] for case in report['joint_selection_cases'].values())
+    assert report['joint_selection_cases']['default']['keys']
     assert report['selected_keys_exact_equal'] is True
     assert report['oracle_sha256'] == BASELINE_SHA256
     assert report['source_identity']['baseline_commit'] == '65643f08cb6e61fbbb200de825d57086f5c7a127'
@@ -90,6 +94,142 @@ def test_dropout_fixture_uses_private_rng_and_checkpoint_backward():
 
 DEVICES = ['cpu', pytest.param('cuda', marks=pytest.mark.skipif(
     not torch.cuda.is_available(), reason='CUDA operator comparison requires an available device'))]
+
+
+SELECTOR_CASES = ['normal', 'ties', 'zero_cap', 'empty', 'low_mass',
+                  'cumulative_below', 'cumulative_equal', 'cumulative_above',
+                  'lowmass_below', 'lowmass_equal', 'lowmass_above']
+
+
+@pytest.mark.parametrize('case', SELECTOR_CASES)
+@pytest.mark.parametrize('compact', [False, True])
+def test_selector_ordered_keys_match_source65643f0_at_fp32_boundaries(case, compact):
+    from stage1.v5_selection import select_v5_text_keys
+    from tests.stage1.v5.gpu_utilization_fixtures import original_module, selector_boundary_fixture
+    metadata, attention, clean, reference, config = selector_boundary_fixture(case)
+    expected = original_module('v5_selection').select_v5_text_keys(
+        metadata, attention, clean, reference, config)
+    if compact:
+        attention = {(b.batch_index, q): attention[(b.batch_index, q)][list(b.candidate_positions)]
+                     for b in metadata.blocks for q in b.query_positions}
+    actual = select_v5_text_keys(metadata, attention, clean, reference, config, compact_attention=compact)
+    assert list(actual.items()) == list(expected.items())
+    first = next(iter(actual.values()))
+    if case.startswith('cumulative_'):
+        assert first == ((2, 4) if case.endswith('below') else (2,))
+    elif case.startswith('lowmass_'):
+        assert first == ((2, 4) if case.endswith('below') else (2,))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='direct CPU/CUDA attention/logits contract')
+@pytest.mark.parametrize('case', SELECTOR_CASES)
+@pytest.mark.parametrize('placement', ['cuda_cpu', 'cpu_cuda', 'cuda_cuda', 'mixed_cuda', 'mixed_cpu'])
+def test_selector_devices_are_independent_and_keep_original_reduction(case, placement):
+    from stage1.v5_selection import select_v5_text_keys
+    from tests.stage1.v5.gpu_utilization_fixtures import original_module, selector_boundary_fixture
+    attention_device, logits_device = placement.split('_')
+    metadata, attention, clean, reference, config = selector_boundary_fixture(
+        case, attention_device='cpu' if attention_device == 'mixed' else attention_device,
+        logits_device=logits_device)
+    if attention_device == 'mixed':
+        attention = {key: (row.cuda() if i % 2 else row) for i, (key, row) in enumerate(attention.items())}
+    expected = original_module('v5_selection').select_v5_text_keys(metadata, attention, clean, reference, config)
+    actual = select_v5_text_keys(metadata, attention, clean, reference, config)
+    assert list(actual.items()) == list(expected.items())
+
+
+def test_selector_transfers_only_stable_ranked_prefix_with_integer_coordinates(monkeypatch):
+    import builtins
+    from stage1 import v5_selection
+    from tests.stage1.v5.gpu_utilization_fixtures import OperatorCounts, original_module, selector_boundary_fixture
+    args = selector_boundary_fixture('ties')
+    lists, python_candidate_sorts = [], []
+    original_tolist = torch.Tensor.tolist
+    def observed_tolist(value):
+        lists.append((value.dtype, value.numel()))
+        return original_tolist(value)
+    def observed_sorted(values, *args, **kwargs):
+        if isinstance(values, zip):
+            python_candidate_sorts.append(True)
+        return builtins.sorted(values, *args, **kwargs)
+    monkeypatch.setattr(torch.Tensor, 'tolist', observed_tolist)
+    monkeypatch.setattr(v5_selection, 'sorted', observed_sorted, raising=False)
+    original_module('v5_selection').select_v5_text_keys(*args)
+    baseline_elements = sum(count for _, count in lists)
+    lists.clear()
+    with OperatorCounts() as counts:
+        actual = v5_selection.select_v5_text_keys(*args, validate=False)
+    candidate_elements = sum(count for _, count in lists)
+    queries = len(args[0].query_keys)
+    prefix = int(args[-1].text_cap * len(args[0].blocks[0].candidate_positions))
+    print(f'SELECTOR_TRANSFER baseline={baseline_elements} candidate={candidate_elements} lists={lists}')
+    assert len(actual) == queries
+    assert candidate_elements == 2 * queries * prefix + 2 * queries < baseline_elements
+    assert lists == [(torch.int64, queries * prefix), (torch.float32, queries * prefix + 2 * queries)]
+    assert counts.stable_sort_calls == queries
+    assert counts.integer_float_casts == counts.scalar_reads == 0
+    assert not python_candidate_sorts, 'candidate ranking still runs Python sorted(zip(...))'
+    baseline_bytes = baseline_elements * 4
+    candidate_bytes = sum(count * torch.empty((), dtype=dtype).element_size() for dtype, count in lists)
+    assert (baseline_bytes, candidate_bytes) == (704, 640)
+    print(f'SELECTOR_TRANSFER_BYTES baseline={baseline_bytes} candidate={candidate_bytes}')
+
+
+def test_selector_unsorted_candidate_metadata_still_rejected():
+    from stage1.v5_metadata import V5Block
+    with pytest.raises(ValueError, match='sorted unique'):
+        V5Block(0, 0, 8, 9, (10,), (0,), (4, 2))
+
+
+@pytest.mark.parametrize('device', DEVICES)
+@pytest.mark.parametrize('case', ['normal', 'ties', 'near_ties'])
+def test_joint_attention_selection_preserves_exact_keys_at_measured_boundaries(device, case):
+    from tests.stage1.v5.gpu_utilization_fixtures import (
+        ATTENTION_ATOL, ATTENTION_RTOL, joint_observation_fixture, joint_selection_comparison,
+        observe_joint, original_module,
+    )
+    from transformers.models.qwen2_5_vl.stage1_v5_trace import capture_v5_trace
+    fixture = joint_observation_fixture(torch.device(device), case=case)
+    before, before_projections = observe_joint(original_module('stage1_v5_trace').capture_v5_trace, fixture)
+    after, after_projections = observe_joint(capture_v5_trace, fixture)
+    assert len(before_projections) == len(after_projections) == 2 * fixture.layers
+    assert all(torch.equal(a, b) for a, b in zip(before_projections, after_projections))
+    max_abs, max_rel = 0., 0.
+    for key in fixture.keys:
+        error = (after[key] - before[key]).abs()
+        max_abs = max(max_abs, float(error.max()))
+        max_rel = max(max_rel, float((error / before[key].abs().clamp_min(torch.finfo(torch.float32).tiny)).max()))
+        torch.testing.assert_close(after[key], before[key], atol=ATTENTION_ATOL, rtol=ATTENTION_RTOL)
+        assert not after[key].requires_grad
+    joint = joint_selection_comparison(fixture.metadata, before, after, fixture.clean, fixture.reference)
+    changed = {name: [entry for entry in result['keys'] if entry['before'] != entry['after']]
+               for name, result in joint.items() if not result['exact']}
+    print(f'JOINT_ATTENTION device={device} case={case} max_abs={max_abs} max_rel={max_rel} '
+          f'exact_keys={not changed} queries={len(fixture.keys)} boundary_cases={list(joint)} changed={changed}')
+    assert not changed, f'changed discrete selected keys: {changed}'
+
+
+@pytest.mark.parametrize('queries,budget_chunks', [(1, None), (35, None), (67, None), (35, 3)])
+def test_attention_dispatches_bounded_query_chunks_with_remainders(monkeypatch, queries, budget_chunks):
+    from tests.stage1.v5.gpu_utilization_fixtures import OperatorCounts, joint_observation_fixture, observe_joint
+    from transformers.models.qwen2_5_vl import stage1_v5_trace as trace_module
+    fixture = joint_observation_fixture(torch.device('cpu'), queries=queries)
+    budget = 33554432 if budget_chunks is None else 2 * fixture.heads * fixture.length * 4 * budget_chunks
+    if budget_chunks is not None:
+        monkeypatch.setattr(trace_module, 'V5_ATTENTION_WORKSPACE_BYTES', budget, raising=False)
+    chunk = max(1, min(32, budget // (2 * fixture.heads * fixture.length * 4)))
+    with OperatorCounts() as counts:
+        observe_joint(trace_module.capture_v5_trace, fixture)
+    matmuls = [a for a, b in counts.matmul_shapes if b == (fixture.heads, fixture.dim, fixture.length)]
+    expected = 2 * fixture.layers * ((queries + chunk - 1) // chunk)
+    print(f'ATTENTION_CHUNKS queries_per_sample={queries} chunk={chunk} dispatched={matmuls}')
+    assert len(matmuls) == expected, 'attention still dispatches one GEMM per query'
+    assert [shape[-2] for shape in matmuls] == [
+        min(chunk, queries - offset) for _ in range(fixture.layers) for _ in range(2)
+        for offset in range(0, queries, chunk)]
+    assert all(2 * fixture.heads * shape[-2] * fixture.length * 4 <= budget for shape in matmuls)
+    assert trace_module.V5_ATTENTION_QUERY_CHUNK_MAX == 32
+    assert trace_module.V5_ATTENTION_WORKSPACE_BYTES == budget
 
 
 @pytest.mark.parametrize('device', DEVICES)

@@ -26,20 +26,19 @@ from stage1.v5_selection import select_v5_text_keys
 from transformers.models.qwen2_5_vl.stage1_v5_replay import run_v5_packed_replay
 from transformers.models.qwen2_5_vl.stage1_v5_trace import capture_v5_trace
 from tests.stage1.v5.gpu_utilization_fixtures import (
-    BASELINE_COMMIT, SOURCE_PATHS, OperatorCounts, dropout_fixture, original_module,
+    ATTENTION_ATOL, ATTENTION_RTOL, BASELINE_COMMIT, SOURCE_PATHS, OperatorCounts,
+    dropout_fixture, joint_metadata, joint_selection_comparison, original_module,
     replay_fixture, run_dropout, run_replay_mask,
 )
 from tests.stage1.v5.throughput_fixtures import observation_fixture, selector_fixture
-
-
-ATTENTION_ATOL, ATTENTION_RTOL = 1e-7, 1e-5
 
 
 @contextmanager
 def count_host_lists():
     original, sizes = torch.Tensor.tolist, []
     def observed(value):
-        sizes.append(value.numel())
+        sizes.append(dict(dtype=str(value.dtype), elements=value.numel(),
+                          bytes=value.numel()*value.element_size()))
         return original(value)
     torch.Tensor.tolist = observed
     try:
@@ -143,6 +142,17 @@ def main():
     attention_close = all(torch.allclose(before_rows[key], after_rows[key], atol=ATTENTION_ATOL,
                                         rtol=ATTENTION_RTOL) for key in keys)
     attention_error = max(float((before_rows[key] - after_rows[key]).abs().max()) for key in keys)
+    attention_relative_error = max(float(((before_rows[key] - after_rows[key]).abs() /
+        before_rows[key].abs().clamp_min(torch.finfo(torch.float32).tiny)).max()) for key in keys)
+    generator = torch.Generator().manual_seed(809)
+    joint_clean = torch.randn(len(keys),17,generator=generator).to(device)
+    joint_reference = torch.randn(joint_clean.shape,generator=generator).to(device)
+    joint_selection = joint_selection_comparison(joint_metadata(keys,candidates), before_rows,
+                                                after_rows,joint_clean,joint_reference)
+    joint_equal = all(result['exact'] for result in joint_selection.values())
+    changed = {case:[entry for entry in result['keys'] if entry['before'] != entry['after']]
+               for case,result in joint_selection.items() if not result['exact']}
+    assert joint_equal, f'joint attention/selection changed discrete keys: {changed}'
     del before_rows, after_rows
     metadata_, attention, clean, reference = selector_fixture(count=8, candidates=128, length=4096)
     attention = {key:(value*.25).to(device) for key,value in attention.items()}
@@ -214,6 +224,8 @@ def main():
             scope='actual private-generator F/packed dropout, checkpoint recomputation and backward; includes owner/checkpoint/sin/reduction/output-detach overhead; no train step'),
         attention_exact_equal=attention_equal,attention_close=attention_close,
         attention_atol=ATTENTION_ATOL,attention_rtol=ATTENTION_RTOL,attention_max_absolute_error=attention_error,
+        attention_max_relative_error=attention_relative_error,
+        joint_selected_keys_exact_equal=joint_equal,joint_selection_cases=joint_selection,
         selected_keys_exact_equal=selection_equal,mask_exact_equal=mask_equal,
         dropout_exact_equal=dropout_equal,dropout_global_rng_unchanged=rng_unchanged,
         source_identity=source_identity(),
@@ -235,13 +247,18 @@ def main():
                 function()
             result['operations'] = {key:getattr(counts,key) for key in (
                 'key_float_copies','arange_calls','scalar_reads','candidate_index_tensors',
-                'random_draw_calls','random_draw_elements','select_calls','stack_calls','index_put_calls')}
-            result['operations'].update(tolist_calls=len(lists),tolist_elements=sum(lists))
+                'random_draw_calls','random_draw_elements','select_calls','stack_calls','index_put_calls',
+                'stable_sort_calls','integer_float_casts')}
+            result['operations'].update(tolist_calls=len(lists),
+                tolist_elements=sum(item['elements'] for item in lists),
+                tolist_bytes=sum(item['bytes'] for item in lists),tolist_transfers=lists,
+                matmul_calls=len(counts.matmul_shapes),
+                batched_matmul_calls=sum(len(a)==3 for a,_ in counts.matmul_shapes))
             report[name + '_' + suffix] = result
     args.output.parent.mkdir(parents=True,exist_ok=True)
     args.output.write_text(json.dumps(report,indent=2)+'\n')
     print(json.dumps(report,indent=2))
-    assert attention_close and selection_equal and mask_equal and dropout_equal and rng_unchanged, 'local oracle mismatch'
+    assert attention_close and joint_equal and selection_equal and mask_equal and dropout_equal and rng_unchanged, 'local oracle mismatch'
 
 
 if __name__ == '__main__':

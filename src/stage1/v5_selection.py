@@ -60,7 +60,7 @@ def select_v5_text_keys(
         rho = config.rho_min + (config.rho_max-config.rho_min) * (
             u[indices] - u[indices].mean()).sigmoid()
         rhos[indices] = rho
-    entries, all_weights, masses = [], [], []
+    entries, all_orders, all_weights, masses = [], [], [], []
     for block in metadata.blocks:
         candidates = block.candidate_positions
         cap = math.floor(config.text_cap * len(candidates))
@@ -72,9 +72,13 @@ def select_v5_text_keys(
                     or not bool(torch.isfinite(row).all()) or bool((row < 0).any())):
                 raise ValueError('invalid original-sequence attention row')
             weights = row if compact_attention else row[list(candidates)]
-            all_weights.append(weights)
             # Preserve the per-row FP32 reduction (including empty candidates).
             masses.append(weights.sum())
+            # Candidate coordinates are already sorted unique by V5Block.
+            # A stable sort therefore keeps the original-position tie break.
+            order = torch.argsort(weights, descending=True, stable=True)[:cap]
+            all_orders.append(order)
+            all_weights.append(weights[order])
             entries.append((key,candidates,cap))
     weight_count = sum(weights.numel() for weights in all_weights)
     if any(weights.device != rhos.device for weights in all_weights):
@@ -82,19 +86,22 @@ def select_v5_text_keys(
         # Preserve each original-device reduction before copying its FP32 value.
         all_weights = [weights.to(rhos.device) for weights in all_weights]
         masses = [mass.to(rhos.device) for mass in masses]
-    # One host transfer, with unchanged FP32 masses/rho and Python cumulative
-    # arithmetic. Do not replace the GPU sums by sums over the host weights.
+        all_orders = [order.to(rhos.device) for order in all_orders]
+    # Keep integer ranks separate from FP32 values. Only capped prefixes cross
+    # to the host; original-device masses and Python cumulative math stay intact.
+    host_orders = torch.cat(all_orders).tolist()
     packed = torch.cat([*all_weights,torch.stack(masses),rhos]).tolist()
     host_masses = packed[weight_count:weight_count+len(keys)]
     host_rhos = dict(zip(keys,packed[weight_count+len(keys):]))
     result = {}
     offset = 0
     for (key,candidates,cap),mass in zip(entries,host_masses):
-        weights = packed[offset:offset+len(candidates)]
-        offset += len(candidates)
+        weights = packed[offset:offset+cap]
+        order = host_orders[offset:offset+cap]
+        offset += cap
         if validate and mass > 1. + 1e-5:
             raise ValueError('candidate attention mass exceeds causal total')
-        ranked = sorted(zip(candidates, weights), key=lambda pair: (-pair[1], pair[0]))
+        ranked = [(candidates[index], weight) for index, weight in zip(order, weights)]
         if mass < config.low_attention_mass:
             chosen = ranked[:min(cap, math.floor(config.low_attention_fraction * len(candidates)))]
         else:

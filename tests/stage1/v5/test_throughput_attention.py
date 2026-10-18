@@ -27,15 +27,26 @@ def test_trace_converts_keys_once_per_sample_layer_and_shares_coordinates():
     assert kwargs['inputs_embeds'].grad is not None
 
 
-def test_observed_rows_match_frozen_original_exactly():
+def test_observed_rows_match_frozen_original_tolerance_and_joint_selected_keys():
+    from tests.stage1.v5.gpu_utilization_fixtures import (
+        ATTENTION_ATOL, ATTENTION_RTOL, joint_metadata, joint_selection_comparison,
+    )
     decoder, kwargs, keys, candidates = observation_fixture()
     with original_module('stage1_v5_trace').capture_v5_trace(decoder, keys, candidates) as original:
         decoder(**kwargs)
     with capture_v5_trace(decoder, keys, candidates) as actual:
         decoder(**kwargs)
     assert actual.attention_rows.keys() == original.attention_rows.keys()
+    max_error = 0.
     for key in keys:
-        torch.testing.assert_close(actual.attention_rows[key], original.attention_rows[key], rtol=0, atol=0)
+        max_error = max(max_error, float((actual.attention_rows[key] - original.attention_rows[key]).abs().max()))
+        torch.testing.assert_close(actual.attention_rows[key], original.attention_rows[key],
+                                   rtol=ATTENTION_RTOL, atol=ATTENTION_ATOL)
+    logits = torch.zeros(len(keys), 17)
+    joint = joint_selection_comparison(joint_metadata(keys, candidates), original.attention_rows,
+                                       actual.attention_rows, logits, logits)
+    assert all(result['exact'] for result in joint.values())
+    print(f'THROUGHPUT_ATTENTION max_abs={max_error} exact_joint_keys=True')
 
 
 def test_trace_materializes_candidate_coordinates_once_per_distinct_set():
@@ -44,7 +55,9 @@ def test_trace_materializes_candidate_coordinates_once_per_distinct_set():
     with OperatorCounts() as counts:
         with capture_v5_trace(decoder, keys, candidates):
             decoder(**kwargs)
-    assert counts.candidate_index_tensors == len(set(candidates))
+    # Chunked index_select also materializes one shared query-coordinate vector
+    # per sample, in addition to each distinct candidate vector.
+    assert counts.candidate_index_tensors == len(set(candidates)) + len({sample for sample, _ in keys})
 
 
 def test_selector_bulk_transfers_without_per_query_scalar_reads(monkeypatch):
@@ -131,8 +144,11 @@ def test_benchmark_compares_identical_candidate_inputs(tmp_path, monkeypatch):
     main()
     import json
     report = json.loads(output.read_text())
-    assert report['selected_keys_exact_equal'] and report['attention_exact_equal']
-    assert report['selection_after']['operations']['tolist_elements'] == 4096 + 32 + 32
+    assert report['selected_keys_exact_equal'] and report['attention_close']
+    assert report['joint_selected_keys_exact_equal']
+    assert report['selection_after']['operations']['tolist_elements'] == 2 * 32 * 38 + 32 + 32
+    assert report['selection_after']['operations']['tolist_bytes'] == 32 * 38 * 8 + (32 * 38 + 64) * 4
+    assert report['selection_before']['operations']['tolist_bytes'] == (4096 + 64) * 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='mixed CPU/CUDA direct selector contract')

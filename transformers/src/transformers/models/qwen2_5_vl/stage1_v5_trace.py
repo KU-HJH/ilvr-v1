@@ -9,6 +9,8 @@ from torch import Tensor, nn
 from torch.utils.checkpoint import checkpoint
 
 QueryKey = tuple[int,int]
+V5_ATTENTION_QUERY_CHUNK_MAX = 32
+V5_ATTENTION_WORKSPACE_BYTES = 33554432
 _EXECUTION = ContextVar('qwen_stage1_v5_execution',default=None)
 _PACKED = ContextVar('qwen_stage1_v5_packed_dropout',default=None)
 
@@ -165,6 +167,7 @@ def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
     coordinates = None
     sample_padding = {}
     candidate_indices = {}
+    query_indices = {}
 
     def before(module,args,kwargs):
         nonlocal coordinates
@@ -182,6 +185,8 @@ def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
         if query_keys:
             coordinates = torch.arange(t,device=embeds.device)
             sample_padding.update((row,trace.padding[row].bool()) for row in queries_by_sample)
+            query_indices.update((row,torch.tensor([key[1] for key,_ in queries],device=embeds.device,dtype=torch.long))
+                                 for row,queries in queries_by_sample.items())
             candidate_indices.update((positions,torch.tensor(positions,device=embeds.device,dtype=torch.long))
                                      for positions in dict.fromkeys(candidate_positions))
         ids = kwargs.get('position_ids')
@@ -208,18 +213,23 @@ def capture_v5_trace(model: nn.Module, query_keys: tuple[QueryKey,...],
             cos,sin = kwargs['position_embeddings']
             q,k = apply_multimodal_rotary_pos_emb(q,k,cos,sin,attn.rope_scaling['mrope_section'])
             k = repeat_kv(k,attn.num_key_value_groups)
+            # Target two FP32 [heads,query_chunk,keys] score/probability
+            # workspaces, not total VRAM. A single query is the minimum unit.
+            chunk = max(1,min(V5_ATTENTION_QUERY_CHUNK_MAX,
+                V5_ATTENTION_WORKSPACE_BYTES//(2*q.shape[1]*t*4)))
             for row,queries in queries_by_sample.items():
-                # Bound the FP32 copy to this sample/layer; keep every query's
-                # original GEMM shape and reduction order unchanged.
                 sample_k = k[row].float().transpose(-2,-1)
-                for key,candidates in queries:
-                    position = key[1]
-                    scores = q[row,:,position:position+1].float() @ sample_k
-                    scores = scores.squeeze(1)*attn.scaling
-                    visible = (coordinates<=position) & sample_padding[row]
-                    weights = scores.masked_fill(~visible,float('-inf')).softmax(-1).mean(0)
-                    values = weights[candidate_indices[candidates]]/len(decoder.layers)
-                    trace.attention_rows[key] = trace.attention_rows.get(key,0)+values
+                for start in range(0,len(queries),chunk):
+                    positions = query_indices[row][start:start+chunk]
+                    scores = q[row].index_select(1,positions).float() @ sample_k
+                    visible = (coordinates[None]<=positions[:,None]) & sample_padding[row][None]
+                    weights = scores.mul_(attn.scaling).masked_fill_(
+                        ~visible[None],float('-inf')).softmax(-1).mean(0)
+                    del scores,visible
+                    for index,(key,candidates) in enumerate(queries[start:start+chunk]):
+                        values = weights[index][candidate_indices[candidates]]/len(decoder.layers)
+                        trace.attention_rows[key] = trace.attention_rows.get(key,0)+values
+                    del weights
                 del sample_k
 
     try:

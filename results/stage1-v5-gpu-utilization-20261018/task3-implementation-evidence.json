@@ -1,0 +1,243 @@
+{
+  "task": "Task3: stable selector ranking and bounded attention observation",
+  "base_commit": "d63db46ea8cd134b66ed42bf1935212c4ffaadf4",
+  "baseline_commit": "65643f08cb6e61fbbb200de825d57086f5c7a127",
+  "approved_spec": "docs/superpowers/specs/2026-10-18-stage1-v5-gpu-utilization-commitment-v1.md",
+  "approved_spec_sha256": "843832ae9b09c10f28dea3dea60ceaa8d845f77f103f98259d4f26304cbe659a",
+  "agent": "/root/gpu_util_t3_impl",
+  "implementation_method": "Root-approved Subagent-driven Task3 implementer; no spawned subagents; independent root review gates pending",
+  "tdd_skill": "/root/.codex/plugins/cache/openai-curated/superpowers/bd2122cb/skills/test-driven-development/SKILL.md",
+  "active_phase": "Implementation completed/self-reviewed, ready for independent specification and quality reviews",
+  "candidate_content_sha256": {
+    "src/stage1/v5_selection.py": "a534cf7184c43575ca8fca610df0f14325ed221db3dceb1564b34802c891b43c",
+    "transformers/src/transformers/models/qwen2_5_vl/stage1_v5_trace.py": "45e286bfef7314e855e06812ede9f729124d3eb61ec6b53891a2c2036c51d36b",
+    "tests/stage1/v5/gpu_utilization_fixtures.py": "382c3405fef49c645868b2c1745f2d5fc172efdcf8270e4f51db190f9decf118",
+    "tests/stage1/v5/test_gpu_utilization.py": "ef9e2dc1922244fdfce5a351ae07e4c0c2a7b51a75f79a79f3de96404dde2d9c",
+    "tests/stage1/v5/test_throughput_attention.py": "efa5da3c6448e727bf497ed0878a12a20e7eddcfaad50dbae849a62483f29a6f",
+    "scripts/benchmark_stage1_v5_attention_selection.py": "cc972c22c3e6c75d3202ab0191d037e7a2febb4d479baae9d962954487872c2d"
+  },
+  "verification": [
+    {
+      "phase": "selector RED",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py -k selector --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-selector-red > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-selector-red.log 2>&1",
+      "exit": 1,
+      "summary": "1 failed, 23 passed, 55 skipped; missing ranked-prefix transfers; 176 vs required112 elements",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-selector-red.log",
+      "log_sha256": "36bd4dbc4903ce1793c2efafe49ac0fc06111777a579c95fe11796090fdaa585"
+    },
+    {
+      "phase": "selector GREEN before attention production change",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_selection.py tests/stage1/v5/test_throughput_attention.py -k 'selector or selected_keys_match or text_' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-selector-green > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-selector-green.log 2>&1",
+      "exit": 0,
+      "summary": "43 passed, 57 skipped",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-selector-green.log",
+      "log_sha256": "20ab00c921ecab1a5c3f979c18ce8030cbf427ad14065533fd70a16f3636ed4d"
+    },
+    {
+      "phase": "attention RED before production shape change",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py -k 'joint_attention or attention_dispatches' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-attention-red > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-attention-red.log 2>&1",
+      "exit": 1,
+      "summary": "4 failed, 3 passed, 3 skipped; old140 GEMMs vs required8 at35 queries/sample and policy constant absent",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-attention-red.log",
+      "log_sha256": "1d78ea7ca3348cfb064b2bd64ce2d2136904aeea8f09d7687d66b88c28a6a5be"
+    },
+    {
+      "phase": "early joint CPU gate before broad integration",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py -k 'joint_attention or attention_dispatches' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-attention-early-cpu > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-attention-early-cpu.log 2>&1",
+      "exit": 0,
+      "summary": "7 passed, 3 skipped",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-attention-early-cpu.log",
+      "log_sha256": "e8422e1391568233b5f321adeef237fe4e0c9398427d01ab04c2195a2c3f2aeb"
+    },
+    {
+      "phase": "immediately preceding CUDA resource check",
+      "exit": 0,
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-cuda-idle-transcript.log",
+      "log_sha256": "20dff87ca621a77084ea2137a5beb160ec072807973b1349c55d75c7299731b0",
+      "scope": "Both H100 NVLs at0 MiB/0%, no compute applications; CUDA_VISIBLE_DEVICES=0 used afterward; transcript retains original tool output"
+    },
+    {
+      "phase": "early joint CUDA operator and independent selector-device gate",
+      "command": "CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py -k 'joint_attention or selector_devices' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-early-cuda-operator > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-early-cuda-operator.log 2>&1",
+      "exit": 0,
+      "summary": "61 passed; CUDA operator only, no CUDA model/backward/optimizer",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-early-cuda-operator.log",
+      "log_sha256": "8b6a60201744a5e88593e8ab5dc582148d3a002db6d164c84e7f8ef1ca78166f"
+    },
+    {
+      "phase": "benchmark reporting RED before report implementation",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_throughput_attention.py -k 'benchmark_reports or benchmark_compares' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-benchmark-red > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-benchmark-red.log 2>&1",
+      "exit": 1,
+      "summary": "2 failed; joint-selected-key report missing",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-benchmark-red.log",
+      "log_sha256": "2a6beef9484ef3f171a4978e81899f6d81a907535c0c29f8d25f8d8695595b0c"
+    },
+    {
+      "phase": "required focused CPU integration GREEN",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_throughput_attention.py tests/stage1/v5/test_selection.py tests/stage1/v5/test_execution.py tests/stage1/v5/test_replay.py tests/stage1/v5/test_trainer.py --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-focused-green > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-focused-green.log 2>&1",
+      "exit": 0,
+      "summary": "171 passed, 90 skipped in16.95s",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-focused-green.log",
+      "log_sha256": "e045b5fb776736a34fac9d5a4665b2c8bf30567e393617a49b2957eadc96e6bd"
+    },
+    {
+      "phase": "self-review narrow verification after test-helper cleanup/assertion strengthening",
+      "command": "CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -s tests/stage1/v5/test_gpu_utilization.py -k 'joint_attention or attention_dispatches or selector_transfers' --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t3-self-review-narrow > /root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-self-review-narrow.log 2>&1",
+      "exit": 0,
+      "summary": "8 passed, 3 skipped",
+      "log": "/root/.codex/worktrees/d3c8/ILVR/logs/stage1-v5-gpu-utilization-20261018/t3-self-review-narrow.log",
+      "log_sha256": "8430b482a7886c4d14992491926251ce85b345264d081ef644854c557e004212"
+    },
+    {
+      "phase": "whitespace verification",
+      "command": "git diff --check",
+      "exit": 0
+    },
+    {
+      "phase": "report preservation/result validation",
+      "exit": 0,
+      "scope": "Validated focused CPU benchmark JSON flags and dtype/element/byte counts; copied its identical bytes to results without another performance run"
+    }
+  ],
+  "attention_policy": {
+    "candidate_rows_dtype": "FP32",
+    "atol": 1e-07,
+    "rtol": 1e-05,
+    "query_chunk_max": 32,
+    "workspace_bytes": 33554432,
+    "chunk_formula": "max(1,min(32,33554432//(2*heads*keys*4)))",
+    "scope": "Two FP32 score/probability workspaces; not a total VRAM bound. Scaling and masking in-place; scores/visibility and each chunk result explicitly released. Native mRoPE/GQA, full causal normalization, original candidate gather and sequential per-layer addition retained"
+  },
+  "joint_witness": {
+    "projections": "Pairwise bitwise equal, identical decoder and logits",
+    "cases": [
+      "normal",
+      "ties",
+      "near_ties"
+    ],
+    "queries_per_case": 70,
+    "selection_configs": [
+      "default",
+      "cumulative_below",
+      "cumulative_equal",
+      "cumulative_above",
+      "lowmass_below",
+      "lowmass_equal",
+      "lowmass_above"
+    ],
+    "ordered_selected_keys_exact": true,
+    "max_cpu_absolute_error": 9.313225746154785e-10,
+    "max_cpu_relative_error": 1.1898036689217406e-07,
+    "max_cuda_absolute_error": 1.862645149230957e-09,
+    "max_cuda_relative_error": 2.3796073378434812e-07,
+    "device_cases": "55 direct-selector cases: 11 branches \u00d7 CUDA-attention/CPU-logits, CPU-attention/CUDA-logits, CUDA/CUDA, mixed-attention/CUDA-logits, mixed-attention/CPU-logits",
+    "chunk_dispatches": {
+      "queries_per_sample": [
+        1,
+        35,
+        67
+      ],
+      "old": [
+        4,
+        140,
+        268
+      ],
+      "candidate": [
+        4,
+        8,
+        12
+      ],
+      "forced_chunk3_queries35_calls": 48
+    },
+    "report_with_explicit_ordered_keys": "/root/.codex/worktrees/d3c8/ILVR/results/stage1-v5-gpu-utilization-20261018/task3-benchmark-acceptance-cpu.json",
+    "report_sha256": "1c1564e71368b538524f58f486e799f4e51d75797cff35b828006c69b3b99292"
+  },
+  "selector_transfer_witness": {
+    "small_fixture": {
+      "before": {
+        "dtype": "torch.float32",
+        "elements": 176,
+        "bytes": 704
+      },
+      "after": [
+        {
+          "dtype": "torch.int64",
+          "elements": 48,
+          "bytes": 384
+        },
+        {
+          "dtype": "torch.float32",
+          "elements": 64,
+          "bytes": 256
+        }
+      ],
+      "after_total_elements": 112,
+      "after_total_bytes": 640
+    },
+    "benchmark_fixture": {
+      "before": [
+        {
+          "dtype": "torch.float32",
+          "elements": 4160,
+          "bytes": 16640
+        }
+      ],
+      "after": [
+        {
+          "dtype": "torch.int64",
+          "elements": 1216,
+          "bytes": 9728
+        },
+        {
+          "dtype": "torch.float32",
+          "elements": 1280,
+          "bytes": 5120
+        }
+      ],
+      "before_total_elements": 4160,
+      "after_total_elements": 2496,
+      "before_total_bytes": 16640,
+      "after_total_bytes": 14848
+    },
+    "integer_to_float_casts": 0,
+    "python_candidate_sorts": 0,
+    "stable_tensor_sort_per_query": true,
+    "scope": "Host tolist payload counts, not a claim of zero synchronization or GPU speedup"
+  },
+  "cpu_native_integration": {
+    "required_six_files_passed": true,
+    "nonzero_dora": true,
+    "loss_gradient_atol": 1e-05,
+    "loss_gradient_rtol": 0.0001,
+    "maximum_raw_K_gradient_error": 2.4783730623312294e-09,
+    "maximum_total_gradient_error": 2.2351741790771484e-08,
+    "checkpoint_modes": [
+      "off",
+      "early",
+      "full"
+    ],
+    "oracle": "Existing full-sequence native replay oracle unmodified; each loss/grad, reference immutability, original call count, trainer and negative controls retained"
+  },
+  "immutable_sha256": {
+    "tests/stage1/v5/frozen_gpu_utilization/stage1_v5_replay.py": "bf15d87ea7d6f9a2dd7775c6e1ab4d4b4edb3750bc4096213b8b3e310135fa5e",
+    "tests/stage1/v5/frozen_gpu_utilization/stage1_v5_trace.py": "33f55a0f6480bbfc50b9256cceb71c6ab61a968cbf4b6815c5dee8f80f5f7efb",
+    "tests/stage1/v5/frozen_gpu_utilization/v5_execution.py": "0abd7e9fb51f327916b735b74d7cad53dd0d4b7242d3dc74725dc43257c19a69",
+    "tests/stage1/v5/frozen_gpu_utilization/v5_selection.py": "1b285303a6da390c4de2635aff46c57582272f952d75efc72b52a67eddce2850",
+    "tests/stage1/v5/frozen_throughput/stage1_data.py": "d132b34f4a2a79403b7f850b9d667a4e947bf368a807da31856591fb81e2a183",
+    "tests/stage1/v5/frozen_throughput/stage1_v5_trace.py": "1a7d4bfb8b1d968e0a40541642b78e8fa5dbf61d4570af4c8effe3fe42441724",
+    "tests/stage1/v5/frozen_throughput/v5_selection.py": "3530678a6f9f7673d91d8305c2895e5904ca648f2dbbb8d34019e446e3f99827",
+    "tests/stage1/v5/test_replay.py": "451be588cf98945aa982f461145e2444f7ea4f37e2fc487d85d8723868f55679"
+  },
+  "self_review": {
+    "verdict": "No unresolved Task3 implementation concerns identified; independent reviews pending",
+    "selector": "FP32 original-device mass before sort/copy; stable descending argsort capped before transfer; integer ranks separately bulk-transferred; exact original tuple reconstruction; same T-squared KL, sample-local rho, validation and verbatim Python-double accumulation/threshold and low-mass floor/cap",
+    "attention": "Per-sample/layer K hoisted; bounded q index_select uses original coordinates; causal+padding source mask and candidate gather retained; no all-query score tensor, new CLI, native checkpoint/loss/gradient behavior changes or fallback",
+    "preserved": "Frozen_gpu_utilization/frozen_throughput byte-identical versus base; test_replay.py full-sequence oracle untouched; Task2 production files and runtime-contract files untouched; root workflow modifications excluded"
+  },
+  "limitations": [
+    "Finite deterministic operator cases do not prove future selected-key equality, production BF16 equivalence, or distributed training speed. Any later changed discrete selection must fail acceptance even if rows close.",
+    "CUDA witness used BF16 projection operator fixture with GQA/nontrivial mRoPE and source padding; no CUDA training, model backward, optimizer, production model or environment changes.",
+    "Saved benchmark report is one-repetition CPU acceptance from focused tests, not final performance evidence. Its fixture hash predates only removal of an unused test-helper parameter; candidate production hashes are unchanged. Final paired default/long performance and actual peak memory are Task4.",
+    "Independent reviews and final root verification/finish remain outstanding."
+  ]
+}
