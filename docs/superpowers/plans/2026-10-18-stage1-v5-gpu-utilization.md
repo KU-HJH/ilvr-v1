@@ -173,8 +173,8 @@ Do not assert that remaining unique/nonzero calls eliminate every CUDA sync.
 
 **Files:** Modify selection/trace; extend independent joint fixtures/test_gpu_utilization; narrowly update approved throughput floating/transfer assertions and benchmark acceptance.
 
-- [ ] **1. Write selector tests first.** Assert exact ordered original keys against the frozen selector for ties, cap0, empty candidates, low-mass and `nextafter` cumulative thresholds, independent CPU/CUDA attention rows and interleaved samples. Add a causal transferred-element/Python-sort witness: fewer transferred candidate weights than the original full candidate rows when cap<1, while integer identities remain exact and Python accumulation is unchanged.
-- [ ] **2. Run selector RED then implement stable prefix ranking.** Compute original-device row mass before any sorting/copy. For each aligned weights vector, retain original FP32 values and produce:
+- [x] **1. Write selector tests first.** Assert exact ordered original keys against the frozen selector for ties, cap0, empty candidates, low-mass and `nextafter` cumulative thresholds, independent CPU/CUDA attention rows and interleaved samples. Add a causal transferred-element/Python-sort witness: fewer transferred candidate weights than the original full candidate rows when cap<1, while integer identities remain exact and Python accumulation is unchanged.
+- [x] **2. Run selector RED then implement stable prefix ranking.** Compute original-device row mass before any sorting/copy. For each aligned weights vector, retain original FP32 values and produce:
 
 ```python
 order = torch.argsort(weights, descending=True, stable=True)[:cap]
@@ -190,8 +190,8 @@ packing. Preserve validation and mixed attention/logit device callers.
 Run `test_selection.py`, new selector tests and existing selector throughput
 tests GREEN before proceeding to attention.
 
-- [ ] **3. Write attention operation-count and joint comparison tests first.** Keep the frozen source; set ATOL1e-7/RTOL1e-5 before running candidate results. Compare each candidate row and exact selected tuple after both old/new traces using identical projections/logits; selector-only equality does not suffice. Include >32 queries, short final chunks, padding, GQA, nontrivial multimodal RoPE, ties and threshold neighbors. Keep old exact equality fields truthful. RED must show per-query matmul count rather than import errors.
-- [ ] **4. Implement minimal bounded query computation and run the joint probe before broad integration.** Define internal constants `V5_ATTENTION_QUERY_CHUNK_MAX=32` and `V5_ATTENTION_WORKSPACE_BYTES=33554432`; effective chunk is at least1 and at most32 with target `2*heads*chunk*keys*4` bytes. Within each sample/layer:
+- [x] **3. Write attention operation-count and joint comparison tests first.** Keep the frozen source; set ATOL1e-7/RTOL1e-5 before running candidate results. Compare each candidate row and exact selected tuple after both old/new traces using identical projections/logits; selector-only equality does not suffice. Include >32 queries, short final chunks, padding, GQA, nontrivial multimodal RoPE, ties and threshold neighbors. Keep old exact equality fields truthful. RED must show per-query matmul count rather than import errors.
+- [x] **4. Implement minimal bounded query computation and run the joint probe before broad integration.** Define internal constants `V5_ATTENTION_QUERY_CHUNK_MAX=32` and `V5_ATTENTION_WORKSPACE_BYTES=33554432`; effective chunk is at least1 and at most32 with target `2*heads*chunk*keys*4` bytes. Within each sample/layer:
 
 ```python
 positions = torch.tensor([key[1] for key, _ in queries_chunk],
@@ -211,8 +211,8 @@ VRAM. Do not truncate causal denominator. Any exact selected-key mismatch
 must be reported immediately with the input and error; stop this activation
 and contact root. Never loosen tolerance or silently adopt a partial scope.
 
-- [ ] **5. Run CPU GREEN and one idle CUDA joint operator comparison**, including boundary cases, before accepting attention. Run `test_gpu_utilization.py test_throughput_attention.py test_selection.py test_execution.py test_replay.py test_trainer.py`. CPU-only model integration uses current tiny fixtures and existing FP32 gradient tolerances. Benchmark report must include both attention closeness and joint exact selected keys; no production-BF16 equivalence claim.
-- [ ] **6. Self-review and commit.** Report exact discrete results, maximum floating error, policy bounds, relevant operator counts and logs. Root obtains sequential spec and quality review.
+- [x] **5. Run CPU GREEN and one idle CUDA joint operator comparison**, including boundary cases, before accepting attention. Run `test_gpu_utilization.py test_throughput_attention.py test_selection.py test_execution.py test_replay.py test_trainer.py`. CPU-only model integration uses current tiny fixtures and existing FP32 gradient tolerances. Benchmark report must include both attention closeness and joint exact selected keys; no production-BF16 equivalence claim.
+- [x] **6. Self-review and commit.** Report exact discrete results, maximum floating error, policy bounds, relevant operator counts and logs. Root obtains sequential spec and quality review.
 
 ## Task 4: Actual execution identity, integration and final measurements
 

@@ -405,3 +405,63 @@ checkpoint/dropout and prefix gradients; independently ran CPU mask/dropout/
 dispatch cases38pass/30CUDA-skip/7deselected and checked complete logs/hashes.
 Task2 review gates closed; Task3 may proceed. Exact reviewer command requested
 for this record without rerunning the test.
+
+Task2 quality review's exact independent command (exit0,3.13s):
+
+```bash
+CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest -q -p no:cacheprovider tests/stage1/v5/test_gpu_utilization.py -k 'replay_bias or raw_dropout or diagnostic_coordinate or replay_without or dispatch'
+```
+
+Result38pass/30skip/7deselected. No model fixtures or log file were created;
+complete stdout remains tool transcript chunk ae935d and this durable record
+retains the command/result. Root did not repeat it. Task2 complete at control
+recordd63db46; final quality verdict has no unresolved findings.
+
+## Task 3 active implementation
+
+Fresh implementer `/root/gpu_util_t3_impl`, based63db46ea8cd134b66ed42bf1935212c4ffaadf4,
+received full Task3 requirements and existing reviewed dependencies. Scope is
+stable prefix ranking with unchanged original-device masses/Python decisions,
+then bounded attention chunks with early joint exact-selection comparisons.
+Root emphasized detached in-place scale/mask lifetime management within the
+32MiB score/probability target and honest actual peak memory. Any discrete
+mismatch stops affected activation; no silent fallback/tolerance change.
+No new human confirmation is needed for these approved internals.
+
+Task3 implementer committed4888e7ad4a46c5044d03124bc381eec970564dd8 with base
+d63db46ea8cd134b66ed42bf1935212c4ffaadf4; root control edits were excluded.
+Root read actual trace/selector diffs, full selector RED/GREEN and early
+CPU/CUDA logs and implementation evidence JSON (SHA256
+cbda9a1b52baa28937ce52dcbde7c518c892d91e4d858bf5bc6a59b74785f45c).
+Commands/exits/content/log hashes are durably in
+`results/stage1-v5-gpu-utilization-20261018/task3-implementation-evidence.json`.
+
+Selector RED1expected fail precedes code; GREEN43pass/57skip. Attention RED
+shows old140GEMMs versus required8 at35queries/sample; early CPU7pass/3skip,
+early CUDA61pass (including55selector placement cases). Joint old/new selected
+tuples exact for normal/ties/near-ties at70queries each and seven measured
+default/cumulative/lowmass boundary configurations. Max observed attention
+absolute error CPU9.313225746154785e-10, CUDA1.862645149230957e-9, within
+predefined1e-7/1e-5. Chunk constants32/33554432, remainders and budget-forced
+chunk3 witnessed. These are finite operator witnesses, not universal proof.
+
+Focused CPU six-file integration171pass/90CUDA-skip,16.95s; root read its
+summary/native-gradient outputs and small early logs in full. Large JSON
+outputs in the full integration log remain available for programmatic review.
+Benchmark-report causal RED precedes new joint/byte metadata. Narrow final
+self-review8pass/3skip follows test-helper cleanup. Selector benchmark payload
+4160->2496elements but16640->14848bytes (int64 ranks separate from FP32 values),
+not the same percentage. Native full-sequence oracle/frozen sources unchanged.
+
+Independent spec reviewer `/root/gpu_util_t3_spec`: SPEC PASS at exact diff
+d63db46..4888e7a, no gaps/extras. It traced actual source and independently
+checked hashes, complete JSON reports and non-JSON integration-log text;
+confirmed boundary cases produce distinct choices (first-query cumulative
+2vs3 and lowmass38vs12), so labels are backed by actual branch effects.
+Quality reviewer `/root/gpu_util_t3_quality`: QUALITY PASS at4888e7a,
+no Critical/Important/Minor issues. Traced production callers/native attention,
+checked six source and nine log hashes and complete focused-log data; fresh
+CPU selector/joint/chunk tests30pass/3skip reproduced exact keys/maxerror/chunks.
+Task3 review gates closed; Task4 may proceed. Reviewer command requested for
+the durable record without another run. No final performance claim from the
+one-repetition CPU acceptance report.
