@@ -58,7 +58,7 @@ Do not rerun the already-green broad baseline. No post-failure tolerance changes
 
 **Files:** Create frozen sources/helper/test file above; modify the existing benchmark and its old benchmark assertions only as needed.
 
-- [ ] **1. Write causal benchmark contract and frozen-hash tests first.** The new measurement must return before/after data for replay mask and dropout as well as existing attention/selection, include raw paired times, geometry, scope, source identity and actual memory. A minimal RED assertion is:
+- [x] **1. Write causal benchmark contract and frozen-hash tests first.** The new measurement must return before/after data for replay mask and dropout as well as existing attention/selection, include raw paired times, geometry, scope, source identity and actual memory. A minimal RED assertion is:
 
 ```python
 def test_benchmark_contains_all_four_independent_operators(tmp_path, monkeypatch):
@@ -76,8 +76,8 @@ def test_benchmark_contains_all_four_independent_operators(tmp_path, monkeypatch
     assert report['dropout_exact_equal']
 ```
 
-- [ ] **2. Run just the new failing benchmark test**, using the standard CPU environment and unique task1-red basetemp/log. Expect a missing replay/dropout record, not an import or fixture error.
-- [ ] **3. Freeze and implement the minimal measurement extension.** Copy bytes with `git show 65643f08cb6e61fbbb200de825d57086f5c7a127:<path>` for each of the four baseline modules, checking the commitment's literal hashes. Load them under their existing packages with unique frozen names. Keep the historical frozen_throughput files unchanged. Build deterministic bounded fixtures and a no-model replay decoder that captures the actual bias; label fixed stub overhead in measurement. Use real private-generator dropout execution contexts. Do not rewrite production operator algorithms in this task.
+- [x] **2. Run just the new failing benchmark test**, using the standard CPU environment and unique task1-red basetemp/log. Expect a missing replay/dropout record, not an import or fixture error.
+- [x] **3. Freeze and implement the minimal measurement extension.** Copy bytes with `git show 65643f08cb6e61fbbb200de825d57086f5c7a127:<path>` for each of the four baseline modules, checking the commitment's literal hashes. Load them under their existing packages with unique frozen names. Keep the historical frozen_throughput files unchanged. Build deterministic bounded fixtures and a no-model replay decoder that captures the actual bias; label fixed stub overhead in measurement. Use real private-generator dropout execution contexts. Do not rewrite production operator algorithms in this task.
 
 The paired timing loop must use the same prebuilt inputs and alternate order:
 
@@ -101,9 +101,9 @@ Add max attention errors/within-tolerance fields without falsely reporting exact
 equality. Reuse existing CLI with bounded geometry options only if necessary;
 do not load production weights or save model-bearing artifacts.
 
-- [ ] **4. Run task1 GREEN and existing benchmark contract tests.** Run `tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_throughput_attention.py`. Expected green; old tests can gain additional report fields but must still compare identical candidate inputs.
-- [ ] **5. Record source65643f0 costs before any product rewrite.** Run the existing script with warmup3/repetitions20 on CPU and idle CUDA device0; save distinct `baseline-cpu.json` and `baseline-cuda.json` plus full logs. Check `nvidia-smi` first. Report current GPU name/version (the fresh observation shows H100 NVL, not a presumed B200). This is operator measurement, not training.
-- [ ] **6. Self-review and commit.** Record byte hashes and actual command results. Do not change root workflow records. Return DONE/CONCERNS with commit and log paths; root obtains sequential spec then quality review.
+- [x] **4. Run task1 GREEN and existing benchmark contract tests.** Run `tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_throughput_attention.py`. Expected green; old tests can gain additional report fields but must still compare identical candidate inputs.
+- [x] **5. Record source65643f0 costs before any product rewrite.** Run the existing script with warmup3/repetitions20 on CPU and idle CUDA device0; save distinct `baseline-cpu.json` and `baseline-cuda.json` plus full logs. Check `nvidia-smi` first. Report current GPU name/version (the fresh observation shows H100 NVL, not a presumed B200). This is operator measurement, not training.
+- [x] **6. Self-review and commit.** Record byte hashes and actual command results. Do not change root workflow records. Return DONE/CONCERNS with commit and log paths; root obtains sequential spec then quality review.
 
 ## Task 2: Exact replay-mask and dropout tensor assembly
 

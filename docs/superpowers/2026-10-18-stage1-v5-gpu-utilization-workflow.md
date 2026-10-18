@@ -320,3 +320,51 @@ continuously without further same-scope approval stops.
 Fresh local resource observation before handoff: two NVIDIA H100 NVL devices,
 zero used memory/zero utilization and no compute processes. This supersedes
 any presumed B200 for local operator measurements; recheck before CUDA work.
+
+## Task 1 implementation and review evidence
+
+Implementer `/root/gpu_util_t1_impl`, base91a1440b199548afd387d76cf7a303a5e59a24a2,
+head5a7df38096f6e874269e731d1d0b9f055fc0a9ec. Nine files: four byte-identical
+frozen sources, fixtures/tests, direct benchmark extension and two baseline
+JSONs. Root verified the head/diff and unchanged production operators plus
+historical frozen_throughput via `git diff --exit-code 65643f0 -- <four paths>
+tests/stage1/v5/frozen_throughput`. Worktree was clean after commit.
+
+Causal RED logs `t1-red-operators.log` (missing replay_mask_before/frozen
+files/paired execution) and `t1-red-dropout.log` (missing execution fixture)
+precede implementation. Initial GREEN `t1-green.log` exposed serialization of
+inherited dispatch bookkeeping; the script now explicitly serializes counters.
+Corrected GREEN `t1-green-fixed.log`: exit0, 26pass/2CUDA-onlyskip in11.69s.
+Root read corrected GREEN and output-validation/resource-check logs; spec
+reviewer read all RED, failed/corrected GREEN and complete measurement logs.
+
+All following commands ran from d3c8 with repository venv, exited0 and had
+complete stdout/stderr redirected to the matching logs. Exact effective
+commands, without the shell's subsequent output-display/exit wrapper:
+
+```bash
+CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python -m pytest tests/stage1/v5/test_gpu_utilization.py tests/stage1/v5/test_throughput_attention.py -q --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/t1-green-fixed > logs/stage1-v5-gpu-utilization-20261018/t1-green-fixed.log 2>&1
+CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python scripts/benchmark_stage1_v5_attention_selection.py --device cpu --warmup 3 --repetitions 20 --output results/stage1-v5-gpu-utilization-20261018/baseline-cpu.json > logs/stage1-v5-gpu-utilization-20261018/baseline-cpu.log 2>&1
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ./venv/ilvr-venv/bin/python scripts/benchmark_stage1_v5_attention_selection.py --device cuda:0 --warmup 3 --repetitions 20 --output results/stage1-v5-gpu-utilization-20261018/baseline-cuda.json > logs/stage1-v5-gpu-utilization-20261018/baseline-cuda.log 2>&1
+```
+
+Pre-CUDA resource check: idle two H100 NVL devices/no processes, recorded in
+`baseline-cuda-resource-check.log`. CPU baseline JSON SHA256
+01983a777189e9a9a103c6ba706aee11278cb34a6a4a2b277907e8241712f50c;
+CUDA baseline JSON SHA256
+aaedfd07f9bf692ede952dff5a125bb342654b6157fb0b535efe57c53f96cb4a.
+Measurement identity includes pre-commit HEAD91a1440 and exact committed
+script/fixture hashes. All four exact flags true, attention maxerror0 and
+global dropout RNG unchanged. These are unchanged-code operator costs; no
+improvement or production/distributed equivalence is established.
+
+Independent spec reviewer `/root/gpu_util_t1_spec`: SPEC PASS at5a7df38;
+independently checked byte sources, timing order/medians/hashes/log matches,
+actual dummy replay/dropout paths and declared scope. No gaps/extras. It noted
+raw logs lack argv; the implementer's exact execution record is persisted
+above without rerunning measurements. Quality reviewer
+`/root/gpu_util_t1_quality`: QUALITY PASS at5a7df38, no Critical/Important
+issues; independently checked all four source bytes, JSON/full-log identity,
+script/fixture hashes, paired order/medians/memory arithmetic and equality/RNG
+flags. No GPU or test rerun. Task1 is complete; Task2 may start. Final quality
+response and any minor observations will be retained when received.
