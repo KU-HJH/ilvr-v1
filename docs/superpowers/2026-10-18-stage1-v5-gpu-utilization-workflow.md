@@ -67,8 +67,13 @@ have been changed; no implementation agent has been dispatched.
 5. Architecture/components/data-flow section A1: confirmed by the user's
    subsequent `진행해` in response to the explicit A1 question. This approval
    binds A1 only and authorizes elaborating validation, not product changes.
-   Error handling and testing section B1 below awaits confirmation.
-6. Complete written specification and self-review: pending confirmed sections.
+   Error handling and testing section B1: confirmed by the subsequent `계속`
+   after the explanation of approval fragmentation. Treat this as continuation
+   of the pending design section, not waiver of the final written-spec gate.
+   The user objected to repeated stops; consolidate the remaining design,
+   critique and uncertainty presentation into one exact final commitment.
+6. Complete written specification and self-review: in progress with A1/B1
+   confirmed. Root is not authorized to implement product code yet.
 7. Freeze proposal, root hate, applicable macrothink fresh reads, synthesize
    commitment: pending complete unapproved proposal. No premise experiment is
    authorized or reported as run by those advisory hooks.
@@ -174,7 +179,7 @@ activation rather than being explained away by float tolerance. Finite tests
 will not be described as a proof over every future input. No GPU premise probe
 has been authorized or executed for this proposal.
 
-## Error handling and verification section B1, proposed
+## Error handling and verification section B1, confirmed by `계속`
 
 Keep the existing literal independent full-sequence oracle and frozen older
 sources. Add an immutable, hash-identified comparison baseline for the four
@@ -200,7 +205,7 @@ The proposed numerical limits, fixed before any candidate GREEN result, are:
   scope; these CPU/tiny-model bounds are not proof of production BF16 or
   two-node/four-rank behavior.
 
-Include unsorted candidate metadata, exact weight ties, nextafter threshold
+Include rejection of unsorted candidate metadata, exact weight ties, nextafter threshold
 neighbors, mass on both sides of the low-mass branch, empty and zero-cap rows,
 multiple source samples, duplicate/permuted source coordinates, variable
 source lengths, padding and checkpoint full/early-stop recomputation. Use
@@ -246,3 +251,12 @@ No costly or implementation-like premise probe has been run during design.
 Hate's proposed first nail will remain a proposal unless separately authorized.
 Any remaining load-bearing uncertainty must be explicit in the exact final
 commitment and accepted by the human before planning and implementation.
+
+## Written-spec preparation and self-review correction
+
+Runtime-path inspection confirms V5Block.__post_init__ already requires sorted
+unique candidate positions. B1's unsorted-metadata test therefore verifies
+unchanged rejection, not a new supported input. Interleaved samples/blocks
+remain valid; stable sorting must preserve original position tie-break for
+valid sorted candidates. This correction preserves A1's existing interfaces
+and adds no new behavior or implementation authority.
