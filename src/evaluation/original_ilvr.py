@@ -4,6 +4,7 @@ The native sampler/model are mechanical snapshots, not reconstructed rollouts.
 Do not normalize their cache, EOS, or incomplete-block behavior.
 """
 from dataclasses import dataclass
+from contextlib import nullcontext
 import logging
 
 import torch
@@ -48,8 +49,10 @@ class OriginalGenerationResult:
     stop_reason: str
 
 
-def generate_original(model, inputs, generation_kwargs, *, tokenizer=None):
+def generate_original(model, inputs, generation_kwargs, *, tokenizer=None, static_inference_cache=False):
     """Call the pinned source's real generate/prepare/forward/_sample chain."""
+    if type(static_inference_cache) is not bool:
+        raise TypeError('static_inference_cache must be a boolean')
     from peft_common import resolve_qwen2_5_vl_model
     qwen=resolve_qwen2_5_vl_model(model)
     if not isinstance(qwen, original_model_class()):
@@ -66,9 +69,11 @@ def generate_original(model, inputs, generation_kwargs, *, tokenizer=None):
     kwargs.pop('max_sequence_length',None)
     kwargs.pop('generation_limit_policy',None)
     generator=model if callable(getattr(model,'generate',None)) else qwen
-    sequences = generator.generate(**inputs, **kwargs, tokenizer=tokenizer,
-        logits_processor=LogitsProcessorList([LatentTemplateLogitsProcessor(
-            start,end,pad,int(getattr(qwen.config,'latent_size',8)))]))
+    from .static_inference import static_inference_cache as static_cache
+    with static_cache(model) if static_inference_cache else nullcontext():
+        sequences = generator.generate(**inputs, **kwargs, tokenizer=tokenizer,
+            logits_processor=LogitsProcessorList([LatentTemplateLogitsProcessor(
+                start,end,pad,int(getattr(qwen.config,'latent_size',8)))]))
     if not torch.is_tensor(sequences):
         sequences = sequences.sequences
     suffix = sequences[0,inputs['input_ids'].shape[1]:].tolist()

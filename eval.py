@@ -65,7 +65,7 @@ from evaluation.continuous_latent import (
 from evaluation.runtime import prepare_evaluation_input
 from evaluation import original_scoring
 from evaluation.original_ilvr import (generate_original, load_original_model, execution_identity, config_resolution)
-from evaluation.protocol import resolve_protocol, resolve_options
+from evaluation.protocol import resolve_protocol, resolve_options, validate_inference_options
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -147,7 +147,7 @@ def get_eval_args():
     parser.add_argument("--use-kv-cache", action="store_true",
                         help="Cache Stage 1 OFF decoding (requires --disable-latent-generation).")
     parser.add_argument("--static-inference-cache", action="store_true",
-                        help="Reuse fixed Stage 1 OFF inference state (requires --use-kv-cache).")
+                        help="Reuse immutable PEFT constants per original generation, or Stage 1 OFF with KV cache.")
     parser.add_argument("--num-shards", type=int, default=1)
     parser.add_argument("--shard-index", type=int, default=0)
     parser.add_argument("--model-identity", type=str)
@@ -377,13 +377,18 @@ def run_one_example(
     Run inference on a single example and return raw output,
     extracted final answer, and inference time.
     """
+    qwen_model = resolve_qwen2_5_vl_model(model)
+    stage = getattr(qwen_model.config, "stage", None)
+    evaluation_protocol = resolve_protocol(evaluation_protocol, stage)
+    validate_inference_options(evaluation_protocol, stage,
+        disable_latent_generation=disable_latent_generation, use_kv_cache=use_kv_cache,
+        static_inference_cache=static_inference_cache)
     text_input = sample.get("text_input", "")
     img_list = _resolve_image_paths(sample.get("image_input", []))
     images = open_images(img_list) if img_list else None
 
     prepared = prepare_evaluation_input(processor, sample, images)
 
-    qwen_model = resolve_qwen2_5_vl_model(model)
     effective_device = getattr(model, "device", None)
     if effective_device is None:
         effective_device = getattr(qwen_model, "device", None)
@@ -410,25 +415,11 @@ def run_one_example(
     ):
         raise ValueError("checkpoint config must contain a positive latent_size")
     token_ids = resolve_latent_token_ids(processor.tokenizer, qwen_model.config)
-    stage = getattr(qwen_model.config, "stage", None)
-    evaluation_protocol = resolve_protocol(evaluation_protocol, stage)
     if evaluation_protocol == "original":
-        if disable_latent_generation or use_kv_cache or static_inference_cache:
-            raise ValueError("Stage 1 OFF/cache diagnostics require explicit continuous evaluation")
         resolve_options("original", gen_kwargs.get("repetition_penalty"), gen_kwargs.get("generation_limit_policy"))
         max_sequence_length = gen_kwargs.get("max_sequence_length")
         if max_sequence_length is not None and input_ids.shape[1] + gen_kwargs["max_new_tokens"] > max_sequence_length:
             raise ValueError("original evaluation exceeds the max_sequence_length resource guard")
-    if type(use_kv_cache) is not bool:
-        raise TypeError("use_kv_cache must be a boolean")
-    if use_kv_cache and (stage != "stage1" or not disable_latent_generation):
-        raise ValueError("KV cache requires Stage 1 with latent generation disabled")
-    if type(static_inference_cache) is not bool:
-        raise TypeError("static_inference_cache must be a boolean")
-    if static_inference_cache and not use_kv_cache:
-        raise ValueError("static inference cache requires Stage 1 OFF with KV cache")
-    if disable_latent_generation and stage != "stage1":
-        raise ValueError("disable_latent_generation is a Stage 1 diagnostic only")
     if stage == "stage1" and evaluation_protocol != "original":
         if not isinstance(qwen_model, ContinuousLatentModelProtocol):
             raise TypeError(
@@ -454,13 +445,14 @@ def run_one_example(
         raise ValueError(f"unsupported evaluation stage: {stage!r}")
 
     # ---- Start inference timing (generation only) ----
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if torch.device(effective_device).type == "cuda":
+        torch.cuda.synchronize(effective_device)
     start_time = time.perf_counter()
 
     with torch.inference_mode():
         if evaluation_protocol == "original":
-            generation_result = generate_original(model, inputs, gen_kwargs, tokenizer=processor.tokenizer)
+            generation_result = generate_original(model, inputs, gen_kwargs, tokenizer=processor.tokenizer,
+                static_inference_cache=static_inference_cache)
             out_ids = generation_result.sequences
         elif stage == "stage1":
             generation_result = ContinuousLatentController().generate(
@@ -490,8 +482,8 @@ def run_one_example(
             )
             out_ids = generation_result.sequences
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
+    if torch.device(effective_device).type == "cuda":
+        torch.cuda.synchronize(effective_device)
     end_time = time.perf_counter()
     inference_time = end_time - start_time
     # ---- End inference timing ----
@@ -589,11 +581,10 @@ def main():
     )
     protocol = resolve_protocol(args.evaluation_protocol, resolve_qwen2_5_vl_model(model).config.stage) if hasattr(args,"evaluation_protocol") else "continuous"
     args.repetition_penalty, args.generation_limit_policy = resolve_options(protocol,args.repetition_penalty,getattr(args,"generation_limit_policy",None))
-    if protocol == "original" and any(
-        getattr(args, name, False)
-        for name in ("disable_latent_generation", "use_kv_cache", "static_inference_cache")
-    ):
-        raise ValueError("Stage 1 OFF/cache diagnostics require explicit continuous evaluation")
+    validate_inference_options(protocol, resolve_qwen2_5_vl_model(model).config.stage,
+        disable_latent_generation=getattr(args,"disable_latent_generation",False),
+        use_kv_cache=getattr(args,"use_kv_cache",False),
+        static_inference_cache=getattr(args,"static_inference_cache",False))
 
     # Load test data
     data = []
@@ -784,6 +775,7 @@ def main():
         "source_sha256": hashlib.sha256(dataset_path.read_bytes()).hexdigest(),
         "generation_profile": {key: value for key, value in gen_kwargs.items() if key != "do_sample"},
     } if (getattr(args, "disable_latent_generation", False)
+          or getattr(args, "static_inference_cache", False)
           or getattr(args, "model_identity", None) is not None) else {}
     for row in results:
         row.update(diagnostic_identity)

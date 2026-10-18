@@ -2098,8 +2098,10 @@ def validate_evaluation_sidecars(
     execution_initialized = False
     require_penalty = "repetition_penalty" in expected_generation_config
     generation_config = _validate_generation_config(
-        dict(expected_generation_config), include_default_vision_ablation=True, require_repetition_penalty=require_penalty
+        dict(expected_generation_config), include_default_vision_ablation=True, require_repetition_penalty=require_penalty,
+        evaluation_protocol=expected_evaluation_protocol or "continuous",
     )
+    generation_config.setdefault("static_inference_cache", False)
     required = {
         "schema_version",
         "result_jsonl",
@@ -2149,7 +2151,9 @@ def validate_evaluation_sidecars(
             raise ValueError(f"sidecar JSONL mismatch for shard {shard_index}")
         if payload["model_identity"] != expected_model_identity:
             raise ValueError("model identity mismatch across evaluation sidecars")
-        observed_generation = _validate_generation_config(payload["generation_config"],include_default_vision_ablation=True)
+        observed_generation = _validate_generation_config(payload["generation_config"],include_default_vision_ablation=True,
+            evaluation_protocol=identity["evaluation_protocol"] if identity is not None else "continuous")
+        observed_generation.setdefault("static_inference_cache", False)
         if not require_penalty:
             observed_generation.pop("repetition_penalty",None)
         if observed_generation != generation_config:

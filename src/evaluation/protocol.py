@@ -26,6 +26,25 @@ def resolve_options(protocol, repetition_penalty, generation_limit_policy):
             generation_limit_policy or 'bounded')
 
 
+def validate_inference_options(protocol, stage, *, disable_latent_generation=False,
+                               use_kv_cache=False, static_inference_cache=False):
+    """Reject global mode conflicts before an evaluator enters its sample loop."""
+    for name, value in (('use_kv_cache', use_kv_cache),
+                        ('static_inference_cache', static_inference_cache)):
+        if type(value) is not bool:
+            raise TypeError(f'{name} must be a boolean')
+    if protocol == 'original':
+        if disable_latent_generation or use_kv_cache:
+            raise ValueError('Stage 1 OFF/cache diagnostics require explicit continuous evaluation')
+        return
+    if use_kv_cache and (stage != 'stage1' or not disable_latent_generation):
+        raise ValueError('KV cache requires Stage 1 with latent generation disabled')
+    if static_inference_cache and not (stage == 'stage1' and disable_latent_generation and use_kv_cache):
+        raise ValueError('static inference cache requires Stage 1 OFF with KV cache')
+    if disable_latent_generation and stage != 'stage1':
+        raise ValueError('disable_latent_generation is a Stage 1 diagnostic only')
+
+
 def validate_execution_identity(value):
     if not isinstance(value,dict) or not {'evaluation_protocol','source_commit','generation_config','attention_backend'} <= set(value):
         raise ValueError('invalid evaluation execution identity')

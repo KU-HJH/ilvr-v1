@@ -190,7 +190,7 @@ def test_witness_cli_equal_ordinary_tokens_reports_inconclusive_and_nonzero(tmp_
     assert report['verdict']=='inconclusive' and report['first_nail_passed'] is False
 
 
-@pytest.mark.parametrize('flag', ['--disable-latent-generation', '--use-kv-cache', '--static-inference-cache'])
+@pytest.mark.parametrize('flag', ['--disable-latent-generation', '--use-kv-cache'])
 def test_original_global_diagnostic_flags_fail_before_sample_processing_or_output(tmp_path, monkeypatch, flag):
     from step_preference import capacity_evidence
     module = importlib.import_module('eval')

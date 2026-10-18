@@ -1176,6 +1176,7 @@ class EvaluationPlan:
     repetition_penalty: float | None = None
     generation_limit_policy: str | None = None
     evaluation_protocol: str = "auto"
+    static_inference_cache: bool = False
     temperature: float = 0.0
     top_p: float = 1.0
     vision_ablation: str = "none"
@@ -1248,6 +1249,10 @@ class EvaluationPlan:
             raise ValueError("repetition_penalty must be finite and positive")
         if self.evaluation_protocol not in ("auto","original","continuous"):
             raise ValueError("invalid evaluation protocol")
+        if type(self.static_inference_cache) is not bool:
+            raise ValueError("static_inference_cache must be a boolean")
+        if self.static_inference_cache and self.evaluation_protocol == "continuous":
+            raise ValueError("coordinator static inference cache requires original Stage 1 evaluation")
         if self.generation_limit_policy not in (
             None, "native", "bounded", "external_full_latent_block",
         ):
@@ -1353,6 +1358,8 @@ def _build_evaluation_commands_for_stage(
         raise ValueError("observed inference stage must be stage1 or stage2")
     from evaluation.protocol import resolve_protocol, resolve_options
     protocol = resolve_protocol(plan.evaluation_protocol,stage)
+    if plan.static_inference_cache and protocol != "original":
+        raise ValueError("coordinator static inference cache requires original Stage 1 evaluation")
     penalty, limit_policy = resolve_options(protocol,plan.repetition_penalty,plan.generation_limit_policy)
     if stage == "stage1" and plan.vision_ablation != "none":
         raise ValueError("vision ablation is only supported for Stage 2 evaluation")
@@ -1397,6 +1404,8 @@ def _build_evaluation_commands_for_stage(
         ]
         if penalty is not None:
             evaluator_command.extend(("--repetition_penalty",str(penalty)))
+        if plan.static_inference_cache:
+            evaluator_command.append("--static-inference-cache")
         if stage == 'stage1':
             evaluator_command.extend(('--runtime_identity_path', str(_evaluation_node_path(
                 plan, plan.output_dir / f'shard-{assignment.shard_index}.runtime-identity.json', remote=remote))))
@@ -3268,6 +3277,7 @@ class EvaluationSubprocessRunner:
                 "temperature": self.plan.temperature,
                 "top_p": self.plan.top_p,
                 "vision_ablation": self.plan.vision_ablation,
+                **({"static_inference_cache": True} if self.plan.static_inference_cache else {}),
             },
             expected_evaluation_protocol=commands.evaluation_protocol,
         )

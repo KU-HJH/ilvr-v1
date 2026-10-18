@@ -179,6 +179,7 @@ def _validate_generation_config(
     require_vision_ablation: bool = False,
     require_generation_limit_policy: bool = True,
     include_default_vision_ablation: bool = False,
+    evaluation_protocol: str = "continuous",
 ) -> dict[str, Any]:
     required = {"max_new_tokens", "temperature", "top_p"}
     if require_sequence_length:
@@ -211,7 +212,11 @@ def _validate_generation_config(
         raise ValueError("invalid generation config use_kv_cache")
     if "static_inference_cache" in value and type(value["static_inference_cache"]) is not bool:
         raise ValueError("invalid generation config static_inference_cache")
-    if value.get("static_inference_cache", False) and not (
+    if evaluation_protocol == "original" and (
+        value.get("use_kv_cache", False) or value.get("disable_latent_generation", False)
+    ):
+        raise ValueError("original evaluation rejects OFF/KV diagnostics")
+    if evaluation_protocol != "original" and value.get("static_inference_cache", False) and not (
         value.get("use_kv_cache", False) and value.get("disable_latent_generation", False)
     ):
         raise ValueError("static_inference_cache requires OFF with KV cache")
@@ -302,10 +307,12 @@ def write_shard_manifest(
         raise ValueError("worker exit status must be a non-negative integer")
 
     identity = _validate_dataset_identity(dict(dataset_identity))
+    execution = validate_execution_identity(dict(execution_identity)) if execution_identity is not None else None
     generation_input = dict(generation_config)
     generation_input.setdefault("generation_limit_policy", "bounded")
     generation = _validate_generation_config(
-        generation_input, include_default_vision_ablation=True
+        generation_input, include_default_vision_ablation=True,
+        evaluation_protocol=execution["evaluation_protocol"] if execution is not None else "continuous",
     )
     expected = _validate_index_list(
         list(expected_source_indices), "expected source indices"
@@ -326,8 +333,8 @@ def write_shard_manifest(
         "worker_exit_status": worker_exit_status,
         "successful": worker_exit_status == 0,
     }
-    if execution_identity is not None:
-        manifest["execution_identity"] = validate_execution_identity(dict(execution_identity))
+    if execution is not None:
+        manifest["execution_identity"] = execution
     with manifest_path.open("x", encoding="utf-8") as stream:
         stream.write(json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n")
     return manifest_path
@@ -405,6 +412,7 @@ def _validate_manifest(
     ):
         manifest["generation_config"] = _validate_generation_config(
             manifest["generation_config"],
+            evaluation_protocol=manifest.get("execution_identity", {}).get("evaluation_protocol", "continuous"),
             require_sequence_length=(
                 schema_version
                 in (

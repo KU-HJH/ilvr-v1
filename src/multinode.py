@@ -2484,6 +2484,7 @@ def _evaluate_main(argv: list[str]) -> int:
     parser.add_argument("--max-sequence-length", type=int, default=32768)
     parser.add_argument("--repetition-penalty", type=float, default=None)
     parser.add_argument("--evaluation-protocol",choices=("auto","original","continuous"),default="auto")
+    parser.add_argument("--static-inference-cache",action="store_true")
     parser.add_argument(
         "--generation-limit-policy",
         choices=("native", "bounded", "external_full_latent_block"),
@@ -2513,6 +2514,7 @@ def _evaluate_main(argv: list[str]) -> int:
             max_sequence_length=args.max_sequence_length,
             repetition_penalty=args.repetition_penalty,
             evaluation_protocol=args.evaluation_protocol,
+            static_inference_cache=args.static_inference_cache,
             generation_limit_policy=args.generation_limit_policy,
             temperature=args.temperature,
             top_p=args.top_p,

@@ -104,7 +104,10 @@ evaluation's local worker copy stays in
 
 TEST400 is the established `data/TEST.jsonl` with exactly 400 nonempty records.
 Evaluation uses temperature0/top_p1, max new4096, max sequence128000,
-repetition penalty1, no vision ablation and `external_full_latent_block`.
+no vision ablation and the restored `original` native per-token protocol.
+The recipe leaves repetition penalty, EOS and KV behavior to the original
+base's loaded generation configuration. Runtime identities record those
+resolved settings. Historical continuous evaluations used a separate profile.
 For unequal managed roots, the coordinator hashes the exact local TEST file
 and binds its canonical path/size/mtime plus SHA256 into every Stage1 worker
 command. Workers validate local mapped bytes before model loading and again
@@ -121,6 +124,41 @@ JSONL and summary JSON. Stage1 workers also publish distinct
 `shard-N.runtime-identity.json` backend witnesses in that results directory;
 remote shards0/1 and their runtime witnesses are collected through the fixed
 rsync list. Evaluation logs and ownership records stay under logs.
+
+Original evaluation can explicitly select `--static-inference-cache` on
+`eval.py` or `python -m src.multinode evaluate`. The coordinator forwards it
+to all four workers and validates the same setting in their sidecars and rows.
+It reuses supported linear DoRA magnitude norms and trainable embedding
+materializations only within each generation, under eval/no-grad. The native
+sampler, attention, MRoPE, latent handoff, stopping and unmerged parameters
+remain the original execution. Original mode rejects the separate OFF/KV
+diagnostic switches. Continuous static reuse still requires Stage1 OFF+KV.
+Omitting the flag keeps reuse disabled, including in the automatic recipe.
+
+After review and GPU equality acceptance, inspect a fresh four-worker command
+with the prepared artifact and both managed roots:
+
+```bash
+./venv/ilvr-venv/bin/python -m src.multinode evaluate \
+  --run-id <distinct-eval-id> --model-dir <prepared-model-under-checkpoints> \
+  --base-model-dir <original-base> --test-data-path "$PWD/data/TEST.jsonl" \
+  --task-name zebra-cot --output-dir "$PWD/results/<distinct-eval-id>" \
+  --cache-dir "$PWD/data/cache" --local-repo-root "$PWD" \
+  --remote-repo-root <reviewed-remote-container-root> \
+  --remote-host-repo-root <matching-remote-host-root> \
+  --evaluation-protocol original --generation-limit-policy native \
+  --max-new-tokens 4096 --max-sequence-length 128000 --temperature 0 --top-p 1 \
+  --static-inference-cache --dry-run
+```
+
+The bounded `evaluation.original_witness` command accepts
+`--comparison-mode restored-vs-optimized --indices 0,3,12 --max-new-tokens 512`.
+Its default remains `source-vs-restored`. Both modes require exact suffix IDs,
+prompt/decoder input hashes, decoded/scored output and parameter/config/backend
+identity, plus a complete naturally entered latent block and a post-END token
+for a passing verdict. Generation wall times and supported constant call counts
+are separate instrumentation; they describe that instrumented sample set,
+not TEST400 throughput. Only the root operator runs the approved GPU witness.
 
 For resume, call `run_multinode_stage1_training.sh` with the same run ID, a new
 `--attempt-id`, both explicit remote roots, and `--resume` pointing to that run's

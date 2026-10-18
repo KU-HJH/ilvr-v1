@@ -11,6 +11,7 @@ so the controller owns the aggregate GPU budget, including model loading.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import gc
 import hashlib
 import json
@@ -89,7 +90,7 @@ def _decoder_record(_module,_args,kwargs):
 def load_for_mode(mode,model_dir,base_model_dir,cache_dir):
     from transformers import AutoProcessor
     from stage1.checkpointing import load_stage1_peft_artifact
-    if mode=='restored':
+    if mode in ('restored','optimized'):
         from eval import load_evaluation_artifacts
         return load_evaluation_artifacts(model_dir=model_dir,base_model_dir=base_model_dir,
             cache_dir=cache_dir,evaluation_protocol='original')
@@ -109,6 +110,46 @@ def load_for_mode(mode,model_dir,base_model_dir,cache_dir):
     return model,processor
 
 
+@contextmanager
+def constant_call_counts(model):
+    """Observe the supported constants before the generation-local cache wraps them."""
+    import torch
+    from peft.tuners.lora.dora import DoraLinearLayer
+    from peft.tuners.lora.layer import Linear as LoraLinear
+    from peft.tuners.trainable_tokens.layer import TrainableTokensLayer
+    counts = dict(dora_weight_norm=0, embedding_materialization=0)
+    saved = []
+
+    def observe(module, name, key):
+        original = getattr(module, name)
+        saved.append((module, name, name in module.__dict__, module.__dict__.get(name)))
+        def counted(*args, **kwargs):
+            counts[key] += 1
+            return original(*args, **kwargs)
+        setattr(module, name, counted)
+
+    try:
+        for module in model.modules():
+            if isinstance(module, LoraLinear) and type(module.get_base_layer()) is torch.nn.Linear:
+                for adapter, dora in module.lora_magnitude_vector.items():
+                    if (type(dora) is DoraLinearLayer
+                            and getattr(dora.forward, '__func__', None) is DoraLinearLayer.forward
+                            and type(module.lora_A[adapter]) is torch.nn.Linear
+                            and type(module.lora_B[adapter]) is torch.nn.Linear):
+                        observe(dora, 'get_weight_norm', 'dora_weight_norm')
+            elif (isinstance(module, TrainableTokensLayer)
+                  and isinstance(module.base_layer, torch.nn.Embedding)
+                  and module.base_layer.max_norm is None):
+                observe(module, 'get_merged_weights', 'embedding_materialization')
+        yield counts
+    finally:
+        for module, name, existed, original in reversed(saved):
+            if existed:
+                setattr(module, name, original)
+            else:
+                delattr(module, name)
+
+
 def run_mode(mode,*,model_dir,base_model_dir,dataset_path,indices,cap,cache_dir,deadline):
     import torch
     from peft_common import resolve_qwen2_5_vl_model
@@ -125,6 +166,8 @@ def run_mode(mode,*,model_dir,base_model_dir,dataset_path,indices,cap,cache_dir,
     original=source_evaluation_functions(dataset_root=dataset_path.parent)
     rows=[json.loads(line) for line in dataset_path.read_text().splitlines() if line.strip()]
     observations=[]
+    instrumentation=[]
+    cuda_devices = {parameter.device for parameter in model.parameters() if parameter.is_cuda}
     for index in indices:
         if time.monotonic()>=deadline:
             raise TimeoutError('aggregate witness time budget exhausted')
@@ -134,18 +177,27 @@ def run_mode(mode,*,model_dir,base_model_dir,dataset_path,indices,cap,cache_dir,
         calls=[]
         hook=qwen.model.register_forward_pre_hook(lambda module,args,kw:calls.append(_decoder_record(module,args,kw)),with_kwargs=True)
         sequences=[]
+        generation_seconds=[]
         generate=model.generate
         def capture_generate(**kw):
+            for device in cuda_devices:
+                torch.cuda.synchronize(device)
+            started=time.perf_counter()
             result=generate(**kw)
+            for device in cuda_devices:
+                torch.cuda.synchronize(device)
+            generation_seconds.append(time.perf_counter()-started)
             sequences.append(result.detach().cpu().tolist())
             return result
         model.generate=capture_generate
         try:
-            if mode=='source':
-                result=original['run_one_example'](model,traced_processor,sample,kwargs)
-            else:
-                from eval import run_one_example
-                result=run_one_example(model,traced_processor,sample,kwargs,evaluation_protocol='original')
+            with constant_call_counts(model) as counts:
+                if mode=='source':
+                    result=original['run_one_example'](model,traced_processor,sample,kwargs)
+                else:
+                    from eval import run_one_example
+                    result=run_one_example(model,traced_processor,sample,kwargs,evaluation_protocol='original',
+                        static_inference_cache=mode=='optimized')
         finally:
             model.generate=generate
             hook.remove()
@@ -161,11 +213,14 @@ def run_mode(mode,*,model_dir,base_model_dir,dataset_path,indices,cap,cache_dir,
             stop_reason='eos' if suffix and suffix[-1] in eos else 'max_new_tokens',
             match=original['normalize_for_match'](extracted)==original['normalize_for_match'](gold),
             decoder_calls=calls))
+        instrumentation.append(dict(index=index,generation_wall_seconds=result['inference_time'],
+            native_generate_wall_seconds=sum(generation_seconds),
+            constant_calls=counts))
     del model,qwen
     gc.collect()
-    if torch.cuda.is_available():
+    if cuda_devices:
         torch.cuda.empty_cache()
-    return dict(metadata=metadata,observations=observations)
+    return dict(metadata=metadata,observations=observations,instrumentation=instrumentation)
 
 
 def compare(source,restored):
@@ -174,6 +229,8 @@ def compare(source,restored):
     for field in ('parameters','execution_identity'):
         if source['metadata'][field]!=restored['metadata'][field]:
             differences.append('metadata.'+field)
+    if source['metadata'].get('config_resolution') != restored['metadata'].get('config_resolution'):
+        differences.append('metadata.config_resolution')
     for index,(left,right) in enumerate(zip(source['observations'],restored['observations'])):
         for field in left:
             if left[field]!=right[field]:
@@ -199,11 +256,11 @@ def _covered_source_indices(payload):
     return covered
 
 
-def comparison_verdict(source, restored):
+def comparison_verdict(source, restored, *, modes=('source','restored')):
     """Separate exact observed equality from a covered natural latent transition."""
     differences = compare(source, restored)
-    coverage = dict(source=_covered_source_indices(source), restored=_covered_source_indices(restored))
-    covered = bool(set(coverage['source']) & set(coverage['restored']))
+    coverage = {modes[0]:_covered_source_indices(source), modes[1]:_covered_source_indices(restored)}
+    covered = bool(set(coverage[modes[0]]) & set(coverage[modes[1]]))
     verdict = 'mismatch' if differences else 'pass' if covered else 'inconclusive'
     token_equality = [
         (row['index'], row['generated_suffix_token_ids']) for row in source['observations']
@@ -222,6 +279,8 @@ def main(argv=None):
     parser.add_argument('--max-new-tokens',type=int,default=512)
     parser.add_argument('--cache-dir',default='data/cache')
     parser.add_argument('--output-dir',required=True,type=Path)
+    parser.add_argument('--comparison-mode',choices=('source-vs-restored','restored-vs-optimized'),
+        default='source-vs-restored')
     args=parser.parse_args(argv)
     indices=validate_budget(args.indices,args.max_new_tokens)
     root=Path(__file__).resolve().parents[2]
@@ -231,14 +290,17 @@ def main(argv=None):
     args.output_dir.mkdir(parents=True)
     deadline=time.monotonic()+600
     outputs={}
-    for mode in ('source','restored'):
+    modes=('source','restored') if args.comparison_mode=='source-vs-restored' else ('restored','optimized')
+    for mode in modes:
         outputs[mode]=run_mode(mode,model_dir=args.model_dir,base_model_dir=args.base_model_dir,
             dataset_path=args.test_data_path.resolve(strict=True),indices=indices,cap=args.max_new_tokens,
             cache_dir=args.cache_dir,deadline=deadline)
         (args.output_dir/f'{mode}.json').write_text(json.dumps(outputs[mode],sort_keys=True,allow_nan=False)+'\n')
-    report=comparison_verdict(outputs['source'],outputs['restored'])
+    report=comparison_verdict(outputs[modes[0]],outputs[modes[1]],modes=modes)
     report.update(source_indices=indices, max_new_tokens=args.max_new_tokens,
-        scope='bounded witness only; not full TEST400 parity')
+        comparison_mode=args.comparison_mode,
+        instrumentation={mode:outputs[mode].get('instrumentation',[]) for mode in modes},
+        scope='bounded instrumented witness only; not full TEST400 parity or benchmark throughput')
     (args.output_dir/'comparison.json').write_text(json.dumps(report,sort_keys=True)+'\n')
     print(json.dumps(report,sort_keys=True))
     return {'pass':0, 'mismatch':1, 'inconclusive':2}[report['verdict']]
