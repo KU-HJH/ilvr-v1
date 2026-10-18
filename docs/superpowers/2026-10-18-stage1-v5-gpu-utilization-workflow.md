@@ -72,11 +72,17 @@ have been changed; no implementation agent has been dispatched.
    of the pending design section, not waiver of the final written-spec gate.
    The user objected to repeated stops; consolidate the remaining design,
    critique and uncertainty presentation into one exact final commitment.
-6. Complete written specification and self-review: in progress with A1/B1
-   confirmed. Root is not authorized to implement product code yet.
-7. Freeze proposal, root hate, applicable macrothink fresh reads, synthesize
-   commitment: pending complete unapproved proposal. No premise experiment is
-   authorized or reported as run by those advisory hooks.
+6. Complete written specification and self-review: proposal v1 committed at
+   93bd9519a73ab4eda4c1c820ae5a522db508924a, SHA256
+   e036cc923079233ad2ccf4bc0807164c827337742ca303a974aa506a91c9aec0.
+   Placeholder/consistency/scope/ambiguity check completed, including actual
+   V5Block invalid-input behavior. Frozen proposal remains unchanged.
+7. Root hate completed with exactly root/first_nail; macrothink completed
+   with three fresh same-model read-only agents /root/gpu_util_fresh_a,
+   /root/gpu_util_fresh_b and /root/gpu_util_fresh_c. Input/results and primary
+   divergent-incompatible classifications are recorded in the design-review
+   file. Root synthesized commitment v1, preserving unresolved attribution/
+   boundary uncertainty. No premise experiment was authorized or executed.
 8. Final human approval of exact written commitment, including any explicit
    uncertainty acceptance: pending. Initial implementation request is not it.
 9. Only after approval: writing-plans, retained SDD/TDD implementation and
@@ -260,3 +266,32 @@ unchanged rejection, not a new supported input. Interleaved samples/blocks
 remain valid; stable sorting must preserve original position tie-break for
 valid sorted candidates. This correction preserves A1's existing interfaces
 and adds no new behavior or implementation authority.
+
+## Critique commitment and final gate
+
+Using the root-only advisory hooks did not advance implementation. Fresh
+reads challenged committing to four changes without attribution; one also
+challenged attention arithmetic before boundary evidence. Final commitment
+retains the explicitly chosen four-path scope, stages baseline measurements
+and exact mask/dropout first, and gates attention integration on joint discrete
+comparison. The alternative priority of a real unchanged distributed profile
+before any rewrite remains unresolved. Same-model alignment is reassurance,
+not runtime evidence or review approval.
+
+The exact final artifact is
+`specs/2026-10-18-stage1-v5-gpu-utilization-commitment-v1.md`. It includes all
+A1/B1 architecture/acceptance details, baseline hashes, critique synthesis,
+experiment-not-run status and explicit uncertainty acceptance. Its approval
+will cover bounded local development and operator checks with idle-resource
+checks, not another training launch. Root will ask one consolidated written
+specification approval, not repeat scope/A1/B1 questions. No product source,
+tests, runtime configuration, historical checkpoints or remote files changed.
+
+Final commitment was read in full after synthesis and checked for consistency
+against A1/B1, actual source invariants and the critique record. Its SHA256 is
+`843832ae9b09c10f28dea3dea60ceaa8d845f77f103f98259d4f26304cbe659a`.
+The frozen proposal digest was rechecked unchanged; `git diff --check` passed.
+These are document/identity checks, not new correctness or performance tests.
+Await exact commitment approval and explicit uncertainty acceptance before
+invoking writing-plans or dispatching implementers. No new section approval
+is being requested.
