@@ -188,3 +188,25 @@ def test_witness_cli_equal_ordinary_tokens_reports_inconclusive_and_nonzero(tmp_
     report=json.loads((output/'comparison.json').read_text())
     assert report['token_equality'] is True and report['parity'] is None
     assert report['verdict']=='inconclusive' and report['first_nail_passed'] is False
+
+
+@pytest.mark.parametrize('flag', ['--disable-latent-generation', '--use-kv-cache', '--static-inference-cache'])
+def test_original_global_diagnostic_flags_fail_before_sample_processing_or_output(tmp_path, monkeypatch, flag):
+    from step_preference import capacity_evidence
+    module = importlib.import_module('eval')
+    _, model, decoder_calls = tiny_original([3])
+    processor = NativeProcessor()
+    dataset = tmp_path/'test.jsonl'
+    dataset.write_text('{}\n')
+    output = tmp_path/'result.jsonl'
+    publications = []
+    monkeypatch.setattr(module, 'load_evaluation_artifacts', lambda **kwargs: (model, processor))
+    monkeypatch.setattr(module, 'publish_evaluation_runtime_identity', lambda *args, **kwargs: publications.append(True))
+    monkeypatch.setattr(capacity_evidence, 'git_identity', lambda: 'a'*40)
+    monkeypatch.setattr(sys, 'argv', arguments(dataset, output, tmp_path/'runtime.json') + [flag])
+    with pytest.raises(ValueError, match='diagnostics require explicit continuous'):
+        module.main()
+    assert processor.conversations == []
+    assert decoder_calls == []
+    assert publications == []
+    assert not output.exists()

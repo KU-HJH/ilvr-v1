@@ -589,6 +589,11 @@ def main():
     )
     protocol = resolve_protocol(args.evaluation_protocol, resolve_qwen2_5_vl_model(model).config.stage) if hasattr(args,"evaluation_protocol") else "continuous"
     args.repetition_penalty, args.generation_limit_policy = resolve_options(protocol,args.repetition_penalty,getattr(args,"generation_limit_policy",None))
+    if protocol == "original" and any(
+        getattr(args, name, False)
+        for name in ("disable_latent_generation", "use_kv_cache", "static_inference_cache")
+    ):
+        raise ValueError("Stage 1 OFF/cache diagnostics require explicit continuous evaluation")
 
     # Load test data
     data = []
