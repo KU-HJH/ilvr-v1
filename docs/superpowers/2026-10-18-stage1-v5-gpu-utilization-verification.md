@@ -145,4 +145,3 @@ untracked src __pycache__ directories, first asserting every entry was a
 regular .pyc file. No product source, checkpoints, user files, worktree or
 skill records were deleted. The only committed post-review changes are
 controller workflow/plan/verification evidence.
-

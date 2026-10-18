@@ -728,3 +728,31 @@ present exactly the reduced three-option human handoff; do not choose keep,
 push or discard for the user. No further implementation approval is needed.
 The remaining human choice concerns integration only. Root will write the
 required one-line ntfy completion summary immediately before the final result.
+
+## Authorized PR publication
+
+The user selected `1` from the reduced detached-HEAD menu, explicitly
+authorizing a new branch push and PR creation. Continue finishing's publication
+path; retain this host-managed workspace and existing checkpoints. No further
+implementation approval or repeated full suite is required for this unchanged
+reviewed runtime/test source. The previous full-suite and review evidence
+remain applicable; publication-only checks are fresh.
+
+Fresh remote inspection found only origin/main at
+13a67ed2ee975d6ca56b4e9eba18d68b352b166b, an ancestor630commits behind the
+reviewed baseline65643f0. A direct main-target PR would contain649commits and
+unrelated prior work. To preserve the exact reviewed optimization scope,
+publish the immutable baseline as new branch
+`stage1-v5-gpu-utilization-base-65643f0`, publish the current reviewed source
+and controller evidence as `stage1-v5-gpu-utilization`, then create the PR
+against that base branch. This adds refs without changing origin/main or
+rebasing/cherry-picking reviewed code. Explain the dependency in the PR body.
+No existing branch or PR with those names was found. Actual publication
+outcome will be recorded in the GitHub PR and the local result receipt
+`results/stage1-v5-gpu-utilization-20261018/pull-request.json`.
+
+Fresh range-level whitespace check found one extra EOF blank in the
+controller verification record that the earlier working-tree check could not
+see while it was untracked. Root removed only that formatting issue while
+recording this handoff. No product/test bytes changed; no new test cycle is
+warranted by this controller-only correction.
