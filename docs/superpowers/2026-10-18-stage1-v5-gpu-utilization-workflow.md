@@ -601,3 +601,78 @@ env CUDA_VISIBLE_DEVICES= PYTHONPATH=transformers/src:src:. PYTHONDONTWRITEBYTEC
 The original numerical failure is resolved for the checked cases and both
 fix-review gates close. Resume the same parked Task4 implementer; no new
 scope approval, input/tolerance change or training launch is involved.
+
+## Task4 resumed implementation and final local measurements
+
+The same implementer `/root/gpu_util_t4_impl` resumed after both numerical-fix
+review gates, measured source7632cde6bb8892829d3b0c5678ea8a5c6fbd8f30, and
+committed four candidate reports plus separate completion evidence at
+725be217d2acaffe6bd58cd96ec6a783ecf7a21a. No product code changed on resume;
+Task4's runtime/test/benchmark source remains inb3e13a4. Root independently
+read the actual runtime/verifier diff, checked clean HEAD after the owned
+commit and parsed all four complete report objects. Root recomputed all20
+raw-time medians and checked six correctness/RNG flags, warmup3/repetitions20,
+attention errors and measured source identity. The first long failure and
+its original evidence remain preserved rather than overwritten.
+
+Fresh focused post-repair CPU result269pass/90CUDA-onlyskip, exit0,26.27s.
+Implementer programmatically consumed the entire7,486,577-byte log, including
+two full benchmark JSONs and five actual resume-dispatch witness lines. Root
+read the summary and long exact-selection witness. Exact commands/exits,
+all source/log/report digests, two immediately preceding idle H100 checks,
+actual memory and host-byte/counter data are recorded in
+`results/stage1-v5-gpu-utilization-20261018/task4-completion-evidence.json`,
+SHA2560d0dce514d24014bb2683c91a61097e651c979443a233c87d60bd2079aa20c39.
+Root checked that digest. Each final benchmark ran once; no favorable rerun
+or dropped timing outlier is used.
+
+Paired synchronized median milliseconds, rounded, frozen65643f0 -> candidate:
+
+| Device/profile | Attention | Selection | Replay mask | Dropout |
+| --- | ---: | ---: | ---: | ---: |
+| CPU/default |10.701->8.329|0.737->0.705|2.786->0.708|4.586->2.619|
+| CPU/long |266.270->292.192|1.643->1.057|18.929->17.031|60.746->25.276|
+| H100 CUDA/default |10.614->3.740|1.057->1.609|6.895->0.960|4.528->2.127|
+| H100 CUDA/long |25.758->12.085|1.951->1.807|33.414->1.596|45.142->2.428|
+
+Retain measured regressions explicitly: CPU-long attention+9.7353percent and
+CUDA-default selection+52.2396percent. Long CUDA attention peak allocated
+148251648->155864064B; extra allocated93552640->101165056B and reserved
+169869312->197132288B. CPU tracemalloc is Python allocations only. The
+two-workspace target is not a total VRAM bound; CUDA operator allocation and
+reserved-memory increases are not hidden.
+
+All four measured profiles have exact tested ordered selections, replay masks,
+dropout comparisons and unchanged global RNG. Long CPU/CUDA attention rows
+match bitwise; default CUDA max absolute error4.656612873077393e-10 is within
+the predeclared tolerance and selected tuples remain exact. This is finite
+synthetic operator evidence, not all-input/BF16/distributed equivalence or
+measured training-throughput/utilization improvement. No training launched.
+
+Fresh independent Task4 spec reviewer `/root/gpu_util_t4_spec` dispatched
+overffec431..725be217, with the separate reviewed T3 fix identified explicitly.
+Task4 spec/quality and whole-change final review are pending; root final
+full-suite/claim verification and finishing are not complete.
+
+Task4 spec reviewer `/root/gpu_util_t4_spec`: SPEC PASS at725be217, no gaps,
+extras or blocking findings. It traced runtime/admission/rejection paths and
+literal witnesses, consumed all7,486,577 focused-log bytes and four full report
+objects, verified committed/log/current-source hashes, immutable oracles,
+twenty paired times/medians, seven joint configurations and transfer-byte
+arithmetic. Historical root-ledger digest was checked at measured7632cde,
+before later control additions. No tests or benchmarks rerun. Root separately
+traced the resume negative test: printed parent_calls=1 includes the successful
+control call before drift; the rejected resume adds no call/publication or
+optimizer work. QUALITY review dispatched after SPEC PASS to independent
+`/root/gpu_util_t4_quality`; no new scope or implementation approval requested.
+
+Task4 quality reviewer `/root/gpu_util_t4_quality`: QUALITY PASS at725be217
+againstffec431, no Critical/Important/Minor findings. Independently traced
+source/profile capture, effective-contract/cross-rank comparisons and actual
+negative resume dispatch; checked twelve runtime hashes and fourteen artifact
+hash/size references, complete four report/stdout identities, paired medians/
+orders, memory and transfer arithmetic, seven exact ordered-key cases and all
+focused-log bytes. No tests, GPU or benchmark reruns. Disclosed timing/memory
+regressions remain observations, not waived correctness findings. Both Task4
+review gates close; all four implementation tasks are complete. Whole-change
+independent review and fresh root verification/finishing are next.
