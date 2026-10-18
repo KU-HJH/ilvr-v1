@@ -676,3 +676,55 @@ focused-log bytes. No tests, GPU or benchmark reruns. Disclosed timing/memory
 regressions remain observations, not waived correctness findings. Both Task4
 review gates close; all four implementation tasks are complete. Whole-change
 independent review and fresh root verification/finishing are next.
+
+## Whole-change review and fresh root verification
+
+Independent final reviewer `/root/gpu_util_final_review` reviewed exact range
+65643f08cb6e61fbbb200de825d57086f5c7a127..3e51bf79b6a89fd3c8763a63b682d33e85526bcb:
+FINAL PASS with no Critical/Important/Minor findings. It traced integrated
+actual Trainer/native attention/selector/replay/checkpoint/dropout and resume
+paths, checked twelve runtime hashes, frozen modules against Git bytes, eight
+immutable hashes, complete report/log/evidence identities,32 medians from640
+raw timings and2772 ordered-key comparisons. It fully parsed both focused
+and native logs and all five embedded reports, with remaining text read.
+No tests, GPU or benchmark rerun, no product fixes requested. Its limits
+retain the disclosed regressions and no universal/BF16/distributed claims.
+
+Root announced verification-before-completion and finishing-a-development-
+branch, identified the shared project full-suite command and launched it once
+on that exact reviewed source after checking two idle H100s/no processes.
+Real training smoke opt-ins are explicitly0. Durable exact commands and
+claim-specific artifact verification are in
+`2026-10-18-stage1-v5-gpu-utilization-verification.md`. Distinct artifact check
+exit0 with complete output read: twelve runtime/eight immutable hashes, four
+complete report/stdout pairs,640 times/2772 ordered rows, source/profile,
+paired order, transfers/memory and original failure digests match. Root has
+not rerun timing. Full suite is still running, so completion/finishing options
+remain gated. Control-record changes do not alter the reviewed runtime/tests.
+
+## Verified completion and human integration handoff
+
+The single fresh root project suite completed exit0 on reviewed3e51bf79:
+5272passed/11skipped/1warning,1286.34seconds. Root read the entire82line,
+6544-byte log; its SHA256 is
+a9e9181e4ae2508b406bd83b58d06c9638bc1f51b415280f7092fbd0317a0c7d.
+The warning is the existing CPU-Adam test's unset CUDA architecture-list
+notice. The green full suite is reused for verification and finishing Step1.
+Distinct root artifact-check exit0 log SHA256
+b9a9b7fbaa996ab3a70d869ea640709eac89a98981467803dd9ff7dada137bed.
+Exact commands, requirements scope and evidence are in the verification record.
+Post-suite source/script/test diff against the reviewed revision is empty.
+
+All approved implementation, independent task/fix/final review and fresh
+verification gates have actual witnesses and are complete. No new training,
+sampler/worker/rank change, loss redesign, merge/push/PR or checkpoint rewrite
+occurred. Performance conclusions remain finite local operator observations,
+including the two regressions and increased CUDA memory. Production BF16,
+future inputs and actual distributed utilization/throughput remain unverified.
+
+Finishing detects different Git/common dirs and detached HEAD in the existing
+host-managed worktree. Main merge-base is65643f0. Preserve the workspace and
+present exactly the reduced three-option human handoff; do not choose keep,
+push or discard for the user. No further implementation approval is needed.
+The remaining human choice concerns integration only. Root will write the
+required one-line ntfy completion summary immediately before the final result.

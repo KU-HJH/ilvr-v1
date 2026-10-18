@@ -237,8 +237,8 @@ spec then quality re-review before Task4 resumes.
 
 **Files:** Modify v5_trainer, existing verifier, literal resume/protocol tests, benchmark integration as required; no coefficient/formula/schema changes.
 
-- [ ] **1. Add causal runtime tests before code.** Actual `_build_v5_runtime_contract` must bind four added modules and an operator profile. Extend the existing literal runtime-source assertions (do not import the production mapping as the expected value). Test missing/changed added bindings and profile, different per-rank contracts, old historical load-only contracts and the actual `train` dispatch rejecting incompatible resume before parent training/optimizer work. RED must demonstrate the currently missing bindings/profile.
-- [ ] **2. Bind actual runtime module bytes**, not decorated-wrapper source files. Import the four modules and hash `Path(module.__file__).read_bytes()`; `inspect.getsourcefile` on contextmanager/no_grad wrappers can accidentally hash contextlib. Add explicit source keys `v5_execution`, `v5_selection`, `v5_trace`, `v5_replay`. Save:
+- [x] **1. Add causal runtime tests before code.** Actual `_build_v5_runtime_contract` must bind four added modules and an operator profile. Extend the existing literal runtime-source assertions (do not import the production mapping as the expected value). Test missing/changed added bindings and profile, different per-rank contracts, old historical load-only contracts and the actual `train` dispatch rejecting incompatible resume before parent training/optimizer work. RED must demonstrate the currently missing bindings/profile.
+- [x] **2. Bind actual runtime module bytes**, not decorated-wrapper source files. Import the four modules and hash `Path(module.__file__).read_bytes()`; `inspect.getsourcefile` on contextmanager/no_grad wrappers can accidentally hash contextlib. Add explicit source keys `v5_execution`, `v5_selection`, `v5_trace`, `v5_replay`. Save:
 
 ```python
 execution['operator_profile'] = {
@@ -254,16 +254,24 @@ parsing separate from strict current runtime admission. Existing effective
 contract equality must reject changed source/profile before parent `train`;
 give guidance to use the original reviewed code. No hash normalization or
 checkpoint migration; schema2 and objective remain unchanged.
-- [ ] **3. Run focused GREEN:** `tests/stage1/v5/test_resume.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_trainer.py tests/stage1/v5/test_history_integration.py tests/stage1/v5/test_gpu_utilization.py`. Read complete logs and verify actual dispatch witnesses.
-- [ ] **4. Run final operator measurements once after focused correctness.** Check idle GPUs; run paired CPU and CUDA0 benchmark with warmup3/repetitions20 at default and bounded long/multi-block shapes. Record raw medians/peak memory/transfers/equality/error and current source/profile/GPU/package identity. Use distinct `candidate-{cpu,cuda}-{default,long}.json`. Label fixture stub overhead and scope; report any operator regression, no end-to-end training claim.
-- [ ] **5. Self-review and commit.** Return measured comparisons, reviewed source identity and limitations. Root obtains task spec then quality review, and finally a separate whole-change reviewer. Only after findings close, root invokes verification-before-completion and finishing, runs the project suite once and additional distinct claim checks.
+- [x] **3. Run focused GREEN:** `tests/stage1/v5/test_resume.py tests/stage1/v5/test_protocol.py tests/stage1/v5/test_trainer.py tests/stage1/v5/test_history_integration.py tests/stage1/v5/test_gpu_utilization.py`. Read complete logs and verify actual dispatch witnesses.
+- [x] **4. Run final operator measurements once after focused correctness.** Check idle GPUs; run paired CPU and CUDA0 benchmark with warmup3/repetitions20 at default and bounded long/multi-block shapes. Record raw medians/peak memory/transfers/equality/error and current source/profile/GPU/package identity. Use distinct `candidate-{cpu,cuda}-{default,long}.json`. Label fixture stub overhead and scope; report any operator regression, no end-to-end training claim.
+- [x] **5. Self-review and commit.** Return measured comparisons, reviewed source identity and limitations. Root obtains task spec then quality review, and finally a separate whole-change reviewer. Only after findings close, root invokes verification-before-completion and finishing, runs the project suite once and additional distinct claim checks.
 
 ## Controller completion and plan self-review
 
-- [ ] Record each task base/head, implementer/reviewer IDs, causal commands/results and review dispositions in the existing workflow ledger; preserve unresolved findings.
-- [ ] Dispatch an independent final reviewer over the entire baseline-to-final diff after all task reviews. Fix requested changes through agents and re-review affected claims.
-- [ ] Read finishing and verification skills, announce finishing, run one shared project full suite on the final reviewed revision using a fresh checkpoint basetemp; read complete output. Do not repeat the same broad suite back-to-back. Additional performance/artifact/identity claims need their distinct existing witnesses.
-- [ ] Report actual operator results and limitations. Keep source/checkpoints and host-managed worktree; human owns final merge/PR/keep decision. Write ntfy summary before the final response.
+- [x] Record each task base/head, implementer/reviewer IDs, causal commands/results and review dispositions in the existing workflow ledger; preserve unresolved findings.
+- [x] Dispatch an independent final reviewer over the entire baseline-to-final diff after all task reviews. Fix requested changes through agents and re-review affected claims.
+- [x] Read finishing and verification skills, announce finishing, run one shared project full suite on the final reviewed revision using a fresh checkpoint basetemp; read complete output. Do not repeat the same broad suite back-to-back. Additional performance/artifact/identity claims need their distinct existing witnesses.
+- [x] Prepare the final report of actual operator results and limitations. Keep source/checkpoints and host-managed worktree; human owns final merge/PR/keep decision. The required ntfy summary is the immediate pre-final action; final response presents the reduced detached-HEAD handoff menu.
+
+Completion evidence: all task and fix gates plus independent whole-change
+review PASS; fresh project full suite5272pass/11skip/1warning, exit0 on reviewed
+3e51bf79; distinct root artifact/source check exit0. Exact commands, hashes,
+limits and pending human integration choice are in the workflow and
+`../2026-10-18-stage1-v5-gpu-utilization-verification.md`. CPU-long attention
+and CUDA-default selector regressions remain disclosed; no actual training
+throughput claim is made. Only controller evidence changes after that review.
 
 Inline plan self-review: all four approved paths, source/resume consumers,
 independent exact/numerical comparisons, staged joint boundary gate, measured
