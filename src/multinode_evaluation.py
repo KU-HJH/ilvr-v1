@@ -456,7 +456,9 @@ def _validate_manifest(
     return manifest, jsonl_path
 
 
-def _read_shard_rows(path: Path) -> list[dict[str, Any]]:
+def _read_shard_rows(
+    path: Path, *, allow_sample_errors: bool = False
+) -> list[dict[str, Any]]:
     rows = []
     try:
         stream = path.open("r", encoding="utf-8")
@@ -474,14 +476,27 @@ def _read_shard_rows(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(
                     f"invalid JSON object in shard JSONL {path} line {line_number}"
                 )
-            if "error" in row:
-                raise ValueError(
-                    f"error row in shard JSONL {path} line {line_number}: "
-                    f"{row['error']}"
-                )
+            sample_error = "error" in row
+            if sample_error:
+                if not allow_sample_errors:
+                    raise ValueError(
+                        f"error row in shard JSONL {path} line {line_number}: "
+                        f"{row['error']}"
+                    )
+                if (
+                    not isinstance(row["error"], str)
+                    or row.get("match", False) is not False
+                    or row.get("summary") is True
+                    or "inference_time_sec" not in row
+                    or row["inference_time_sec"] is not None
+                ):
+                    raise ValueError(
+                        f"invalid original sample error row in {path} line {line_number}"
+                    )
             if row.get("summary") is True:
                 continue
-            if set(("index", "task_name", "match")) - set(row):
+            required = {"index", "task_name"} if sample_error else {"index", "task_name", "match"}
+            if required - set(row):
                 raise ValueError(
                     f"missing evaluation fields in shard JSONL {path} line {line_number}"
                 )
@@ -489,7 +504,9 @@ def _read_shard_rows(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(
                     f"invalid source index in shard JSONL {path} line {line_number}"
                 )
-            if not isinstance(row["task_name"], str) or type(row["match"]) is not bool:
+            if not isinstance(row["task_name"], str) or (
+                not sample_error and type(row["match"]) is not bool
+            ):
                 raise ValueError(
                     f"invalid evaluation fields in shard JSONL {path} line {line_number}"
                 )
@@ -589,7 +606,8 @@ def merge_shards(
     actual_indices_by_shard: dict[int, list[int]] = {}
     for shard_index in range(NUM_EVALUATION_SHARDS):
         manifest, jsonl_path = manifests[shard_index]
-        rows = _read_shard_rows(jsonl_path)
+        original = (manifest.get("execution_identity") or {}).get("evaluation_protocol") == "original"
+        rows = _read_shard_rows(jsonl_path, allow_sample_errors=original)
         actual_indices = []
         for row in rows:
             identity=manifest.get("execution_identity")

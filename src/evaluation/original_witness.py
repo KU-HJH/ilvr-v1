@@ -169,6 +169,7 @@ def run_mode(mode,*,model_dir,base_model_dir,dataset_path,indices,cap,cache_dir,
 
 
 def compare(source,restored):
+    """Return observed differences; equality alone does not prove block coverage."""
     differences=[]
     for field in ('parameters','execution_identity'):
         if source['metadata'][field]!=restored['metadata'][field]:
@@ -180,6 +181,36 @@ def compare(source,restored):
     if len(source['observations'])!=len(restored['observations']):
         differences.append('sample_count')
     return differences
+
+
+def _covered_source_indices(payload):
+    latent_size = payload['metadata']['execution_identity'].get('model_config', {}).get('latent_size')
+    if type(latent_size) is not int or latent_size <= 0:
+        return []
+    covered = []
+    for row in payload['observations']:
+        tokens = row['generated_suffix_token_ids']
+        for position, token in enumerate(tokens):
+            if (token == 151666 and position + latent_size + 2 < len(tokens)
+                    and tokens[position + 1:position + latent_size + 1] == [151665] * latent_size
+                    and tokens[position + latent_size + 1] == 151667):
+                covered.append(row['index'])
+                break
+    return covered
+
+
+def comparison_verdict(source, restored):
+    """Separate exact observed equality from a covered natural latent transition."""
+    differences = compare(source, restored)
+    coverage = dict(source=_covered_source_indices(source), restored=_covered_source_indices(restored))
+    covered = bool(set(coverage['source']) & set(coverage['restored']))
+    verdict = 'mismatch' if differences else 'pass' if covered else 'inconclusive'
+    token_equality = [
+        (row['index'], row['generated_suffix_token_ids']) for row in source['observations']
+    ] == [(row['index'], row['generated_suffix_token_ids']) for row in restored['observations']]
+    return dict(verdict=verdict, parity=None if verdict == 'inconclusive' else verdict == 'pass',
+        token_equality=token_equality, observed_trace_equality=not differences,
+        first_nail_passed=verdict == 'pass', latent_transition_coverage=coverage, differences=differences)
 
 
 def main(argv=None):
@@ -205,12 +236,12 @@ def main(argv=None):
             dataset_path=args.test_data_path.resolve(strict=True),indices=indices,cap=args.max_new_tokens,
             cache_dir=args.cache_dir,deadline=deadline)
         (args.output_dir/f'{mode}.json').write_text(json.dumps(outputs[mode],sort_keys=True,allow_nan=False)+'\n')
-    differences=compare(outputs['source'],outputs['restored'])
-    report=dict(parity=not differences,differences=differences,source_indices=indices,
-        max_new_tokens=args.max_new_tokens,scope='bounded witness only; not full TEST400 parity')
+    report=comparison_verdict(outputs['source'],outputs['restored'])
+    report.update(source_indices=indices, max_new_tokens=args.max_new_tokens,
+        scope='bounded witness only; not full TEST400 parity')
     (args.output_dir/'comparison.json').write_text(json.dumps(report,sort_keys=True)+'\n')
     print(json.dumps(report,sort_keys=True))
-    return int(bool(differences))
+    return {'pass':0, 'mismatch':1, 'inconclusive':2}[report['verdict']]
 
 
 if __name__=='__main__':

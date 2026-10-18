@@ -31,6 +31,10 @@ Primary original scoring uses full raw decode, original assistant extraction,
 original answer parsing/normalization, and the all-source denominator, including
 legacy empty/missing-gold matches. Corrected parser fields are nested as
 `corrected_scoring_diagnostic`; they do not replace the primary metric.
+Caught per-sample exceptions remain incorrect entries in the all-source denominator
+and normal-complete, as in the source. Original shard merges validate and retain
+these error rows. Infrastructure failures and continuous/Stage 2 sample-error
+handling retain their existing failure behavior.
 Historical unlabelled manifests remain readable as continuous. New manifests carry
 protocol, resolved config and concrete attention classes; merging different or
 unknown execution identities fails.
@@ -44,3 +48,8 @@ resolution and backend classes. It saves metadata only. ROOT must execute it aft
 review with an external 600-second timeout, at most three distinct source indices,
 and at most 512 generated tokens per side/sample. CPU contracts and source hashing
 alone do not establish parity for trained GPU evaluation or TEST400.
+The comparison reports token equality separately from its first-nail verdict.
+Passing requires equal observed traces and at least one naturally generated complete
+START, configured latent body, END, and subsequent-token transition in both sides.
+Equal traces without this coverage are inconclusive (`parity: null`, exit 2);
+mismatches exit 1 and a covered bounded pass exits 0. The probe never forces START.

@@ -730,7 +730,8 @@ def main():
 
         except Exception as e:
             logging.error(f"[{i}] Evaluation failed: {e}")
-            worker_failed = True
+            if protocol != "original":
+                worker_failed = True
             error_result = {
                 "index": i,
                 "task_name": args.task_name,
