@@ -102,3 +102,31 @@ need identical baseline/candidate inputs, wall time and peak memory as well as
 operator count and exact discrete comparisons. GPU utilization alone is not
 the success metric. Separate CPU evidence, operator CUDA evidence and actual
 two-node/four-rank training throughput; none may stand in for another.
+
+## Fresh focused baseline and additional contract finding
+
+At control-only revision492b0e8, root ran the existing unchanged focused CPU
+tests with CUDA_VISIBLE_DEVICES empty, repository venv, vendored Transformers,
+one CPU thread and a fresh basetemp under checkpoints. Exact command:
+
+```bash
+env CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=transformers/src:src:. ./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/v5/test_throughput_attention.py tests/stage1/v5/test_selection.py tests/stage1/v5/test_execution.py tests/stage1/v5/test_replay.py --basetemp=checkpoints/stage1-v5-gpu-utilization-20261018-tests/intake-baseline > logs/stage1-v5-gpu-utilization-20261018/intake-baseline.log 2>&1
+```
+
+Observed exit0, **64passed/2skipped in12.97s**; complete output read. Log
+SHA25681260e8769331b8b1b2c0f964eb374a15015eabd37e903029c72b1819bc79618.
+These are baseline witnesses, not tests or measurements of a new implementation.
+
+Additional static finding: the current eight runtime source bindings cover
+Teacher/query/history and parent/v5 Trainers, but not the source modules that
+implement dropout ownership, student attention capture, packed replay or text
+selection. The design must explicitly bind changed execution modules/profile
+so a changed implementation cannot silently present the old runtime identity.
+Keep old completed contracts/checkpoints inspectable and unchanged. Do not
+weaken existing strict resume comparison or claim compatible continuation
+without separately reviewed evidence. No new loss/query formula is proposed.
+
+Implementation remains unauthorized pending completed architectural design
+sections, critique commitment and final written approval. Scope question is
+still pending; numerical-policy answer is recorded above. No human response
+is inferred from elapsed time, and no product changes have been made.
