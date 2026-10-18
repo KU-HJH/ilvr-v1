@@ -111,3 +111,13 @@ env CUDA_VISIBLE_DEVICES='' PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_
 ```
 
 The initial failed log is preserved unchanged. Root must read the complete new output before completing verification or offering branch handoff. No full TEST400, training, merge, PR or worktree cleanup is authorized by these checks.
+
+## Fresh completion result and branch handoff
+
+Corrected full project CPU suite ran once at control `e01b1ff817d7cfbd145a5f3ffbeca4b91f403e1c`, product `53998d7c2e316fda9931f43496329c503d903c50`, and exited 0: **5075 passed, 35 skipped, 53 deselected, 19 expected source-generation warnings in 1233.36s (20m33s)**. Root read the complete 81-line/6461-byte `final-full-suite-r2.log`, including every warning. This one successful command supplies the overlapping CPU test-pass witness for verification-before-completion and finishing Step 1; no suite was run a second time after green. The first failed invocation remains separately recorded, classified and fixed rather than counted as passing.
+
+Root freshly confirmed tested branch/base identities after green: named branch `fix/original-eval-20261018`, main/base `65643f08cb6e61fbbb200de825d57086f5c7a127`, linked Git dir `/root/workspace/ILVR/.git/worktrees/ILVR4` and common dir `/root/workspace/ILVR/.git`. This host-created worktree remains externally owned. Root inventories and removes only 29 regenerable untracked bytecode files created by the task's full-suite subprocess checks (`owned-test-bytecode-cleanup.json`); all checkpoint fixtures, model artifacts, failure logs and result evidence remain. No worktree/branch/model cleanup or merge is performed.
+
+`verification-summary.json` now records the final test-log SHA256, revisions, 1-sample source restoration and 3-sample static-cache evidence, exact timings/counts, bounded GPU budget, CPU recovery/reviews, hardware (local H100 NVL, driver 580.173.02) and explicit limits. Root also confirmed the old source index-0 executed observation and parameter hash equal the later restored index-0 observation despite cap256/512, both naturally EOS at160. No full TEST400 or full pre-existing GPU-suite pass is inferred. The proposed full400 command construction is reviewable in `full-test400-command-dry-run.json`; its planned remote checkout/preflight remains separate from this bounded task.
+
+All authorized bounded implementation, independent task/final review and fresh verification gates are satisfied. Finishing now presents the required human merge/PR/keep/discard choices; human disposition is pending. Main and the prior evaluation worktree remain unchanged. The branch/worktree are retained for that decision, without assuming a keep-as-is choice on the user's behalf.
