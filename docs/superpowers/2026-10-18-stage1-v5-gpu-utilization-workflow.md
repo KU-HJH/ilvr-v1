@@ -756,3 +756,22 @@ controller verification record that the earlier working-tree check could not
 see while it was untracked. Root removed only that formatting issue while
 recording this handoff. No product/test bytes changed; no new test cycle is
 warranted by this controller-only correction.
+
+Publication execution: created local branch `stage1-v5-gpu-utilization` and
+prepared the complete PR body at
+`results/stage1-v5-gpu-utilization-20261018/pull-request-body.md`. The atomic
+origin push exited128 with HTTP403: permission denied to authenticated
+account KU-HJH. Fresh GitHub inspection reports viewerPermission READ, and
+only that account is logged in. Subsequent remote ref inspection confirms
+neither proposed branch was created. Failure transcript and command are
+preserved in `logs/stage1-v5-gpu-utilization-20261018/pr-origin-push-failed.log`.
+
+No existing KU-HJH/ILVR fork was found. Because a fork-local scoped PR and
+an upstream-main PR containing630prior baseline commits have different
+destinations/review scopes, root requested that missing target choice rather
+than silently redirecting the PR. The asynchronous target question remains
+pending; no fork, remote branch or PR has been created. Publication is partial,
+pending the target answer or original-repository write access. Product/test
+bytes still match reviewed3e51bf79 and the fresh range whitespace check is
+green. This authorization issue does not require repeating implementation
+reviews or the already green project suite.
