@@ -64,8 +64,10 @@ have been changed; no implementation agent has been dispatched.
 3. Clarifications: numerical policy and scope/decomposition answered.
 4. Alternatives: four-operator scope selected over rank redistribution and
    mask/dropout-only scope. Preserve this choice rather than asking again.
-5. Architecture/components/data-flow section: proposal below, awaiting human
-   confirmation. Error handling and testing section follows that confirmation.
+5. Architecture/components/data-flow section A1: confirmed by the user's
+   subsequent `진행해` in response to the explicit A1 question. This approval
+   binds A1 only and authorizes elaborating validation, not product changes.
+   Error handling and testing section B1 below awaits confirmation.
 6. Complete written specification and self-review: pending confirmed sections.
 7. Freeze proposal, root hate, applicable macrothink fresh reads, synthesize
    commitment: pending complete unapproved proposal. No premise experiment is
@@ -135,7 +137,7 @@ sections, critique commitment and final written approval. Scope and numerical
 policy are now confirmed. No human response is inferred from elapsed time,
 and no product changes have been made.
 
-## Architecture section A1 proposed after scope confirmation
+## Architecture section A1, confirmed by the subsequent `진행해`
 
 Use the existing F -> reference -> text selection -> packed V/Text-off ->
 loss/backward flow and existing public interfaces. Change four internals:
@@ -171,3 +173,76 @@ define the comparison witnesses and numerical limits, with a mismatch blocking
 activation rather than being explained away by float tolerance. Finite tests
 will not be described as a proof over every future input. No GPU premise probe
 has been authorized or executed for this proposal.
+
+## Error handling and verification section B1, proposed
+
+Keep the existing literal independent full-sequence oracle and frozen older
+sources. Add an immutable, hash-identified comparison baseline for the four
+operator modules as they exist at source65643f0; do not derive expected masks,
+selected keys or random draws from the implementation under test. Do not
+replace the historical oracle with the candidate. Tests that already require
+exact values unrelated to attention batching keep those exact requirements.
+
+The proposed numerical limits, fixed before any candidate GREEN result, are:
+
+- Exact equality of selected original token positions and their order,
+  zero/-infinity attention mask entries including padding, and raw source-
+  coordinate dropout masks. Keep source seed/draw shape/site/step identity,
+  checkpoint recomputation and unchanged global RNG state. Direct-selector
+  tests receive identical attention inputs; separate joint attention/selector
+  tests compare both paths starting from identical projections and logits.
+- Detached FP32 attention observation: ATOL1e-7/RTOL1e-5. Preserve the full
+  causal denominator, native RoPE, GQA expansion and head/layer averaging;
+  compare every candidate row, not only its total or final loss.
+- Native FP32 oracle logits, each loss term, attached-prefix gradients and
+  trainable parameter gradients: the existing ATOL1e-5/RTOL1e-4. No changed
+  loss reduction or normalization. Report the checked dtype and execution
+  scope; these CPU/tiny-model bounds are not proof of production BF16 or
+  two-node/four-rank behavior.
+
+Include unsorted candidate metadata, exact weight ties, nextafter threshold
+neighbors, mass on both sides of the low-mass branch, empty and zero-cap rows,
+multiple source samples, duplicate/permuted source coordinates, variable
+source lengths, padding and checkpoint full/early-stop recomputation. Use
+multiple-query chunk boundaries and a final shorter chunk. Exercise actual
+Trainer training_step and packed replay, not isolated helpers alone.
+
+Any discrete mismatch is a failed equivalence check even if attention is
+within tolerance. Nonfinite outputs, exceeded tolerance, broken attached
+gradient paths, incompatible source resume and invalid inputs retain explicit
+errors. Correct the cause through the selected implementation/review method;
+do not relax thresholds after seeing a failure. If attention batching cannot
+meet the contract, report it and revise the design rather than silently
+activating it or treating three optimized paths as the approved four-path
+completion. Finite comparison tests are not a universal proof of unchanged
+selection for all future floating-point boundary cases.
+
+Bind execution/profile identity to all four modules, and update the existing
+verifier plus actual resume/admission consumers and tests. New-code training
+resume from an old incompatible contract must fail before optimizer work with
+clear guidance to use the original code; historical read-only audit remains
+possible without rewriting old sidecars or weakening strict validation.
+
+After final design approval, use TDD and the retained Subagent-driven method,
+independent specification/quality/final review, then one fresh appropriate
+completion suite plus distinct claim-specific integration checks. Reuse the
+existing operator measurement script rather than create a new framework.
+Compare old/new identical inputs for attention, selection, mask and dropout:
+three warmups, twenty synchronized timed repetitions, median and raw timings,
+host-transfer/operator counts and peak allocated/reserved CUDA memory. Keep
+attention score/probability workspace bounded by query chunking; avoid a
+second dense replay-sized floating mask. Report any operator regression.
+
+CPU evidence, CUDA operator evidence and end-to-end distributed training
+throughput are separate claims. A CUDA operator comparison contains no model
+loading, optimizer steps or model state writes. The later implementation
+approval may cover these local operator checks, with an idle-device check;
+it does not itself launch fresh training. A separate actual training measure
+uses the mandatory two-node/four-rank coordinator and unchanged comparison
+profile only when authorized. GPU busy percentage alone cannot establish an
+improvement; actual training claims need matched seconds/update or tokens/s.
+
+No costly or implementation-like premise probe has been run during design.
+Hate's proposed first nail will remain a proposal unless separately authorized.
+Any remaining load-bearing uncertainty must be explicit in the exact final
+commitment and accepted by the human before planning and implementation.
