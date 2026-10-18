@@ -295,3 +295,28 @@ These are document/identity checks, not new correctness or performance tests.
 Await exact commitment approval and explicit uncertainty acceptance before
 invoking writing-plans or dispatching implementers. No new section approval
 is being requested.
+
+## Final approval and execution handoff
+
+The subsequent user `계속` directly answers the consolidated final commitment
+question, which explicitly disclosed unrun premise experiments, attribution,
+production boundary/memory uncertainty and the scope of approval. Record this
+as approval of commitment v1 SHA256843832ae9b09c10f28dea3dea60ceaa8d845f77f103f98259d4f26304cbe659a,
+including acceptance of proceeding under that uncertainty. It does not waive
+the exact discrete checks or authorize fresh training. A1/B1 are not reopened.
+
+Root executed writing-plans and self-reviewed the concrete four-task plan at
+`plans/2026-10-18-stage1-v5-gpu-utilization.md`. Retained Subagent-driven method
+requires fresh implementers and sequential spec/quality reviews per task,
+then whole-change review and fresh verification/finishing. Root read SDD,
+TDD, requesting-review and their prompt templates. Active phase: approved
+architectural implementation handoff; no product changes by root.
+
+Task tracker: T1 baseline/measurement pending; T2 mask/dropout pending;
+T3 selector/attention pending; T4 source identity/integration pending;
+independent final review and verification/finish pending. SDD will execute
+continuously without further same-scope approval stops.
+
+Fresh local resource observation before handoff: two NVIDIA H100 NVL devices,
+zero used memory/zero utilization and no compute processes. This supersedes
+any presumed B200 for local operator measurements; recheck before CUDA work.
