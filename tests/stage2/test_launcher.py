@@ -88,6 +88,7 @@ def test_production_entrypoint_imports_with_build_marker_then_restores_platform(
             "-c",
             (
                 "import platform; "
+                "platform.python_version = lambda: '3.11.15+'; "
                 "original = platform.python_version; "
                 "assert original().endswith('+'), original(); "
                 "import main; "
