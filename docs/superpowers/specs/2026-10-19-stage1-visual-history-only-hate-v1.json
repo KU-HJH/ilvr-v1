@@ -1,0 +1,4 @@
+{
+  "root": "An apparently single-variable visual-history ablation is invalid if baseline text/header arithmetic, teacher initialization, data order, training loss or backend are also changed by reusing the current v5 path.",
+  "first_nail": "Before full training, compare the actual pinned baseline and modified builder on identical frozen teacher observations and candidates; require equal baseline intent/text/candidates and first-block query, attribute later query differences exclusively to the visual term, and compare resolved native loss/training profiles on both nodes. Any additional difference falsifies isolation."
+}

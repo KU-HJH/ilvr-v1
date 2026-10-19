@@ -1,0 +1,29 @@
+{
+  "proposal_version": 2,
+  "proposal_sha256": "7b110eb5e39a36f36acbdca79397762c9bb8009e01b6c54270545530cf7b2fb2",
+  "incompatible_divergences": [],
+  "compatible_clusters": [
+    {
+      "root": "Historical runtime identity remains an evidence requirement, even with pinned training source.",
+      "readers": [
+        "/root/visual_history_fresh_a",
+        "/root/visual_history_fresh_b",
+        "/root/visual_history_fresh_c"
+      ],
+      "disposition": "Compare archived and effective dependencies/framework, base/processor identities, retained samples/order and sampler remainder. No unexplained algorithm/input/exposure difference may be accepted as a controlled baseline comparison."
+    },
+    {
+      "root": "Visual component replacement bundles memory extent, relevance weighting and absent-text handling.",
+      "readers": [
+        "/root/visual_history_fresh_a",
+        "/root/visual_history_fresh_b",
+        "/root/visual_history_fresh_c"
+      ],
+      "disposition": "Scope conclusions to the complete visual-history rule. Do not attribute an outcome to weighting alone or silently add controls/evaluation."
+    }
+  ],
+  "convergence": "All independent initial reads and frozen-v2 assessments found the pinned-baseline/minimal-visual-patch direction consistent with the stated scope. Reassurance only; no correctness, runtime equivalence, semantic usefulness or success proof.",
+  "read_scope": "Independent fresh stripped-problem readings, then static frozen-proposal/source inspection. No models/tests/probes/edits/child agents by readers.",
+  "first_nail_status": "Proposed comparative implementation witness only; not executed. Approval required before implementation. Launch blocked by any unexplained control mismatch.",
+  "late_operator_inspection": "Pinned historical coordinator hardcodes canonical repository paths and lacks later worktree-root CLI. Isolated execution needs the smallest reviewed repository-path adaptation using existing coordinator/worktree pattern; lifecycle, topology, ownership and safety checks remain required. No manual ranks or new coordinator."
+}
