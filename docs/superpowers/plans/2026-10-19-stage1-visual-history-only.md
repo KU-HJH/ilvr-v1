@@ -41,7 +41,7 @@ Keep the existing query stack/mean, _select call, packing and returned data. Rem
 
 ## Task 2: Fixed isolated repository bindings for the existing coordinator
 
-**Files:** Minimal necessary bindings in src/artifact_paths.py, src/multinode.py, src/multinode_artifacts.py, src/multinode_capacity.py, src/multinode_runtime.py; create tests/multinode/test_visual_history_checkout.py; only tests with causally stale literal-root expectations may be adjusted. Keep all ownership, pidfd, path traversal, same-commit, environment, rendezvous, node and artifact validation behavior.
+**Files:** Minimal necessary bindings in src/artifact_paths.py, src/multinode.py, src/multinode_artifacts.py, src/multinode_capacity.py, src/multinode_runtime.py, and the necessary fixed checkpoint/result constants in src/multinode_evidence.py and src/multinode_results.py; create tests/multinode/test_visual_history_checkout.py; only tests with causally stale literal-root expectations may be adjusted. Keep all ownership, pidfd, path traversal, same-commit, environment, rendezvous, node and artifact validation behavior.
 
 - [ ] Inspect the actual bound paths and source-supported worktree conventions. The experiment execution root is fixed and identical inside both containers:
 
@@ -63,7 +63,7 @@ Use these exact per-experiment fixed bindings in the historical constants, match
 - [ ] Invoke verification-before-completion and finishing-a-development-branch together. The applicable project full-suite command below is run once after final review; read complete output, not just the tail. Precreate only its dev basetemp parent and require unused basetemp/log identity. No extra identical broad suite unless an actual change/failure requires it.
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r1 > logs/stage1-visual-history-only-20261019/final-full-suite-r1.log 2>&1
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest tests -q --basetemp=checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r1 > logs/stage1-visual-history-only-20261019/final-full-suite-r1.log 2>&1
 ```
 
 - [ ] Verify copied metric hash, git diff --check and exact zero diff against c21 for Trainer/composition/EMA/model/collator/PEFT/loss/initializer/Transformers. Record reviewed product revision and any subsequent control-only commits.
