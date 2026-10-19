@@ -9,6 +9,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from stage1.history_metric import content_history
 from stage1.types import (
     Stage1BatchMetadata,
     Stage1SampleMetadata,
@@ -248,22 +249,21 @@ class Stage1TeacherTargetBuilder:
         block_counts = []
         block_indices = []
         block_margins = []
-        previous_selected_mean = None
         for block_index, span in enumerate(sample.latent_spans):
             query_parts = [user_query]
+            current_text = row_hidden_last[:0]
             if text_spans[block_index]:
                 text_indices = torch.tensor(
                     text_spans[block_index],
                     device=row_hidden_last.device,
                     dtype=torch.long,
                 )
-                query_parts.append(
-                    row_hidden_last.index_select(0, text_indices).mean(
-                        dim=0, keepdim=True
-                    )
-                )
-            if previous_selected_mean is not None:
-                query_parts.append(previous_selected_mean)
+                current_text = row_hidden_last.index_select(0, text_indices)
+                query_parts.append(current_text.mean(dim=0, keepdim=True))
+            previous = torch.cat(packed, dim=0) if packed else row_hidden_last[:0]
+            history = content_history(current_text, previous)
+            if history.present:
+                query_parts.append(history.summary.to(dtype=row_hidden_last.dtype))
             query = torch.stack(
                 [part.squeeze(0) for part in query_parts], dim=0
             ).mean(dim=0, keepdim=True)
@@ -277,8 +277,6 @@ class Stage1TeacherTargetBuilder:
             block_counts.append(int(selected.shape[0]))
             block_indices.append(indices)
             block_margins.append(margin)
-            if selected.shape[0]:
-                previous_selected_mean = selected.mean(dim=0, keepdim=True)
         return (
             packed,
             tuple(block_counts),
