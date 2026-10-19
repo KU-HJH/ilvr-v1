@@ -134,8 +134,8 @@ def _phase_paths(experiment_id: str):
     validated = resolve_run_artifact_paths(experiment_id)
     return SimpleNamespace(
         experiment_id=validated.experiment_id,
-        checkpoint_dir=Path("/root/workspace/ILVR/checkpoints") / experiment_id,
-        result_dir=Path("/root/workspace/ILVR/results") / experiment_id,
+        checkpoint_dir=Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints") / experiment_id,
+        result_dir=Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results") / experiment_id,
     )
 
 

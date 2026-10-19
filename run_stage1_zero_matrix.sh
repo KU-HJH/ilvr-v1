@@ -6,9 +6,9 @@ cd -- "$script_dir"
 repository_python="$script_dir/venv/ilvr-venv/bin/python"
 launcher=${STAGE1_LAUNCHER:-"$script_dir/run_stage1_training.sh"}
 
-canonical_checkpoint_root='/root/workspace/ILVR/checkpoints'
-canonical_result_root='/root/workspace/ILVR/results'
-canonical_log_root='/root/workspace/ILVR/logs/zero-stage-compatibility'
+canonical_checkpoint_root='/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints'
+canonical_result_root='/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results'
+canonical_log_root='/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs/zero-stage-compatibility'
 matrix_result_dir="$canonical_result_root/stage1-zero-matrix"
 
 dry_run=false

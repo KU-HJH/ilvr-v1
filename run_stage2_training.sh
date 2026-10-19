@@ -11,7 +11,7 @@ export TOKENIZERS_PARALLELISM=false
 : "${OUTPUT_DIR:?set OUTPUT_DIR}"
 
 experiment_id=${OUTPUT_DIR##*/}
-canonical_log_root='/root/workspace/ILVR/logs/zero-stage-compatibility'
+canonical_log_root='/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs/zero-stage-compatibility'
 if [[ -z "${LOG_FILE:-}" ]]; then
   if [[ -n "${RESUME_CHECKPOINT:-}" ]]; then
     LOG_FILE="$canonical_log_root/$experiment_id/resume-$(date +%Y%m%dT%H%M%S)-$$.log"

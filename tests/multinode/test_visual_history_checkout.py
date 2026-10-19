@@ -338,3 +338,103 @@ def test_lifecycle_evidence_and_final_validator_accept_the_planned_checkout():
             checkpoint_path=ORIGINAL_ROOT / "checkpoints" / lifecycle.child_run_id / "checkpoint-2",
             **arguments,
         )
+
+
+@pytest.mark.parametrize("stage", ("stage1", "stage2"))
+def test_training_launcher_default_logs_belong_to_execution_checkout(stage):
+    output = EXECUTION_ROOT / "checkpoints" / RUN_ID
+    environment = os.environ | {"PYTHONDONTWRITEBYTECODE": "1"}
+    if stage == "stage1":
+        command = (
+            "/usr/bin/bash", str(REPOSITORY / "run_stage1_training.sh"),
+            "--dry-run", *INPUT_ARGUMENTS, "--output-dir", str(output),
+        )
+        environment.pop("STAGE1_LOG_FILE", None)
+    else:
+        command = ("/usr/bin/bash", str(REPOSITORY / "run_stage2_training.sh"))
+        environment.update({
+            "STAGE2_DRY_RUN": "true",
+            "STAGE1_CHECKPOINT": str(ORIGINAL_ROOT / "checkpoints/original-stage1"),
+            "DATA_PATH": str(ORIGINAL_ROOT / "data/TRAIN.jsonl"),
+            "IMAGE_ROOT": str(ORIGINAL_ROOT / "data/images_comt"),
+            "OUTPUT_DIR": str(output),
+        })
+        environment.pop("LOG_FILE", None)
+        environment.pop("RESUME_CHECKPOINT", None)
+    completed = subprocess.run(
+        command, cwd=REPOSITORY, env=environment,
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    arguments = shlex.split(completed.stdout)
+    assert arguments[arguments.index("--save_model_path") + 1] == str(output)
+    assert arguments[arguments.index("--log_file") + 1] == str(
+        EXECUTION_ROOT / "logs/zero-stage-compatibility" / RUN_ID / "train.log"
+    )
+
+
+def test_batch_probe_constructs_checkout_owned_candidate_artifacts(tmp_path):
+    # Reuse the established recording-only launcher; no Trainer is started.
+    from tests.stage1.test_benchmark import _run_probe
+
+    completed, records, output_root, _ = _run_probe(tmp_path, fail_batches="2")
+    assert completed.returncode == 42, completed.stderr
+    recorded = next(records.glob("*.argv0")).read_bytes().split(b"\0")[:-1]
+    arguments = [item.decode() for item in recorded]
+    output = Path(arguments[arguments.index("--output-dir") + 1])
+    assert output.parent == EXECUTION_ROOT / "checkpoints"
+    assert output_root.parent == EXECUTION_ROOT / "results"
+    for flag, expected in (
+        ("--log-file", EXECUTION_ROOT / "logs/zero-stage-compatibility" / output.name / "train.log"),
+        ("--benchmark-run-config", EXECUTION_ROOT / "results" / output.name / "run-config.json"),
+        ("--producer-evidence", EXECUTION_ROOT / "results" / output.name / "producer-evidence.json"),
+    ):
+        assert arguments[arguments.index(flag) + 1] == str(expected)
+
+
+def test_zero_matrix_dry_run_constructs_checkout_owned_artifact_paths():
+    completed = subprocess.run(
+        (
+            "/usr/bin/bash", str(REPOSITORY / "run_stage1_zero_matrix.sh"),
+            "--dry-run", "--model", INPUT_ARGUMENTS[3],
+            "--source-data-path", INPUT_ARGUMENTS[5],
+            "--data-path", INPUT_ARGUMENTS[5],
+            "--image-root", INPUT_ARGUMENTS[7],
+            "--sample-audit", "/unused/visual-history-audit.json",
+        ),
+        cwd=REPOSITORY, env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True, text=True, check=False, timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    plans = [json.loads(line) for line in completed.stdout.splitlines()]
+    assert plans
+    for plan in plans:
+        for key, root in (
+            ("checkpoint_dir", EXECUTION_ROOT / "checkpoints"),
+            ("result_dir", EXECUTION_ROOT / "results"),
+            ("log_dir", EXECUTION_ROOT / "logs/zero-stage-compatibility"),
+        ):
+            assert Path(plan[key]) == root / plan["experiment_id"]
+
+
+@pytest.mark.parametrize("module", (
+    "tests.stage1.zero_compat_diagnostic",
+    "tests.stage2.integration.tiny_stage2_train",
+))
+def test_lifecycle_diagnostic_phase_paths_use_execution_checkout(module):
+    completed = subprocess.run(
+        (
+            str(REPOSITORY / "venv/ilvr-venv/bin/python"), "-c",
+            f"from {module} import _phase_paths; import json; "
+            f"paths = _phase_paths({RUN_ID!r}); "
+            "print(json.dumps({name: str(getattr(paths, name)) "
+            "for name in ('checkpoint_dir', 'result_dir')}))",
+        ),
+        cwd=REPOSITORY, env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "checkpoint_dir": str(EXECUTION_ROOT / "checkpoints" / RUN_ID),
+        "result_dir": str(EXECUTION_ROOT / "results" / RUN_ID),
+    }
