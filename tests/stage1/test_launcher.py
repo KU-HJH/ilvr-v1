@@ -230,7 +230,16 @@ def fake_accelerate_environment(tmp_path):
     source_dir = copied_repo / "src"
     source_dir.mkdir()
     for name in ("artifact_paths.py", "deepspeed_runtime.py"):
-        (source_dir / name).write_bytes((REPO_ROOT / "src" / name).read_bytes())
+        source = (REPO_ROOT / "src" / name).read_text(encoding="utf-8")
+        if name == "artifact_paths.py":
+            assignment = 'CANONICAL_CHECKPOINT_ROOT = CANONICAL_REPOSITORY_ROOT / "checkpoints"'
+            assert assignment in source
+            source = source.replace(
+                assignment,
+                f"CANONICAL_CHECKPOINT_ROOT = Path({str(copied_repo / 'checkpoints')!r})",
+                1,
+            )
+        (source_dir / name).write_text(source, encoding="utf-8")
     bin_dir = copied_repo / "venv/ilvr-venv/bin"
     bin_dir.mkdir(parents=True)
     log_path = tmp_path / "accelerate argv.log"
@@ -286,7 +295,16 @@ def live_import_worker_environment(tmp_path):
     source_dir = copied_repo / "src"
     source_dir.mkdir()
     for name in ("artifact_paths.py", "deepspeed_runtime.py"):
-        (source_dir / name).write_bytes((REPO_ROOT / "src" / name).read_bytes())
+        source = (REPO_ROOT / "src" / name).read_text(encoding="utf-8")
+        if name == "artifact_paths.py":
+            assignment = 'CANONICAL_CHECKPOINT_ROOT = CANONICAL_REPOSITORY_ROOT / "checkpoints"'
+            assert assignment in source
+            source = source.replace(
+                assignment,
+                f"CANONICAL_CHECKPOINT_ROOT = Path({str(copied_repo / 'checkpoints')!r})",
+                1,
+            )
+        (source_dir / name).write_text(source, encoding="utf-8")
     (source_dir / "main.py").write_text(
         """import json
 import os
@@ -620,6 +638,7 @@ def test_live_launcher_refuses_nonempty_output_without_explicit_resume(tmp_path)
     output.mkdir()
     (output / "evidence.txt").write_text("owned", encoding="utf-8")
     env, accelerate_log, wrong_log, launcher = fake_accelerate_environment(tmp_path)
+    assert not output.resolve().is_relative_to((launcher.parent / "checkpoints").resolve())
 
     refused = run_launcher(
         launcher, *live_args(tmp_path, output), env=env
@@ -637,6 +656,7 @@ def test_live_launcher_rejects_noncanonical_resume_output(tmp_path):
     checkpoint = output / "checkpoint-7"
     checkpoint.mkdir(parents=True)
     env, accelerate_log, wrong_log, launcher = fake_accelerate_environment(tmp_path)
+    assert not output.resolve().is_relative_to((launcher.parent / "checkpoints").resolve())
     env["PYTHON_EXEC"] = "/wrong/hjh-venv/bin/python"
 
     resumed = run_launcher(
@@ -658,6 +678,9 @@ def test_live_worker_rejects_noncanonical_output_before_dispatch(tmp_path):
 
     environment, worker_log, launcher, copied_repo = live_import_worker_environment(
         tmp_path
+    )
+    assert not (tmp_path / "worker output").resolve().is_relative_to(
+        (copied_repo / "checkpoints").resolve()
     )
     completed = run_launcher(
         launcher,
@@ -689,6 +712,7 @@ def test_live_launcher_rejects_symlink_output_before_dispatch(
     output = experiment_root / "linked output"
     output.symlink_to(target, target_is_directory=True)
     env, accelerate_log, wrong_log, launcher = fake_accelerate_environment(tmp_path)
+    assert not output.resolve().is_relative_to((launcher.parent / "checkpoints").resolve())
 
     completed = run_launcher(
         launcher, *live_args(tmp_path, output), env=env
