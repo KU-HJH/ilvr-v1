@@ -366,7 +366,8 @@ def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_
     assert not output.exists()
     assert not (REPO_ROOT / "SHOULD_NOT_EXIST").exists()
     command = shlex.split(completed.stdout.strip())
-    assert command[:7] == [
+    assert command[:8] == [
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
         str(REPO_ROOT / "venv/ilvr-venv/bin/accelerate"),
         "launch",
         "--num_processes",
@@ -403,6 +404,34 @@ def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_
     assert deepspeed == REPO_ROOT / "configs/deepspeed_zero3.json"
     assert "--final_save" in command
     assert "--gradient_checkpointing" in command
+
+
+def test_launcher_uses_repository_python_for_existing_console_with_hostile_shebang(tmp_path):
+    """Catches a relocated Accelerate console selecting its stale interpreter."""
+    console = REPO_ROOT / "venv/ilvr-venv/bin/accelerate"
+    console_body = console.read_bytes().split(b"\n", 1)[1]
+    copied_console = tmp_path / "accelerate"
+    copied_console.write_bytes(b"#!/usr/bin/false\n" + console_body)
+    copied_console.chmod(0o755)
+    assert copied_console.read_bytes().split(b"\n", 1)[1] == console_body
+
+    planned = run_launcher(LAUNCHER, *base_args(tmp_path / "unused-output"))
+    assert planned.returncode == 0, planned.stderr
+    command = shlex.split(planned.stdout)
+    console_index = command.index(str(console))
+    help_command = [*command[:console_index], str(copied_console), "--help"]
+    dispatched = subprocess.run(
+        help_command, cwd=REPO_ROOT,
+        env=os.environ | {"PYTHONDONTWRITEBYTECODE": "1"},
+        capture_output=True, text=True, check=False, timeout=60,
+    )
+
+    assert dispatched.returncode == 0, dispatched.stderr
+    assert "usage: accelerate <command> [<args>]" in dispatched.stdout
+    assert "accelerate command helpers" in dispatched.stdout
+    assert command[:3] == [
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"), str(console), "launch"
+    ]
 
 
 def test_stage1_launcher_routes_canonical_lora(tmp_path):
@@ -600,7 +629,11 @@ def test_timed_manifest_is_loaded_without_shell_evaluating_paths(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     command = shlex.split(completed.stdout)
-    assert command[0] == str(REPO_ROOT / "venv/ilvr-venv/bin/accelerate")
+    assert command[:3] == [
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+        str(REPO_ROOT / "venv/ilvr-venv/bin/accelerate"),
+        "launch",
+    ]
     assert command[command.index("--model") + 1] == "model path;literal"
     assert command[command.index("--save_model_path") + 1] == str(output)
     assert command[command.index("--per_device_train_batch_size") + 1] == "16"

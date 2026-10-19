@@ -344,7 +344,7 @@ if [[ $ilvr_num_machines == 2 ]]; then
 fi
 
 command=(
-    "$repository_accelerate" launch
+    "$repository_python" "$repository_accelerate" launch
     "${accelerate_topology[@]}"
     "${accelerate_deepspeed[@]}"
     src/main.py
