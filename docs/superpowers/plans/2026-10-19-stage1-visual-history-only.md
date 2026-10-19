@@ -4,7 +4,7 @@
 
 **Goal:** Train the approved historical-baseline-controlled experiment changing only the visual-history summary.
 
-**Architecture:** Development starts at pinned baseline c21b4e5c311204df4281317219b3f4a6b95e4d3b in native isolated checkout /root/.codex/worktrees/0121/ILVR, branch codex/stage1-visual-history-only-20261019. Two sequential reviewed tasks modify the target builder and bind the existing coordinator to an identical fixed execution checkout on both nodes: /root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019. Runtime copies use the existing canonical data/checkpoint/venv via links. The archived Trainer/model/collator/loss/initializer stay byte-identical.
+**Architecture:** Development starts at pinned baseline c21b4e5c311204df4281317219b3f4a6b95e4d3b in native isolated checkout /root/.codex/worktrees/0121/ILVR, branch codex/stage1-visual-history-only-20261019. Two sequential reviewed tasks modify the target builder and bind the existing coordinator to an identical fixed execution checkout on both nodes: /root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019. Runtime copies use existing canonical data/checkpoint links. Historical DeepSpeed0.18.0 environment is reused locally and copied into the owned remote venv without installation; canonical shared environments are preserved. The archived Trainer/model/collator/loss/initializer stay byte-identical.
 
 **Tech Stack:** Repo Python3.11 venv, existing PyTorch/PEFT/Transformers, pytest, unchanged two-node coordinator, FA2, BF16/ZeRO1. No install/download or new orchestration.
 
@@ -59,11 +59,13 @@ Use these exact per-experiment fixed bindings in the historical constants, match
 
 ## Final review, verification and requested training
 
+Live-preflight recovery after fullsuite r2 PASS: historical validator correctly rejected current shared DeepSpeed0.18.7. Reuse existing `/raid/workspace/ILVR/venv/ilvr-venv`0.18.0, with task-owned links/local and copied remote environment. Its stale absolute Accelerate shebang requires one additional necessary interpreter-path binding: run_stage1_training.sh prepends repository_python to existing repository_accelerate. Original Task2 implementer owns this change and causal real-console --help test, commit55ae6923277ad00a7eb2fbd8331f1deaadeac885. No package installs, version-guard weakening, other dispatcher or training flags. Renewed SPEC then QUALITY and final whole review precede fresh fullsuite r3 in the actual0.18.0 environment. r2 remains recorded successful2384passed6skipped in0.18.7, not a runtime launch pass. New source/environment justify r3, with unused final-pytest-r3/final-full-suite-r3.log instead of overwriting r2.
+
 - [ ] Independent final whole-change review from baseline c21 through both tasks, including loss/profile/source-preservation inventory and probe evidence. Root resolves all required findings before proceeding.
-- [ ] Invoke verification-before-completion and finishing-a-development-branch together. The applicable project full-suite command below is the justified r2 after recorded r1 failure and narrowly reviewed recovery; run once after renewed final review; read complete output, not just the tail. Precreate only its dev basetemp parent and require unused basetemp/log identity. No extra identical broad suite unless an actual change/failure requires it.
+- [ ] Invoke verification-before-completion and finishing-a-development-branch together. The applicable project full-suite command below is the justified r3 after the recorded live-preflight environment failure and narrowly reviewed interpreter recovery; run once after renewed final review; read complete output, not just the tail. Precreate only its dev basetemp parent and require unused basetemp/log identity. No extra identical broad suite unless an actual change/failure requires it.
 
 ```bash
-PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest tests -q --basetemp=checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r2 > logs/stage1-visual-history-only-20261019/final-full-suite-r2.log 2>&1
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONPATH=.:src:transformers/src ./venv/ilvr-venv/bin/python -m pytest tests -q --basetemp=checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r3 > logs/stage1-visual-history-only-20261019/final-full-suite-r3.log 2>&1
 ```
 
 - [ ] Verify copied metric hash, git diff --check and exact zero diff against c21 for Trainer/composition/EMA/model/collator/PEFT/loss/initializer/Transformers. Record reviewed product revision and any subsequent control-only commits.
