@@ -28,7 +28,9 @@ if TYPE_CHECKING:
 _REMOTE_HOST = "korea@10.1.102.41"
 _REMOTE_CONTAINER = "llm_kd"
 _REQUIRED_FREE_BYTES = 100 * 1024**3
-_REPOSITORY_ROOT = Path("/root/workspace/ILVR")
+_REPOSITORY_ROOT = Path(
+    "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019"
+)
 _CHECKPOINT_ROOT = _REPOSITORY_ROOT / "checkpoints"
 _EVALUATION_STAGING_ROOT = CANONICAL_EVALUATION_STAGING_ROOT
 _RESULT_ROOT = _REPOSITORY_ROOT / "results"
@@ -47,7 +49,7 @@ _MINIMAL_EXEC_ENVIRONMENT = {
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
     "PATH": (
-        "/root/workspace/ILVR/venv/ilvr-venv/bin:"
+        f"{_REPOSITORY_ROOT}/venv/ilvr-venv/bin:"
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     ),
     "PYTHONUNBUFFERED": "1",

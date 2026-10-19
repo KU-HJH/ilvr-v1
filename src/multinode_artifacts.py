@@ -42,8 +42,13 @@ _MANIFEST_IDENTITY_FIELDS = (
     "run_id",
 )
 _RESUME_IDENTITY_FIELDS = _MANIFEST_IDENTITY_FIELDS
-_LOCAL_REPOSITORY = Path("/root/workspace/ILVR")
-_REMOTE_HOST_REPOSITORY = Path("/home/korea/Workspace/hjh/workspace/ILVR")
+_LOCAL_REPOSITORY = Path(
+    "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019"
+)
+_REMOTE_HOST_REPOSITORY = Path(
+    "/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/"
+    "stage1-visual-history-only-20261019"
+)
 _REMOTE_HOST = "korea@10.1.102.41"
 _RSYNC_SSH = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8"
 _MAX_COMMON_METADATA_BYTES = 4 * 1024 * 1024

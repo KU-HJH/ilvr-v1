@@ -25,7 +25,7 @@ def snapshot(node, rank):
         machine_rank=rank,
         commit="a" * 40,
         tracked_clean=True,
-        repository=Path("/root/workspace/ILVR"),
+        repository=Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019"),
         container_running=True,
         python_version="3.11",
         torch_version="2.7.1+cu128",
@@ -62,14 +62,14 @@ def test_stage2_peft_zero3_preflight_uses_dedicated_config_on_both_nodes():
     commands = build_preflight_commands(
         launch_plan,
         input_paths=("/input",),
-        artifact_roots=("/root/workspace/ILVR/checkpoints",),
-        remote_run_paths=("/root/workspace/ILVR/checkpoints/remote",),
-        local_run_paths=("/root/workspace/ILVR/checkpoints/local",),
+        artifact_roots=("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints",),
+        remote_run_paths=("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/remote",),
+        local_run_paths=("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/local",),
         remote_tmux_sessions=("ilvr-remote",),
         local_tmux_sessions=("ilvr-local",),
     )
 
-    expected = "/root/workspace/ILVR/configs/deepspeed_zero3_stage2_peft.json"
+    expected = "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/configs/deepspeed_zero3_stage2_peft.json"
     assert commands.local_node_info[
         commands.local_node_info.index("--deepspeed-config") + 1
     ] == expected
@@ -254,8 +254,8 @@ def test_local_collection_never_uses_ssh_or_docker():
     assert len(calls) == 1
     assert calls[0][:3] == [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019:/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/src",
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/venv/ilvr-venv/bin/python",
     ]
     assert "/usr/bin/ssh" not in calls[0]
     assert "docker" not in calls[0]
@@ -290,8 +290,8 @@ def test_preflight_dry_run_prints_commands_without_probing(monkeypatch, capsys):
     assert payload["plan"]["world_size"] == 4
     assert payload["local_node_info"][:6] == [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019:/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/src",
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/venv/ilvr-venv/bin/python",
         "-m",
         "src.multinode",
         "node-info",
@@ -328,14 +328,14 @@ def test_preflight_uses_each_node_repository_artifact_roots(monkeypatch, capsys)
 
     capsys.readouterr()
     assert calls[0]["artifact_roots"] == (
-        Path("/root/workspace/ILVR/checkpoints"),
-        Path("/root/workspace/ILVR/results"),
-        Path("/root/workspace/ILVR/logs"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs"),
     )
     assert calls[1]["artifact_roots"] == (
-        Path("/root/workspace/ILVR/checkpoints"),
-        Path("/root/workspace/ILVR/results"),
-        Path("/root/workspace/ILVR/logs"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs"),
     )
 
 
@@ -352,17 +352,17 @@ def test_preflight_commands_use_the_canonical_repo_venv_and_config():
     commands = build_preflight_commands(
         plan(),
         input_paths=("/input",),
-        artifact_roots=("/root/workspace/ILVR/checkpoints",),
-        remote_run_paths=("/root/workspace/ILVR/checkpoints/fresh-remote",),
-        local_run_paths=("/root/workspace/ILVR/checkpoints/fresh-local",),
+        artifact_roots=("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints",),
+        remote_run_paths=("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/fresh-remote",),
+        local_run_paths=("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/fresh-local",),
         remote_tmux_sessions=("ilvr-remote",),
         local_tmux_sessions=("ilvr-local",),
     )
 
     expected_prefix = [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019:/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/src",
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/venv/ilvr-venv/bin/python",
         "-m",
         "src.multinode",
         "node-info",
@@ -371,15 +371,15 @@ def test_preflight_commands_use_the_canonical_repo_venv_and_config():
     assert "--repository" in commands.local_node_info
     assert commands.local_node_info[
         commands.local_node_info.index("--repository") + 1
-    ] == "/root/workspace/ILVR"
+    ] == "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019"
     assert commands.local_node_info[
         commands.local_node_info.index("--deepspeed-config") + 1
-    ] == "/root/workspace/ILVR/configs/deepspeed_zero2.json"
+    ] == "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/configs/deepspeed_zero2.json"
     remote_docker = shlex.split(commands.remote_node_info[-1])
     assert remote_docker[:3] == ["/usr/bin/docker", "exec", "llm_kd"]
     assert shlex.split(remote_docker[-1])[:2] == [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
+        "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019:/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/src",
     ]
 
 
@@ -431,8 +431,8 @@ def test_dry_run_prints_the_same_three_executable_commands(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert set(payload) == {"container_inspect", "local_node_info", "plan", "remote_node_info"}
     assert payload["local_node_info"][:6] == [
-        "env", "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-        "/root/workspace/ILVR/venv/ilvr-venv/bin/python", "-m", "src.multinode", "node-info",
+        "env", "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019:/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/src",
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/venv/ilvr-venv/bin/python", "-m", "src.multinode", "node-info",
     ]
 
 

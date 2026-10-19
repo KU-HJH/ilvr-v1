@@ -40,8 +40,12 @@ _SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _HEX64 = re.compile(r"^[0-9a-f]{64}$")
 _MAX_SMALL_BYTES = 1024 * 1024
 _MAX_SNAPSHOT_ENTRIES = 4096
-_CANONICAL_RESULT_ROOT = Path("/root/workspace/ILVR/results")
-_CANONICAL_CHECKPOINT_ROOT = Path("/root/workspace/ILVR/checkpoints")
+_CANONICAL_RESULT_ROOT = Path(
+    "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results"
+)
+_CANONICAL_CHECKPOINT_ROOT = Path(
+    "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints"
+)
 _DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 _REPORT_MANIFEST_NAME = "validation-manifest.json"
 _REPORT_SUMMARY_NAME = "validation-summary.md"

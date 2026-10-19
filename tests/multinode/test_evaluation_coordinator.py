@@ -77,12 +77,12 @@ def _plan() -> EvaluationPlan:
         run_id="eval-four-gpu",
         attempt_id="initial",
         model_dir=Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
             "trained-model-run/prepared-model"
         ),
         test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
         task_name="zebra-cot",
-        output_dir=Path("/root/workspace/ILVR/results/eval-four-gpu"),
+        output_dir=Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/eval-four-gpu"),
     )
 
 
@@ -102,7 +102,7 @@ def test_local_inference_staging_is_checkpoint_owned():
     plan = _plan()
 
     assert plan.local_model_dir == Path(
-        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
         "eval-four-gpu/local-model"
     )
 
@@ -111,31 +111,31 @@ def test_evaluation_model_artifacts_are_checkpoint_owned():
     plan = EvaluationPlan(
         run_id="eval-four-gpu",
         model_dir=Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
             "trained-model-run/prepared-model"
         ),
         test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
         task_name="zebra-cot",
-        output_dir=Path("/root/workspace/ILVR/results/eval-four-gpu"),
+        output_dir=Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/eval-four-gpu"),
     )
 
     assert plan.local_model_dir == Path(
-        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
         "eval-four-gpu/local-model"
     )
     with pytest.raises(ValueError, match="checkpoint"):
         dataclasses.replace(
             plan,
             model_dir=Path(
-                "/root/workspace/ILVR/results/trained-model-run/prepared-model"
+                "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/trained-model-run/prepared-model"
             ),
         )
 
 
 @pytest.mark.parametrize(
     ("stage", "evaluator"),
-    [("stage1", "/root/workspace/ILVR/eval.py"),
-     ("stage2", "/root/workspace/ILVR/src/evaluate_deepseed.py")],
+    [("stage1", "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/eval.py"),
+     ("stage2", "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/src/evaluate_deepseed.py")],
 )
 def test_worker_commands_use_observed_stage_exact_gpu_and_one_model_identity(
     stage, evaluator
@@ -650,9 +650,9 @@ def test_cleanup_exception_does_not_mask_launch_timeout_or_skip_later_workers():
 
 
 def test_remote_result_pull_is_fixed_container_rsync_with_explicit_nul_list():
-    output_dir = Path("/root/workspace/ILVR/results/eval-four-gpu")
+    output_dir = Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/eval-four-gpu")
     files_path = Path(
-        "/root/workspace/ILVR/logs/multinode/eval-four-gpu/initial/"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs/multinode/eval-four-gpu/initial/"
         "evaluation-pull.files"
     )
 
@@ -678,8 +678,8 @@ def test_remote_result_pull_is_fixed_container_rsync_with_explicit_nul_list():
         "--rsync-path",
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "korea@10.1.102.41:/root/workspace/ILVR/results/eval-four-gpu/",
-        "/root/workspace/ILVR/results/eval-four-gpu/",
+        "korea@10.1.102.41:/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/eval-four-gpu/",
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/eval-four-gpu/",
     )
     assert "--recursive" not in command
 
@@ -702,13 +702,13 @@ def test_unsafe_result_component_is_rejected_before_runner_creation(
         EvaluationPlan(
             run_id="eval-four-gpu",
             model_dir=Path(
-                "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+                "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
                 "trained-model-run/prepared-model"
             ),
             test_data_path=Path("/root/workspace/ILVR/data/TEST.jsonl"),
             task_name="zebra-cot",
             output_dir=(
-                Path("/root/workspace/ILVR/results")
+                Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results")
                 / unsafe_component
                 / "eval-four-gpu"
             ),
@@ -720,28 +720,28 @@ def test_prepared_inference_backtick_source_is_rejected_before_rsync():
         build_prepared_inference_pull_command(
             _manifest(),
             Path(
-                "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+                "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
                 "bad`touch-owned`/prepared-model"
             ),
             Path(
-                "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+                "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
                 "eval-four-gpu/local-model"
             ),
-            files_from=Path("/root/workspace/ILVR/logs/evaluation.files"),
+            files_from=Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs/evaluation.files"),
         )
 
 
 def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
-    files_path = Path("/root/workspace/ILVR/logs/evaluation.files")
+    files_path = Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs/evaluation.files")
 
     command = build_prepared_inference_pull_command(
         _manifest(),
         Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
             "trained-model-run/prepared-model"
         ),
         Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
             "eval-four-gpu/local-model"
         ),
         files_from=files_path,
@@ -760,9 +760,9 @@ def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
         "--rsync-path",
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "korea@10.1.102.41:/root/workspace/ILVR/"
+        "korea@10.1.102.41:/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/"
         "checkpoints/evaluation-staging/trained-model-run/prepared-model/",
-        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
         "eval-four-gpu/local-model/",
     )
 
@@ -801,12 +801,12 @@ def test_prepared_inference_pull_accepts_resolved_local_checkpoint_destination(
 
 
 def test_prepared_inference_push_has_exact_container_rsync_argv():
-    files_path = Path("/root/workspace/ILVR/logs/prepared-push.files")
+    files_path = Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs/prepared-push.files")
 
     command = build_prepared_inference_push_command(
         _manifest(),
         Path(
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
             "trained-model-run/prepared-model"
         ),
         files_from=files_path,
@@ -825,9 +825,9 @@ def test_prepared_inference_push_has_exact_container_rsync_argv():
         "--rsync-path",
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
         "trained-model-run/",
-        "korea@10.1.102.41:/root/workspace/ILVR/checkpoints/"
+        "korea@10.1.102.41:/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/"
         "evaluation-staging/trained-model-run/",
     )
 
@@ -922,11 +922,11 @@ def test_dry_run_builds_commands_without_constructing_a_live_runner(
             "evaluate",
             "--run-id", "eval-four-gpu",
             "--model-dir",
-            "/root/workspace/ILVR/checkpoints/evaluation-staging/"
+            "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/evaluation-staging/"
             "model/prepared-model",
             "--test-data-path", "/root/workspace/ILVR/data/TEST.jsonl",
             "--task-name", "zebra-cot",
-            "--output-dir", "/root/workspace/ILVR/results/eval-four-gpu",
+            "--output-dir", "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/eval-four-gpu",
             "--dry-run",
         ]
     )

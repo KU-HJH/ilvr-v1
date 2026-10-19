@@ -354,7 +354,7 @@ def test_tmux_commands_use_fixed_sessions_and_quote_shell_metacharacters():
 def test_training_supervisors_import_from_the_canonical_repository():
     """Catches production rank 0 exiting before ownership from container cwd ``/``."""
     commands = build_owned_tmux_commands(plan(), commit="a" * 40)
-    repository = "/root/workspace/ILVR"
+    repository = "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019"
 
     for spec in commands.node_specs:
         environment = dict(spec.environment)
@@ -905,9 +905,9 @@ def test_stage2_forwards_only_allowlisted_environment_and_safe_arguments():
             "ILVR_MACHINE_RANK": "99",
             "UNRELATED_SECRET": "do-not-forward",
         },
-        output_dir="/root/workspace/ILVR/checkpoints/stage2-dora-zero3-four-gpu",
-        log_file="/root/workspace/ILVR/logs/zero-stage-compatibility/stage2-dora-zero3-four-gpu/train.log",
-        deepspeed_config="/root/workspace/ILVR/configs/deepspeed_zero3.json",
+        output_dir="/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/stage2-dora-zero3-four-gpu",
+        log_file="/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs/zero-stage-compatibility/stage2-dora-zero3-four-gpu/train.log",
+        deepspeed_config="/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/configs/deepspeed_zero3.json",
     )
 
     assert environment["STAGE1_CHECKPOINT"] == "/models/stage1;literal"
@@ -924,7 +924,7 @@ def test_stage2_forwards_only_allowlisted_environment_and_safe_arguments():
     )
     effective = dict(commands.node_specs[0].environment)
     assert effective["PATH"].startswith(
-        "/root/workspace/ILVR/venv/ilvr-venv/bin:/usr/local/sbin:"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/venv/ilvr-venv/bin:/usr/local/sbin:"
     )
     assert effective["HOME"] == "/root"
     assert "UNRELATED_SECRET" not in effective
@@ -1000,7 +1000,7 @@ def test_stage2_coordinator_owns_a_fresh_producer_evidence_path():
 def test_ordinary_stage1_coordinator_owns_training_evidence_path_and_argv():
     launch_plan = plan(stage="stage1", method="full")
     producer = Path(
-        "/root/workspace/ILVR/results/stage1-full-zero3-four-gpu/"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/stage1-full-zero3-four-gpu/"
         "initial-producer-evidence.json"
     )
 
@@ -1798,12 +1798,12 @@ def test_subprocess_runner_transfers_only_attempt_plan_with_size_and_sha(tmp_pat
         command_runner.calls, ("prepare-attempt", "receive-plan"), strict=True
     ):
         remote = shlex.split(call[0][6])
-        assert remote[remote.index("--workdir") + 1] == "/root/workspace/ILVR"
+        assert remote[remote.index("--workdir") + 1] == "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019"
         inner = shlex.split(remote[-1])
         assert inner[:6] == [
             "/usr/bin/env",
-            "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-            "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+            "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019:/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/src",
+            "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/venv/ilvr-venv/bin/python",
             "-m",
             "src.multinode",
             subcommand,

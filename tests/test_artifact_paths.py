@@ -27,13 +27,13 @@ def test_run_paths_share_one_experiment_identifier():
     paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
 
     assert paths.checkpoint_dir == Path(
-        "/root/workspace/ILVR/checkpoints/stage1-zero2-dora-mb4-ga2-candidate"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/stage1-zero2-dora-mb4-ga2-candidate"
     )
     assert paths.result_dir == Path(
-        "/root/workspace/ILVR/results/stage1-zero2-dora-mb4-ga2-candidate"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/stage1-zero2-dora-mb4-ga2-candidate"
     )
     assert paths.log_dir == Path(
-        "/root/workspace/ILVR/logs/zero-stage-compatibility/"
+        "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs/zero-stage-compatibility/"
         "stage1-zero2-dora-mb4-ga2-candidate"
     )
     assert paths.result_dir.name == paths.checkpoint_dir.name
@@ -82,7 +82,7 @@ def test_owned_training_evidence_supports_nested_capacity_result_root(stage1_arg
     stage1_args.save_model_path = str(paths.checkpoint_dir)
     stage1_args.log_file = str(paths.log_dir / "initial-train.log")
     stage1_args.training_evidence_path = str(
-        Path("/root/workspace/ILVR/results/hardware/capacity")
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/hardware/capacity")
         / run_id
         / "initial-producer-evidence.json"
     )
@@ -90,7 +90,7 @@ def test_owned_training_evidence_supports_nested_capacity_result_root(stage1_arg
     assert validate_generated_artifact_paths(stage1_args) == paths
 
     stage1_args.training_evidence_path = str(
-        Path("/root/workspace/ILVR/results/hardware/capacity/wrong-run")
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/hardware/capacity/wrong-run")
         / "initial-producer-evidence.json"
     )
     with pytest.raises(ValueError, match="experiment ID"):
@@ -103,7 +103,7 @@ def test_owned_stage2_evidence_supports_nested_batch1_result_root(stage1_args):
     stage1_args.save_model_path = str(paths.checkpoint_dir)
     stage1_args.log_file = str(paths.log_dir / "initial-train.log")
     stage1_args.benchmark_evidence_path = str(
-        Path("/root/workspace/ILVR/results/hardware/capacity/stage2-batch1")
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/hardware/capacity/stage2-batch1")
         / run_id
         / "initial-producer-evidence.json"
     )
@@ -111,7 +111,7 @@ def test_owned_stage2_evidence_supports_nested_batch1_result_root(stage1_args):
     assert validate_generated_artifact_paths(stage1_args) == paths
 
     stage1_args.benchmark_evidence_path = str(
-        Path("/root/workspace/ILVR/results/hardware/capacity/stage2-batch1/wrong-run")
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/hardware/capacity/stage2-batch1/wrong-run")
         / "initial-producer-evidence.json"
     )
     with pytest.raises(ValueError, match="experiment ID"):
@@ -123,14 +123,14 @@ def test_multinode_direct_artifact_tuple_rejects_legacy_nested_checkpoint(
 ):
     run_id = "multinode-four-gpu-stage2-full-zero1"
     paths = resolve_run_artifact_paths(run_id)
-    stage1_args.save_model_path = str(Path("/root/workspace/ILVR/checkpoints") / run_id)
+    stage1_args.save_model_path = str(Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints") / run_id)
     stage1_args.log_file = str(
-        Path("/root/workspace/ILVR/logs/zero-stage-compatibility")
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/logs/zero-stage-compatibility")
         / run_id
         / "initial-train.log"
     )
     stage1_args.benchmark_evidence_path = str(
-        Path("/root/workspace/ILVR/results")
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results")
         / run_id
         / "initial-producer-evidence.json"
     )
@@ -138,7 +138,7 @@ def test_multinode_direct_artifact_tuple_rejects_legacy_nested_checkpoint(
     assert validate_generated_artifact_paths(stage1_args) == paths
 
     stage1_args.save_model_path = str(
-        Path("/root/workspace/ILVR/checkpoints/zero-stage-compatibility") / run_id
+        Path("/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/zero-stage-compatibility") / run_id
     )
     with pytest.raises(ValueError, match="share one experiment ID"):
         validate_generated_artifact_paths(stage1_args)
