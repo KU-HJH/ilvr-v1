@@ -64,16 +64,35 @@ def test_diagnostic_entrypoint_leaves_an_extra_build_marker_invalid():
             str(repo_root / "venv/ilvr-venv/bin/python"),
             "-c",
             """
+import builtins
 import platform
-from packaging.version import InvalidVersion
+from packaging.version import InvalidVersion, Version
 
 platform.python_version = lambda: "3.11.15++"
+original = platform.python_version
+real_import = builtins.__import__
+observed = []
+
+def validate_version_at_heavy_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name == "torch":
+        value = platform.python_version()
+        observed.append(value)
+        Version(value)
+    return real_import(name, globals, locals, fromlist, level)
+
+builtins.__import__ = validate_version_at_heavy_import
 try:
     import stage1.evaluation_diagnostics
 except InvalidVersion as error:
     assert str(error) == "Invalid version: '3.11.15+'"
 else:
     raise AssertionError("an extra build marker was accepted")
+finally:
+    builtins.__import__ = real_import
+
+assert observed == ["3.11.15+"]
+assert platform.python_version is original
+assert platform.python_version() == "3.11.15++"
 """,
         ],
         cwd=repo_root,
@@ -102,11 +121,15 @@ def test_diagnostic_entrypoint_restores_platform_after_heavy_import_failure():
 import builtins
 import platform
 
+platform.python_version = lambda: "3.11.15+"
 original = platform.python_version
 real_import = builtins.__import__
+observed = []
 
 def fail_torch_import(name, globals=None, locals=None, fromlist=(), level=0):
     if name == "torch":
+        observed.append(platform.python_version())
+        assert platform.python_version() == "3.11.15"
         raise RuntimeError("simulated heavy import failure")
     return real_import(name, globals, locals, fromlist, level)
 
@@ -120,6 +143,7 @@ else:
 finally:
     builtins.__import__ = real_import
 
+assert observed == ["3.11.15"]
 assert platform.python_version is original
 assert platform.python_version().endswith("+")
 """,
