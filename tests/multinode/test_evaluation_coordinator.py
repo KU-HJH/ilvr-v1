@@ -541,7 +541,7 @@ def test_production_runner_transfer_publishes_exact_list_before_fake_rsync(
     assert calls == [commands.remote_pull]
     assert "--secluded-args" in calls[0]
     assert calls[0][calls[0].index("--rsync-path") + 1] == (
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync"
     )
 
 
@@ -725,9 +725,9 @@ def test_remote_result_pull_is_fixed_container_rsync_with_explicit_nul_list():
         "--rsh",
         "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8",
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
-        f"korea@10.1.102.41:{REPO_ROOT}/results/eval-four-gpu/",
+        f"korea@172.16.11.41:{REPO_ROOT}/results/eval-four-gpu/",
         f"{REPO_ROOT}/results/eval-four-gpu/",
     )
     assert "--recursive" not in command
@@ -807,9 +807,9 @@ def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
         "--rsh",
         "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8",
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
-        f"korea@10.1.102.41:{REPO_ROOT}/checkpoints/evaluation-staging/"
+        f"korea@172.16.11.41:{REPO_ROOT}/checkpoints/evaluation-staging/"
         "trained-model-run/prepared-model/",
         f"{REPO_ROOT}/checkpoints/evaluation-staging/eval-four-gpu/local-model/",
     )
@@ -844,7 +844,7 @@ def test_prepared_inference_pull_accepts_resolved_local_checkpoint_destination(
         files_from=tmp_path / "evaluation.files",
     )
 
-    assert command[-2] == f"korea@10.1.102.41:{source}/"
+    assert command[-2] == f"korea@172.16.11.41:{source}/"
     assert command[-1] == f"{physical_destination}/"
 
 
@@ -871,10 +871,10 @@ def test_prepared_inference_push_has_exact_container_rsync_argv():
         "--rsh",
         "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8",
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{REPO_ROOT}/checkpoints/evaluation-staging/trained-model-run/",
-        f"korea@10.1.102.41:{REPO_ROOT}/checkpoints/evaluation-staging/"
+        f"korea@172.16.11.41:{REPO_ROOT}/checkpoints/evaluation-staging/"
         "trained-model-run/",
     )
 

@@ -25,8 +25,8 @@ if TYPE_CHECKING:
     from src.multinode import LaunchPlan
 
 
-_REMOTE_HOST = "korea@10.1.102.41"
-_REMOTE_CONTAINER = "llm_kd"
+_REMOTE_HOST = "korea@172.16.11.41"
+_REMOTE_CONTAINER = "llm_kd_rdma"
 _REQUIRED_FREE_BYTES = 100 * 1024**3
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 _CHECKPOINT_ROOT = _REPOSITORY_ROOT / "checkpoints"
@@ -54,6 +54,13 @@ _MINIMAL_EXEC_ENVIRONMENT = {
 }
 _STAGE2_FIXED_EXEC_ENVIRONMENT = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+    "NCCL_NET": "IB",
+    "NCCL_IB_DISABLE": "0",
+    "NCCL_IB_HCA": "mlx5_0:1",
+    "NCCL_SOCKET_IFNAME": "bond0.11",
+    "GLOO_SOCKET_IFNAME": "bond0.11",
+    "NCCL_DEBUG": "INFO",
+    "NCCL_DEBUG_SUBSYS": "INIT,NET",
 }
 
 
@@ -601,7 +608,7 @@ def owned_listener_is_ready(
     expected_owner_start_ticks: int | None = None,
 ) -> bool:
     """Prove that the requested LISTEN socket belongs to the owned process tree."""
-    if master_addr != "10.1.102.41":
+    if master_addr != "172.16.11.41":
         raise ValueError("readiness master address must match the fixed topology")
     listening = _listening_socket_inodes(
         master_addr=master_addr, port=port, proc_root=proc_root
@@ -1526,8 +1533,8 @@ def build_dil_full_model_probe_commands(
             or plan.world_size != 4 or plan.cluster.num_machines != 2
             or plan.cluster.num_processes != 4 or plan.cluster.gpus_per_node != 2
             or plan.cluster.remote_rank != 0 or plan.cluster.local_rank != 1
-            or plan.cluster.master_addr != "10.1.102.41"
-            or plan.cluster.socket_ifname != "bond1.102" or plan.attempt_id != "initial"):
+            or plan.cluster.master_addr != "172.16.11.41"
+            or plan.cluster.socket_ifname != "bond0.11" or plan.attempt_id != "initial"):
         raise ValueError("DIL probe requires fresh two-node/four-rank DoRA ZeRO2 profile")
     _require_digest("manifest_sha256", manifest_sha256)
     if not re.fullmatch(r"[a-f0-9]{40}", commit):
@@ -1538,14 +1545,14 @@ def build_dil_full_model_probe_commands(
     for machine_rank in (0, 1):
         environment = {
             **_MINIMAL_EXEC_ENVIRONMENT, **_distributed_environment(plan, machine_rank),
-            "MASTER_ADDR": "10.1.102.41", "GLOO_SOCKET_IFNAME": "bond1.102", "NCCL_SOCKET_IFNAME": "bond1.102",
+            "MASTER_ADDR": "172.16.11.41", "GLOO_SOCKET_IFNAME": "bond0.11", "NCCL_SOCKET_IFNAME": "bond0.11",
             "PYTHONDONTWRITEBYTECODE": "1", "ILVR_REPOSITORY_COMMIT": commit,
             "PYTHONPATH": f"{repository}:{repository / 'src'}",
         }
         command = (
             str(repository / "venv/ilvr-venv/bin/accelerate"), "launch",
             "--num_machines", "2", "--num_processes", "4", "--machine_rank", str(machine_rank),
-            "--main_process_ip", "10.1.102.41", "--main_process_port", str(plan.main_process_port),
+            "--main_process_ip", "172.16.11.41", "--main_process_port", str(plan.main_process_port),
             "--mixed_precision", "bf16", "--use_deepspeed", "--deepspeed_multinode_launcher", "standard",
             "--deepspeed_config_file", str(plan.deepspeed_config),
             str(repository / "scripts/probe_dil_full_model.py"), "run", "--repository", str(repository),
@@ -3932,7 +3939,7 @@ def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot) -> PreflightRe
     for node in (remote, local):
         _validate_snapshot(node)
     if remote.container_running is not True:
-        raise ValueError("remote llm_kd container is not running")
+        raise ValueError("remote llm_kd_rdma container is not running")
     return PreflightReport(commit=remote.commit, world_size=4)
 
 
@@ -3951,8 +3958,8 @@ def _validate_snapshot(node: NodeSnapshot) -> None:
         raise ValueError(f"{node.node}: exactly two GPUs are required")
     if any("H100" not in name for name in node.gpu_names):
         raise ValueError(f"{node.node}: H100 GPUs are required")
-    if node.interface != "bond1.102":
-        raise ValueError(f"{node.node}: bond1.102 interface is required")
+    if node.interface != "bond0.11":
+        raise ValueError(f"{node.node}: bond0.11 interface is required")
     if not node.input_paths_ok:
         raise ValueError(f"{node.node}: input paths are missing")
     if not node.artifact_roots_writable:

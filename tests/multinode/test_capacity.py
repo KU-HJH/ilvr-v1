@@ -45,7 +45,7 @@ def test_capacity_parent_is_reserved_locally_then_remotely_before_child(
             "exec",
             "--workdir",
             str(REPO_ROOT),
-            "llm_kd",
+            "llm_kd_rdma",
             "/usr/bin/bash",
             "-lc",
         ]
@@ -574,13 +574,13 @@ def test_subprocess_runner_rejects_remote_evidence_outside_exact_child(tmp_path)
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=8",
-            "korea@10.1.102.41",
+            "korea@172.16.11.41",
         )
         remote_argv = shlex.split(command[6])
         assert remote_argv[:5] == [
             "/usr/bin/docker",
             "exec",
-            "llm_kd",
+            "llm_kd_rdma",
             "/usr/bin/bash",
             "-lc",
         ]

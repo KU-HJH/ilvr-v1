@@ -47,7 +47,7 @@ _REMOTE_HOST_REPOSITORY = (
     Path("/home/korea/Workspace/hjh/workspace/ILVR")
     / _LOCAL_REPOSITORY.relative_to(Path("/root/workspace/ILVR"))
 )
-_REMOTE_HOST = "korea@10.1.102.41"
+_REMOTE_HOST = "korea@172.16.11.41"
 _RSYNC_SSH = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8"
 _MAX_COMMON_METADATA_BYTES = 4 * 1024 * 1024
 _MAX_LATEST_BYTES = 1024
@@ -1452,7 +1452,7 @@ def build_push_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{source}/",
         f"{_REMOTE_HOST}:{destination}/",
@@ -1679,7 +1679,7 @@ def build_pull_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{_REMOTE_HOST}:{source}/",
         f"{local_destination}/",
@@ -1946,7 +1946,7 @@ def build_evaluation_pull_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{_REMOTE_HOST}:{remote}/",
         f"{output}/",
@@ -1980,7 +1980,7 @@ def build_prepared_inference_pull_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{_REMOTE_HOST}:{remote}/",
         f"{Path(destination)}/",
@@ -2028,7 +2028,7 @@ def build_prepared_inference_push_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{source.parent}/",
         f"{_REMOTE_HOST}:{remote_parent}/",
