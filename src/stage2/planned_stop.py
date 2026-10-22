@@ -1,4 +1,4 @@
-"""Optional fresh-run checkpoint boundary for a same-budget DIL resume probe."""
+"""Optional fresh-run checkpoint boundary for a same-budget Stage2B probe."""
 from transformers import TrainerCallback
 
 
@@ -8,8 +8,8 @@ def validate_planned_checkpoint_stop(step, *, config, max_steps, resume=None, st
     if type(step) is not int or step <= 0:
         raise ValueError('stage2_stop_after_checkpoint must be a positive integer')
     if stage != 'stage2' or not (config.is_context_preference and config.is_stage2b
-            and config.preference_loss_type in ('dil_bce_rf', 'dil_bce_rf_topk', 'dil_bce_rf_topk_reverse')):
-        raise ValueError('stage2_stop_after_checkpoint requires enabled context-preference DIL Stage2B')
+            and config.preference_loss_type in ('dpo', 'dil_bce_rf', 'dil_bce_rf_topk', 'dil_bce_rf_topk_reverse')):
+        raise ValueError('stage2_stop_after_checkpoint requires enabled context-preference Stage2B')
     if resume:
         raise ValueError('stage2_stop_after_checkpoint is fresh-run only; omit it when resuming')
     if type(max_steps) is not int or not step < max_steps:

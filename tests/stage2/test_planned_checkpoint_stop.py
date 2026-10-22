@@ -1,5 +1,6 @@
 """CPU save/stop/resume lifecycle; no four-rank or DIL numerics claim."""
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -41,24 +42,41 @@ def test_parser_rejects_invalid_stop(value):
         parse_args(fresh_argv() + ['--stage2_stop_after_checkpoint', value])
 
 
-def test_stop_rejects_resume_and_non_dil():
+def test_stop_rejects_resume():
     with pytest.raises(ValueError, match='fresh'):
         parse_args(resume_argv('saved', 'base', 'data') + ['--stage2_stop_after_checkpoint', '2'])
+
+
+def test_ordinary_preference_stop_preserves_the_full_baseline_budget():
+    """R1: the real argument parser must admit the approved ordinary smoke."""
     argv = fresh_argv()
     argv[argv.index('--step_preference_loss_type') + 1] = 'dpo'
-    with pytest.raises(ValueError, match='DIL'):
-        parse_args(argv + ['--stage2_stop_after_checkpoint', '2'])
+    argv[argv.index('--step_preference_beta') + 1] = '10'
+    argv[argv.index('--max_steps') + 1] = '212'
+    args = parse_args(argv + [
+        '--stage2_total_steps', '212', '--ce_weight', '0.1',
+        '--step_preference_margin', '0.5', '--stage2_stop_after_checkpoint', '2',
+    ])
+    assert args.stage2_stop_after_checkpoint == 2
+    assert args.max_steps == args.step_preference_config.phase_steps == 212
+    assert args.ce_weight == 0.1
+    assert args.step_preference_beta == 10
+    assert args.step_preference_margin == 0.5
 
 
-def tiny_trainer(output, stop=None):
+def tiny_trainer(output, stop=None, kind='dil_bce_rf'):
     torch.manual_seed(42)
+    config = bce_config()
+    if kind == 'dpo':
+        config = replace(config, preference_loss_type='dpo', beta=10.,
+                         preference_margin=.5, lambda_ce=.1)
     trainer = Stage2Trainer(
         model=tiny_stage2_qwen(),
         args=TrainingArguments(output_dir=str(output), use_cpu=True, report_to=[],
             max_steps=3, per_device_train_batch_size=1, learning_rate=.01,
             save_steps=3, save_total_limit=1, disable_tqdm=True, logging_steps=1),
         train_dataset=[{'input_ids': torch.tensor([index])} for index in range(6)],
-        step_preference_config=bce_config(),
+        step_preference_config=config,
         **({'stage2_stop_after_checkpoint': stop} if stop is not None else {}),
     )
     trainer.model.config.supervise_latent_boundaries = True
@@ -72,10 +90,11 @@ def tiny_trainer(output, stop=None):
     return trainer, seen
 
 
-def test_actual_trainer_saves_before_normal_stop_then_restores_and_updates(tmp_path):
+@pytest.mark.parametrize('kind', ['dil_bce_rf', 'dpo'])
+def test_actual_trainer_saves_before_normal_stop_then_restores_and_updates(tmp_path, kind):
     # Missing callback, stop-before-save, rewritten max_steps, or skipped restore
     # each breaks this witness. All fixture model state is under checkpoints/.
-    trainer, seen = tiny_trainer(tmp_path / 'split', 2)
+    trainer, seen = tiny_trainer(tmp_path / 'split', 2, kind)
     saved_events = []
     class Persisted(TrainerCallback):
         def on_save(self, args, state, control, **kwargs):
@@ -95,7 +114,7 @@ def test_actual_trainer_saves_before_normal_stop_then_restores_and_updates(tmp_p
     saved_scheduler = torch.load(checkpoint / 'scheduler.pt', weights_only=False)
     before = trainer.model.get_input_embeddings().weight.detach().clone()
 
-    resumed, continued = tiny_trainer(tmp_path / 'split')
+    resumed, continued = tiny_trainer(tmp_path / 'split', kind=kind)
     restored = []
     load_optimizer = resumed._load_optimizer_and_scheduler
     def observe_optimizer(path):
@@ -119,7 +138,7 @@ def test_actual_trainer_saves_before_normal_stop_then_restores_and_updates(tmp_p
     assert resumed.state.global_step == resumed.state.max_steps == 3
     assert len(continued) == 1
     assert not torch.equal(resumed.model.get_input_embeddings().weight, before)
-    full, full_seen = tiny_trainer(tmp_path / 'full')
+    full, full_seen = tiny_trainer(tmp_path / 'full', kind=kind)
     full.train()
     assert seen + continued == full_seen
     torch.testing.assert_close(resumed.model.get_input_embeddings().weight, full.model.get_input_embeddings().weight, rtol=0, atol=0)
