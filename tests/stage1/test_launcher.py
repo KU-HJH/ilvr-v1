@@ -164,7 +164,7 @@ def assert_four_rank_prefix(tokens, rank, port):
         "--num_machines": "2",
         "--num_processes": "4",
         "--machine_rank": str(rank),
-        "--main_process_ip": "10.1.102.41",
+        "--main_process_ip": "172.16.11.41",
         "--main_process_port": str(port),
     }
     for flag, value in expected.items():
@@ -179,9 +179,9 @@ def test_stage1_multinode_dry_run_emits_rank_one_four_process_command(tmp_path):
             "ILVR_NUM_MACHINES": "2",
             "ILVR_NUM_PROCESSES": "4",
             "ILVR_MACHINE_RANK": "1",
-            "ILVR_MAIN_PROCESS_IP": "10.1.102.41",
+            "ILVR_MAIN_PROCESS_IP": "172.16.11.41",
             "ILVR_MAIN_PROCESS_PORT": "29621",
-            "ILVR_SOCKET_IFNAME": "bond1.102",
+            "ILVR_SOCKET_IFNAME": "bond0.11",
         }
     )
 
@@ -230,7 +230,16 @@ def fake_accelerate_environment(tmp_path):
     source_dir = copied_repo / "src"
     source_dir.mkdir()
     for name in ("artifact_paths.py", "deepspeed_runtime.py"):
-        (source_dir / name).write_bytes((REPO_ROOT / "src" / name).read_bytes())
+        source = (REPO_ROOT / "src" / name).read_text(encoding="utf-8")
+        if name == "artifact_paths.py":
+            assignment = 'CANONICAL_CHECKPOINT_ROOT = CANONICAL_REPOSITORY_ROOT / "checkpoints"'
+            assert assignment in source
+            source = source.replace(
+                assignment,
+                f"CANONICAL_CHECKPOINT_ROOT = Path({str(copied_repo / 'checkpoints')!r})",
+                1,
+            )
+        (source_dir / name).write_text(source, encoding="utf-8")
     bin_dir = copied_repo / "venv/ilvr-venv/bin"
     bin_dir.mkdir(parents=True)
     log_path = tmp_path / "accelerate argv.log"
@@ -286,7 +295,16 @@ def live_import_worker_environment(tmp_path):
     source_dir = copied_repo / "src"
     source_dir.mkdir()
     for name in ("artifact_paths.py", "deepspeed_runtime.py"):
-        (source_dir / name).write_bytes((REPO_ROOT / "src" / name).read_bytes())
+        source = (REPO_ROOT / "src" / name).read_text(encoding="utf-8")
+        if name == "artifact_paths.py":
+            assignment = 'CANONICAL_CHECKPOINT_ROOT = CANONICAL_REPOSITORY_ROOT / "checkpoints"'
+            assert assignment in source
+            source = source.replace(
+                assignment,
+                f"CANONICAL_CHECKPOINT_ROOT = Path({str(copied_repo / 'checkpoints')!r})",
+                1,
+            )
+        (source_dir / name).write_text(source, encoding="utf-8")
     (source_dir / "main.py").write_text(
         """import json
 import os
@@ -348,7 +366,8 @@ def test_dora_dry_run_emits_exact_safe_two_process_command_without_mutation(tmp_
     assert not output.exists()
     assert not (REPO_ROOT / "SHOULD_NOT_EXIST").exists()
     command = shlex.split(completed.stdout.strip())
-    assert command[:7] == [
+    assert command[:8] == [
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
         str(REPO_ROOT / "venv/ilvr-venv/bin/accelerate"),
         "launch",
         "--num_processes",
@@ -582,7 +601,11 @@ def test_timed_manifest_is_loaded_without_shell_evaluating_paths(tmp_path):
 
     assert completed.returncode == 0, completed.stderr
     command = shlex.split(completed.stdout)
-    assert command[0] == str(REPO_ROOT / "venv/ilvr-venv/bin/accelerate")
+    assert command[:3] == [
+        str(REPO_ROOT / "venv/ilvr-venv/bin/python"),
+        str(REPO_ROOT / "venv/ilvr-venv/bin/accelerate"),
+        "launch",
+    ]
     assert command[command.index("--model") + 1] == "model path;literal"
     assert command[command.index("--save_model_path") + 1] == str(output)
     assert command[command.index("--per_device_train_batch_size") + 1] == "16"
@@ -620,6 +643,7 @@ def test_live_launcher_refuses_nonempty_output_without_explicit_resume(tmp_path)
     output.mkdir()
     (output / "evidence.txt").write_text("owned", encoding="utf-8")
     env, accelerate_log, wrong_log, launcher = fake_accelerate_environment(tmp_path)
+    assert not output.resolve().is_relative_to((launcher.parent / "checkpoints").resolve())
 
     refused = run_launcher(
         launcher, *live_args(tmp_path, output), env=env
@@ -637,6 +661,7 @@ def test_live_launcher_rejects_noncanonical_resume_output(tmp_path):
     checkpoint = output / "checkpoint-7"
     checkpoint.mkdir(parents=True)
     env, accelerate_log, wrong_log, launcher = fake_accelerate_environment(tmp_path)
+    assert not output.resolve().is_relative_to((launcher.parent / "checkpoints").resolve())
     env["PYTHON_EXEC"] = "/wrong/hjh-venv/bin/python"
 
     resumed = run_launcher(
@@ -658,6 +683,9 @@ def test_live_worker_rejects_noncanonical_output_before_dispatch(tmp_path):
 
     environment, worker_log, launcher, copied_repo = live_import_worker_environment(
         tmp_path
+    )
+    assert not (tmp_path / "worker output").resolve().is_relative_to(
+        (copied_repo / "checkpoints").resolve()
     )
     completed = run_launcher(
         launcher,
@@ -689,6 +717,7 @@ def test_live_launcher_rejects_symlink_output_before_dispatch(
     output = experiment_root / "linked output"
     output.symlink_to(target, target_is_directory=True)
     env, accelerate_log, wrong_log, launcher = fake_accelerate_environment(tmp_path)
+    assert not output.resolve().is_relative_to((launcher.parent / "checkpoints").resolve())
 
     completed = run_launcher(
         launcher, *live_args(tmp_path, output), env=env

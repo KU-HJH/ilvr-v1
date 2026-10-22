@@ -25,10 +25,12 @@ if TYPE_CHECKING:
     from src.multinode import LaunchPlan
 
 
-_REMOTE_HOST = "korea@10.1.102.41"
-_REMOTE_CONTAINER = "llm_kd"
+_REMOTE_HOST = "korea@172.16.11.41"
+_REMOTE_CONTAINER = "llm_kd_rdma"
 _REQUIRED_FREE_BYTES = 100 * 1024**3
-_REPOSITORY_ROOT = Path("/root/workspace/ILVR")
+_REPOSITORY_ROOT = Path(
+    "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022"
+)
 _CHECKPOINT_ROOT = _REPOSITORY_ROOT / "checkpoints"
 _EVALUATION_STAGING_ROOT = CANONICAL_EVALUATION_STAGING_ROOT
 _RESULT_ROOT = _REPOSITORY_ROOT / "results"
@@ -47,10 +49,19 @@ _MINIMAL_EXEC_ENVIRONMENT = {
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
     "PATH": (
-        "/root/workspace/ILVR/venv/ilvr-venv/bin:"
+        f"{_REPOSITORY_ROOT}/venv/ilvr-venv/bin:"
         "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
     ),
     "PYTHONUNBUFFERED": "1",
+}
+_STAGE1_FIXED_EXEC_ENVIRONMENT = {
+    "NCCL_NET": "IB",
+    "NCCL_IB_DISABLE": "0",
+    "NCCL_IB_HCA": "mlx5_0:1",
+    "NCCL_SOCKET_IFNAME": "bond0.11",
+    "GLOO_SOCKET_IFNAME": "bond0.11",
+    "NCCL_DEBUG": "INFO",
+    "NCCL_DEBUG_SUBSYS": "INIT,NET",
 }
 _STAGE2_FIXED_EXEC_ENVIRONMENT = {
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
@@ -601,7 +612,7 @@ def owned_listener_is_ready(
     expected_owner_start_ticks: int | None = None,
 ) -> bool:
     """Prove that the requested LISTEN socket belongs to the owned process tree."""
-    if master_addr != "10.1.102.41":
+    if master_addr != "172.16.11.41":
         raise ValueError("readiness master address must match the fixed topology")
     listening = _listening_socket_inodes(
         master_addr=master_addr, port=port, proc_root=proc_root
@@ -1603,7 +1614,7 @@ def build_owned_tmux_commands(
     if plan.stage == "stage1":
         if supplied_environment:
             raise ValueError("Stage 1 does not accept coordinator environment overrides")
-        base_environment: dict[str, str] = {}
+        base_environment: dict[str, str] = dict(_STAGE1_FIXED_EXEC_ENVIRONMENT)
         forwarded = validate_stage1_arguments(stage_arguments)
         stage_owned_arguments: tuple[str, ...] = ()
         finite_loss_evidence_path = (
@@ -3792,7 +3803,7 @@ def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot) -> PreflightRe
     for node in (remote, local):
         _validate_snapshot(node)
     if remote.container_running is not True:
-        raise ValueError("remote llm_kd container is not running")
+        raise ValueError("remote llm_kd_rdma container is not running")
     return PreflightReport(commit=remote.commit, world_size=4)
 
 
@@ -3811,8 +3822,8 @@ def _validate_snapshot(node: NodeSnapshot) -> None:
         raise ValueError(f"{node.node}: exactly two GPUs are required")
     if any("H100" not in name for name in node.gpu_names):
         raise ValueError(f"{node.node}: H100 GPUs are required")
-    if node.interface != "bond1.102":
-        raise ValueError(f"{node.node}: bond1.102 interface is required")
+    if node.interface != "bond0.11":
+        raise ValueError(f"{node.node}: bond0.11 interface is required")
     if not node.input_paths_ok:
         raise ValueError(f"{node.node}: input paths are missing")
     if not node.artifact_roots_writable:

@@ -49,7 +49,9 @@ _CAPACITY_MARKERS = (
 )
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _MAX_EVIDENCE_BYTES = 256 * 1024
-_REPOSITORY_ROOT = Path("/root/workspace/ILVR")
+_REPOSITORY_ROOT = Path(
+    "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022"
+)
 _RESULT_ROOT = _REPOSITORY_ROOT / "results"
 _LOG_ROOT = _REPOSITORY_ROOT / "logs" / "multinode"
 _STAGE_LOG_ROOT = _REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
@@ -529,7 +531,7 @@ def _decode_training_witness(
         "attempt_id": "initial",
         "stage": "stage1",
         "method": tuning_method,
-        "checkpoint_path": f"/root/workspace/ILVR/checkpoints/{child_run_id}",
+        "checkpoint_path": str(_REPOSITORY_ROOT / "checkpoints" / child_run_id),
     }
     if any(
         type(payload[name]) is not str or payload[name] != expected
@@ -832,7 +834,7 @@ def capacity_stage1_main(argv: Sequence[str]) -> int:
             result_root.relative_to(_RESULT_ROOT)
         except ValueError as error:
             raise ValueError(
-                "result_root must be inside /root/workspace/ILVR/results"
+                f"result_root must be inside {_REPOSITORY_ROOT / 'results'}"
             ) from error
         forwarded = validate_stage1_arguments(stage_arguments)
         runner = (

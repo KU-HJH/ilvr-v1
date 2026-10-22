@@ -848,15 +848,15 @@ def test_push_never_overwrites_and_is_scoped_to_the_run():
     assert "--from0" in command
     assert "--checksum" not in command
     assert command[command.index("--rsync-path") + 1] == (
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync"
     )
     assert command[-2] == (
-        "/root/workspace/ILVR/checkpoints/"
+        "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert command[-1] == (
-        "korea@10.1.102.41:"
-        "/root/workspace/ILVR/checkpoints/"
+        "korea@172.16.11.41:"
+        "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert not any("venv" in argument or "/data/" in argument for argument in command)
@@ -876,10 +876,10 @@ def test_pull_selects_only_local_process_ranks_and_common_metadata(tmp_path):
     assert {item.process_rank for item in selected} == {None, 0, 1, 2, 3}
     command = build_pull_command(combined, tmp_path / "checkpoint-copy")
     assert command[command.index("--rsync-path") + 1] == (
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync"
     )
     assert command[-2].startswith(
-        "korea@10.1.102.41:/root/workspace/ILVR/checkpoints/"
+        "korea@172.16.11.41:/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints/"
     )
     assert command[-1] == f"{tmp_path}/checkpoint-copy/"
     assert "--checksum" not in command
@@ -1173,7 +1173,7 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
         log_root=tmp_path / "logs",
         command_runner=fake_command,
     )
-    checkpoint = Path("/root/workspace/ILVR/checkpoints") / plan.run_id / "checkpoint-2"
+    checkpoint = Path("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints") / plan.run_id / "checkpoint-2"
 
     collected = collect_checkpoint_artifacts(
         runner,
@@ -1848,10 +1848,10 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
 
     assert mirror(manifest, destination) == manifest
 
-    python = "/root/workspace/ILVR/venv/ilvr-venv/bin/python"
+    python = "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/venv/ilvr-venv/bin/python"
     fixed_prefix = (
         "/usr/bin/env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
+        "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022:/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/src",
         python,
     )
     assert calls[0] == tuple(runtime_module.build_remote_exec(
@@ -1860,7 +1860,7 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
             "-m", "src.multinode", "prepare-inference-destination",
             "--destination", str(destination),
         ),
-        working_directory="/root/workspace/ILVR",
+        working_directory="/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022",
     ))
     files_path = (
         log_root / plan.run_id / plan.attempt_id
@@ -1879,7 +1879,7 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
             "-m", "src.multinode", "prepared-inference-show",
             "--model-dir", str(destination),
         ),
-        working_directory="/root/workspace/ILVR",
+        working_directory="/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022",
     ))
     names = set(files_path.read_bytes().split(b"\0")) - {b""}
     assert names == {
@@ -1934,7 +1934,7 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         calls.append(argv)
         if argv[0] == "/usr/bin/rsync":
             files_path = Path(argv[argv.index("--files-from") + 1])
-            if argv[-1].startswith("korea@10.1.102.41:"):
+            if argv[-1].startswith("korea@172.16.11.41:"):
                 return subprocess.CompletedProcess(
                     command, 0, stdout="", stderr=""
                 )

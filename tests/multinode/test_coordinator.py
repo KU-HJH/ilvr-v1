@@ -86,7 +86,7 @@ class FakeRunner:
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=8",
-            "korea@10.1.102.41",
+            "korea@172.16.11.41",
         )
         self.events.append("remote-tmux-start")
 
@@ -347,20 +347,24 @@ def test_tmux_commands_use_fixed_sessions_and_quote_shell_metacharacters():
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
-        "korea@10.1.102.41",
+        "korea@172.16.11.41",
     )
 
 
 def test_training_supervisors_import_from_the_canonical_repository():
     """Catches production rank 0 exiting before ownership from container cwd ``/``."""
     commands = build_owned_tmux_commands(plan(), commit="a" * 40)
-    repository = "/root/workspace/ILVR"
+    repository = "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022"
 
     for spec in commands.node_specs:
         environment = dict(spec.environment)
         assert environment["PYTHONPATH"] == f"{repository}:{repository}/src"
+        # The deployment root need not exist in an isolated development checkout.
+        # Assert the actual binding above, then map only filesystem access for import.
+        assert spec.command[0] == f"{repository}/venv/ilvr-venv/bin/python"
+        environment["PYTHONPATH"] = f"{REPO_ROOT}:{REPO_ROOT / 'src'}"
         completed = subprocess.run(
-            (*spec.command[:3], "--help"),
+            (str(REPO_ROOT / "venv/ilvr-venv/bin/python"), *spec.command[1:3], "--help"),
             cwd="/",
             env=environment,
             capture_output=True,
@@ -905,9 +909,9 @@ def test_stage2_forwards_only_allowlisted_environment_and_safe_arguments():
             "ILVR_MACHINE_RANK": "99",
             "UNRELATED_SECRET": "do-not-forward",
         },
-        output_dir="/root/workspace/ILVR/checkpoints/stage2-dora-zero3-four-gpu",
-        log_file="/root/workspace/ILVR/logs/zero-stage-compatibility/stage2-dora-zero3-four-gpu/train.log",
-        deepspeed_config="/root/workspace/ILVR/configs/deepspeed_zero3.json",
+        output_dir="/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints/stage2-dora-zero3-four-gpu",
+        log_file="/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/logs/zero-stage-compatibility/stage2-dora-zero3-four-gpu/train.log",
+        deepspeed_config="/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/configs/deepspeed_zero3.json",
     )
 
     assert environment["STAGE1_CHECKPOINT"] == "/models/stage1;literal"
@@ -924,7 +928,7 @@ def test_stage2_forwards_only_allowlisted_environment_and_safe_arguments():
     )
     effective = dict(commands.node_specs[0].environment)
     assert effective["PATH"].startswith(
-        "/root/workspace/ILVR/venv/ilvr-venv/bin:/usr/local/sbin:"
+        "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/venv/ilvr-venv/bin:/usr/local/sbin:"
     )
     assert effective["HOME"] == "/root"
     assert "UNRELATED_SECRET" not in effective
@@ -1000,7 +1004,7 @@ def test_stage2_coordinator_owns_a_fresh_producer_evidence_path():
 def test_ordinary_stage1_coordinator_owns_training_evidence_path_and_argv():
     launch_plan = plan(stage="stage1", method="full")
     producer = Path(
-        "/root/workspace/ILVR/results/stage1-full-zero3-four-gpu/"
+        "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/results/stage1-full-zero3-four-gpu/"
         "initial-producer-evidence.json"
     )
 
@@ -1342,10 +1346,33 @@ def test_wrapper_help_is_local_and_side_effect_free(wrapper, tmp_path):
 
 
 def test_stage1_wrapper_dry_run_builds_both_nodes_without_remote_calls(tmp_path):
+    # Execute the unchanged wrapper with source fixtures; bind only Git inspection
+    # to this checkout because the separate runtime checkout is not deployed yet.
+    fixture = tmp_path / "checkout"
+    fixture.mkdir()
+    (fixture / "venv").symlink_to(REPO_ROOT / "venv", target_is_directory=True)
+    (fixture / "src").mkdir()
+    for source in (REPO_ROOT / "src").iterdir():
+        if source.name == "__pycache__":
+            continue
+        target = fixture / "src" / source.name
+        if source.name == "multinode.py":
+            text = source.read_text()
+            start = text.index("def _repository_git_stdout(")
+            end = text.index("\ndef _interface_name(", start)
+            text = text[:start] + text[start:end].replace(
+                "_REPOSITORY_ROOT", f"Path({str(REPO_ROOT)!r})"
+            ) + text[end:]
+            target.write_text(text)
+        else:
+            target.symlink_to(source, target_is_directory=source.is_dir())
+    wrapper = fixture / "run_multinode_stage1_training.sh"
+    wrapper.write_bytes((REPO_ROOT / wrapper.name).read_bytes())
+    wrapper.chmod(0o755)
     marker = tmp_path / "DRY_RUN_INJECTION"
     completed = subprocess.run(
         (
-            REPO_ROOT / "run_multinode_stage1_training.sh",
+            wrapper,
             "--run-id",
             "stage1-lora-zero3-four-gpu",
             "--zero-stage",
@@ -1378,7 +1405,7 @@ def test_stage1_wrapper_dry_run_builds_both_nodes_without_remote_calls(tmp_path)
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
-        "korea@10.1.102.41",
+        "korea@172.16.11.41",
     ]
     assert payload["local"][:5] == [
         "/usr/bin/tmux",
@@ -1798,12 +1825,12 @@ def test_subprocess_runner_transfers_only_attempt_plan_with_size_and_sha(tmp_pat
         command_runner.calls, ("prepare-attempt", "receive-plan"), strict=True
     ):
         remote = shlex.split(call[0][6])
-        assert remote[remote.index("--workdir") + 1] == "/root/workspace/ILVR"
+        assert remote[remote.index("--workdir") + 1] == "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022"
         inner = shlex.split(remote[-1])
         assert inner[:6] == [
             "/usr/bin/env",
-            "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-            "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+            "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022:/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/src",
+            "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/venv/ilvr-venv/bin/python",
             "-m",
             "src.multinode",
             subcommand,
@@ -2066,12 +2093,12 @@ def test_owned_listener_rejects_foreign_socket_and_accepts_stable_pinned_descend
     )
 
     assert not owned_listener_is_ready(
-        owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
+        owner, master_addr="172.16.11.41", port=29631, proc_root=tmp_path
     )
     liveness.clear()
     (tmp_path / str(child) / "fd/7").symlink_to("socket:[44444]")
     assert owned_listener_is_ready(
-        owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
+        owner, master_addr="172.16.11.41", port=29631, proc_root=tmp_path
     )
     assert liveness == [(owner, 0), (child, 0)]
 
@@ -2122,7 +2149,7 @@ def test_owned_listener_rejects_descendant_pid_reuse_before_fd_verdict(
     monkeypatch.setattr(signal, "pidfd_send_signal", lambda *_args: None)
 
     assert not owned_listener_is_ready(
-        owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
+        owner, master_addr="172.16.11.41", port=29631, proc_root=tmp_path
     )
 
 

@@ -25,7 +25,7 @@ def snapshot(node, rank):
         machine_rank=rank,
         commit="a" * 40,
         tracked_clean=True,
-        repository=Path("/root/workspace/ILVR"),
+        repository=Path("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022"),
         container_running=True,
         python_version="3.11",
         torch_version="2.7.1+cu128",
@@ -33,7 +33,7 @@ def snapshot(node, rank):
         deepspeed_version="0.18.0",
         torchrun_ok=True,
         gpu_names=("NVIDIA H100 NVL", "NVIDIA H100 NVL"),
-        interface="bond1.102",
+        interface="bond0.11",
         input_paths_ok=True,
         artifact_roots_writable=True,
         artifact_free_bytes=500_000_000_000,
@@ -62,14 +62,14 @@ def test_stage2_peft_zero3_preflight_uses_dedicated_config_on_both_nodes():
     commands = build_preflight_commands(
         launch_plan,
         input_paths=("/input",),
-        artifact_roots=("/root/workspace/ILVR/checkpoints",),
-        remote_run_paths=("/root/workspace/ILVR/checkpoints/remote",),
-        local_run_paths=("/root/workspace/ILVR/checkpoints/local",),
+        artifact_roots=("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints",),
+        remote_run_paths=("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints/remote",),
+        local_run_paths=("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints/local",),
         remote_tmux_sessions=("ilvr-remote",),
         local_tmux_sessions=("ilvr-local",),
     )
 
-    expected = "/root/workspace/ILVR/configs/deepspeed_zero3_stage2_peft.json"
+    expected = "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/configs/deepspeed_zero3_stage2_peft.json"
     assert commands.local_node_info[
         commands.local_node_info.index("--deepspeed-config") + 1
     ] == expected
@@ -113,6 +113,7 @@ def test_stage2_peft_zero3_node_info_decodes_selected_policy(monkeypatch):
 def test_canonical_git_query_tolerates_different_repository_owner(monkeypatch):
     """Catches node-info omitting the canonical Git safe-directory argument."""
     monkeypatch.setenv("GIT_TEST_ASSUME_DIFFERENT_OWNER", "1")
+    monkeypatch.setattr(multinode, "_REPOSITORY_ROOT", Path(__file__).resolve().parents[2])
 
     commit = multinode._repository_git_stdout(("rev-parse", "HEAD"))
 
@@ -131,11 +132,11 @@ def test_preflight_rejects_commit_mismatch_before_launch():
     ("changes", "message"),
     [
         ({"tracked_clean": False}, "tracked files"),
-        ({"container_running": False}, "llm_kd"),
+        ({"container_running": False}, "llm_kd_rdma"),
         ({"torch_version": "2.7.0+cu126"}, "environment versions"),
         ({"gpu_names": ("NVIDIA H100 NVL",)}, "exactly two GPUs"),
         ({"gpu_names": ("NVIDIA A100", "NVIDIA A100")}, "H100"),
-        ({"interface": "eth0"}, "bond1.102"),
+        ({"interface": "eth0"}, "bond0.11"),
         ({"input_paths_ok": False}, "input paths"),
         ({"artifact_roots_writable": False}, "artifact roots"),
         ({"artifact_free_bytes": 1024}, "free space"),
@@ -182,11 +183,11 @@ def test_remote_exec_shell_quotes_each_argument():
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
-        "korea@10.1.102.41",
+        "korea@172.16.11.41",
     ]
     assert len(command) == 7
     remote = shlex.split(command[6])
-    assert remote[:3] == ["/usr/bin/docker", "exec", "llm_kd"]
+    assert remote[:3] == ["/usr/bin/docker", "exec", "llm_kd_rdma"]
     assert remote[3:5] == ["/usr/bin/bash", "-lc"]
     assert shlex.split(remote[5]) == ["python", "-c", "print('safe value')"]
 
@@ -218,7 +219,7 @@ def test_remote_collection_checks_container_then_parses_probe_json():
         "inspect",
         "--format",
         "{{.State.Running}}",
-        "llm_kd",
+        "llm_kd_rdma",
     ]
     assert calls[1][:6] == [
         "/usr/bin/ssh",
@@ -226,7 +227,7 @@ def test_remote_collection_checks_container_then_parses_probe_json():
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
-        "korea@10.1.102.41",
+        "korea@172.16.11.41",
     ]
     assert shlex.split(calls[1][6])[:2] == ["/usr/bin/docker", "exec"]
 
@@ -254,8 +255,8 @@ def test_local_collection_never_uses_ssh_or_docker():
     assert len(calls) == 1
     assert calls[0][:3] == [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022:/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/src",
+        "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/venv/ilvr-venv/bin/python",
     ]
     assert "/usr/bin/ssh" not in calls[0]
     assert "docker" not in calls[0]
@@ -290,8 +291,8 @@ def test_preflight_dry_run_prints_commands_without_probing(monkeypatch, capsys):
     assert payload["plan"]["world_size"] == 4
     assert payload["local_node_info"][:6] == [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022:/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/src",
+        "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/venv/ilvr-venv/bin/python",
         "-m",
         "src.multinode",
         "node-info",
@@ -328,14 +329,14 @@ def test_preflight_uses_each_node_repository_artifact_roots(monkeypatch, capsys)
 
     capsys.readouterr()
     assert calls[0]["artifact_roots"] == (
-        Path("/root/workspace/ILVR/checkpoints"),
-        Path("/root/workspace/ILVR/results"),
-        Path("/root/workspace/ILVR/logs"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/results"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/logs"),
     )
     assert calls[1]["artifact_roots"] == (
-        Path("/root/workspace/ILVR/checkpoints"),
-        Path("/root/workspace/ILVR/results"),
-        Path("/root/workspace/ILVR/logs"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/results"),
+        Path("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/logs"),
     )
 
 
@@ -352,17 +353,17 @@ def test_preflight_commands_use_the_canonical_repo_venv_and_config():
     commands = build_preflight_commands(
         plan(),
         input_paths=("/input",),
-        artifact_roots=("/root/workspace/ILVR/checkpoints",),
-        remote_run_paths=("/root/workspace/ILVR/checkpoints/fresh-remote",),
-        local_run_paths=("/root/workspace/ILVR/checkpoints/fresh-local",),
+        artifact_roots=("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints",),
+        remote_run_paths=("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints/fresh-remote",),
+        local_run_paths=("/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/checkpoints/fresh-local",),
         remote_tmux_sessions=("ilvr-remote",),
         local_tmux_sessions=("ilvr-local",),
     )
 
     expected_prefix = [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-        "/root/workspace/ILVR/venv/ilvr-venv/bin/python",
+        "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022:/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/src",
+        "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/venv/ilvr-venv/bin/python",
         "-m",
         "src.multinode",
         "node-info",
@@ -371,15 +372,15 @@ def test_preflight_commands_use_the_canonical_repo_venv_and_config():
     assert "--repository" in commands.local_node_info
     assert commands.local_node_info[
         commands.local_node_info.index("--repository") + 1
-    ] == "/root/workspace/ILVR"
+    ] == "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022"
     assert commands.local_node_info[
         commands.local_node_info.index("--deepspeed-config") + 1
-    ] == "/root/workspace/ILVR/configs/deepspeed_zero2.json"
+    ] == "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/configs/deepspeed_zero2.json"
     remote_docker = shlex.split(commands.remote_node_info[-1])
-    assert remote_docker[:3] == ["/usr/bin/docker", "exec", "llm_kd"]
+    assert remote_docker[:3] == ["/usr/bin/docker", "exec", "llm_kd_rdma"]
     assert shlex.split(remote_docker[-1])[:2] == [
         "env",
-        "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
+        "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022:/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/src",
     ]
 
 
@@ -431,8 +432,8 @@ def test_dry_run_prints_the_same_three_executable_commands(monkeypatch, capsys):
     payload = json.loads(capsys.readouterr().out)
     assert set(payload) == {"container_inspect", "local_node_info", "plan", "remote_node_info"}
     assert payload["local_node_info"][:6] == [
-        "env", "PYTHONPATH=/root/workspace/ILVR:/root/workspace/ILVR/src",
-        "/root/workspace/ILVR/venv/ilvr-venv/bin/python", "-m", "src.multinode", "node-info",
+        "env", "PYTHONPATH=/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022:/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/src",
+        "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022/venv/ilvr-venv/bin/python", "-m", "src.multinode", "node-info",
     ]
 
 

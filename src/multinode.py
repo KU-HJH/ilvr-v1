@@ -56,7 +56,9 @@ from src.multinode_runtime import (
 )
 
 
-_REPOSITORY_ROOT = Path("/root/workspace/ILVR")
+_REPOSITORY_ROOT = Path(
+    "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022"
+)
 _RUN_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{2,127}$")
 _TRAINING_REQUIRED_FREE_BYTES = 100 * 1024**3
 _ATTEMPT_TIMEOUT_SECONDS = 24 * 60 * 60
@@ -87,12 +89,15 @@ class ClusterSpec:
     @classmethod
     def default(cls) -> "ClusterSpec":
         return cls(
-            remote_host="korea@10.1.102.41",
-            remote_container="llm_kd",
+            remote_host="korea@172.16.11.41",
+            remote_container="llm_kd_rdma",
             remote_repo_root=_REPOSITORY_ROOT,
-            remote_host_repo_root=Path("/home/korea/Workspace/hjh/workspace/ILVR"),
-            master_addr="10.1.102.41",
-            socket_ifname="bond1.102",
+            remote_host_repo_root=Path(
+                "/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/"
+                "stage1-baseline-10ep-ib-20261022"
+            ),
+            master_addr="172.16.11.41",
+            socket_ifname="bond0.11",
         )
 
 
@@ -869,7 +874,7 @@ def _node_info(args: argparse.Namespace) -> NodeSnapshot:
     """Collect node-local evidence after validating the exact config bytes."""
     repository = Path(args.repository)
     if repository != _REPOSITORY_ROOT:
-        raise ValueError("node-info repository must be /root/workspace/ILVR")
+        raise ValueError(f"node-info repository must be {_REPOSITORY_ROOT}")
     expected_config = selected_deepspeed_config(
         args.stage, args.tuning_method, args.zero_stage
     )
@@ -972,13 +977,13 @@ def _repository_git_stdout(arguments: tuple[str, ...]) -> str:
 
 def _interface_name() -> str:
     completed = subprocess.run(
-        ("ip", "-o", "link", "show", "bond1.102"),
+        ("ip", "-o", "link", "show", "bond0.11"),
         capture_output=True,
         text=True,
         check=False,
         timeout=_CONTROL_TIMEOUT_SECONDS,
     )
-    return "bond1.102" if completed.returncode == 0 else ""
+    return "bond0.11" if completed.returncode == 0 else ""
 
 
 def _tmux_session_is_fresh(name: str) -> bool:
@@ -1669,7 +1674,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             result_root.relative_to(canonical_result_root)
         except ValueError as error:
             raise ValueError(
-                "result_root must be inside /root/workspace/ILVR/results"
+                f"result_root must be inside {_REPOSITORY_ROOT / 'results'}"
             ) from error
         forwarded = tuple(stage_arguments)
         if stage == "stage1":

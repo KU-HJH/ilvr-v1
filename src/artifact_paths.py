@@ -9,7 +9,7 @@ from typing import Literal
 
 
 CANONICAL_REPOSITORY_ROOT = Path(
-    "/root/workspace/ILVR"
+    "/root/workspace/ILVR/.worktrees/stage1-baseline-10ep-ib-20261022"
 )
 CANONICAL_CHECKPOINT_ROOT = CANONICAL_REPOSITORY_ROOT / "checkpoints"
 CANONICAL_EVALUATION_STAGING_ROOT = (
