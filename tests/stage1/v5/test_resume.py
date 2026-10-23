@@ -132,9 +132,10 @@ def test_current_source_binding_cannot_lose_its_query_contract():
         api().resolve_v5_query_resume(saved, {})
 
 
+@pytest.mark.parametrize('selection', ['all', 'clean'])
 @pytest.mark.parametrize(('mode', 'selector'), [
     ('legacy', 'last4'), ('adaptive', 'all'), ('adaptive', 'last4')])
-def test_runtime_contract_records_effective_topology_and_independent_query_semantics(tmp_path, mode, selector):
+def test_runtime_contract_records_effective_topology_and_independent_query_semantics(tmp_path, mode, selector, selection):
     from types import SimpleNamespace
     from torch.utils.data import DataLoader
     from peft_common import resolve_qwen2_5_vl_model
@@ -144,6 +145,9 @@ def test_runtime_contract_records_effective_topology_and_independent_query_seman
     from deepspeed_runtime import DeepSpeedRuntimeProfile
     from tests.stage1.v5.test_trainer import integrated_fixture
     trainer, *_ = integrated_fixture(tmp_path)
+    from dataclasses import replace
+    trainer.v5_config = replace(trainer.v5_config, selection=selection,
+        preference_entropy_top_percent=20 if selection == 'clean' else None)
     trainer.v5_reference_identity = V5ReferenceIdentity(1, 'a'*64, 'b'*64, 'c'*64, ('weight',))
     trainer.stage1_peft_metadata = SimpleNamespace(base_model_reference='original/tiny',
         requested_target_suffixes=DEFAULT_STAGE1_TARGET_SUFFIXES)
@@ -161,9 +165,11 @@ def test_runtime_contract_records_effective_topology_and_independent_query_seman
             trainer._build_v5_runtime_contract(loader)
         return
     saved = trainer._build_v5_runtime_contract(loader)
-    assert saved['schedule']['dil_denominator'] == 'actual_window_eligible_dil_tokens'
+    assert saved['schedule']['dil_denominator'] == ('actual_window_selected_dil_tokens'
+        if selection == 'clean' else 'actual_window_eligible_dil_tokens')
     assert saved['schedule']['auxiliary_denominator'] == 'actual_window_original_blocks_including_empty'
-    assert saved['semantics']['dil_sum_units'] == 'eligible_token_loss_sum'
+    assert saved['semantics']['dil_sum_units'] == ('selected_token_loss_sum'
+        if selection == 'clean' else 'eligible_token_loss_sum')
     assert saved['semantics']['auxiliary_sum_units'] == 'original_block_token_mean_sum'
     query = saved['execution']['query_config']
     assert query['mode'] == mode

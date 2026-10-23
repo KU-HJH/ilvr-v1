@@ -18,6 +18,42 @@ Read canonical `/root/workspace/ILVR/AGENTS.md`,
 approved Stage1-v5 run uses its explicit stage-specific profile and fresh
 original base, rather than the Stage2 initialization rule.
 
+## Clean selection training
+
+Fresh v5 training supports `all` and `clean`. With `--stage1-v5-selection clean
+--preference-entropy-top-percent 20`, rank eligible immediate-text targets per
+source sample across its original blocks by detached clean full-vocabulary
+entropy at T=1. Keep exactly ceil(N/5), with stable ties by original predictor
+position; empty samples keep zero. Other percentages use the exact decimal
+rational ceiling separately per sample. DIL, V-off top-k entropy and mass KL
+share this mask. CE/alignment and Text-off KL keep their existing targets and
+reductions.
+
+Clean DIL uses the global selected-token mean across actual microbatches and
+all ranks, including partial tails. Metadata determines its exact denominator
+without an extra forward. Entropy/mass keep their original-block denominator,
+including empty blocks. Native configured-GAS/rank reductions, backward and
+optimizer ownership are unchanged. Clean sidecars use schema3 with
+`global_actual_window_selected_dil_tokens_aux_original_blocks_v3`,
+`selected_token_loss_sum` and schedule denominator
+`actual_window_selected_dil_tokens`. All-token schema2 retains its original
+meaning; historical block-mean schema1 remains readable and cannot resume with
+the new objective. Selection, percentage, represented semantics and strict
+reference/execution/source bindings are checked on resume. `voff`, `gap` and
+`intersection` remain unsupported for training.
+
+Use the existing training-only `run_multinode_stage1_training.sh` coordinator
+with explicit clean-selection and epoch options for a clean20 ten-epoch run.
+The separate recipe below remains the one-exposure, all-token train/evaluate
+protocol; it does not select this experiment. Audit the actual loader and
+requested epoch budget before launching rather than assuming a fixed step count.
+For ten complete epoch checkpoints, pass `--save-strategy steps`,
+`--save-steps <audited-updates-per-epoch>` and `--save-total-limit 10`; retain
+final saving through the existing coordinator. Retention defaults to one when
+omitted. The worker/parser forwards this value to Trainer's existing checkpoint
+rotation; there is no separate retention mechanism. Save cadence and retention
+are execution CLI options, so repeat them explicitly on resume.
+
 ## Prepared execution
 
 Root must provision a distinct compatible remote checkout at the reviewed
@@ -33,7 +69,9 @@ Derive `max_steps` from the actual prepared loader using the Task7 audit. One
 exposure uses ceil(prepared per-rank microbatches / configured GAS4), including
 the final partial window. Do not substitute historical 431/212 or a guessed
 sample-count budget. Ordinary losses retain the configured global16 denominator;
-D/U/mass average over the actual window's original blocks, including empty ones.
+D averages over eligible tokens in the actual accumulation window for `all`;
+U/mass average their per-block token means over all original blocks, including
+empty ones.
 The runtime sidecar records and checks the actual schedule and execution profile.
 
 The recipe is fresh-run only. `--settings FILE` optionally sources existing

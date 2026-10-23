@@ -247,13 +247,19 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, 
     return trainer,batch,calls,forwards,backward_events,values
 
 
-def test_actual_four_calls_one_parent_backward_native_update_and_reference_owned_inputs(tmp_path):
+@pytest.mark.parametrize('selection', ['all', 'clean'])
+def test_actual_four_calls_one_parent_backward_native_update_and_reference_owned_inputs(tmp_path, selection):
     trainer,batch,calls,forwards,backs,values=integrated_fixture(tmp_path)
+    if selection == 'clean':
+        from dataclasses import replace
+        trainer.v5_config=replace(trainer.v5_config,selection='clean',
+            preference_entropy_top_percent=20,lambda_topk_mass=.05)
     before=digest_state(trainer.ema_teacher.model)
     identities=tuple(id(p) for p in trainer.model.parameters())
     batches,_=trainer.get_batch_samples(iter([batch]),4)
     assert batches[0]['stage1_v5_window'].global_original_steps==2
     assert batches[0]['stage1_v5_window'].actual_microbatches==1
+    assert batches[0]['stage1_v5_window'].global_dil_tokens == (2 if selection == 'clean' else 8)
     loss=trainer.training_step(trainer.model,batches[0])
     assert torch.isfinite(loss)
     assert calls==['helper','F','reference','packed']
@@ -266,7 +272,9 @@ def test_actual_four_calls_one_parent_backward_native_update_and_reference_owned
     expected=(.1*diagnostics['ce_loss']+.1*diagnostics['alignment_loss']+
         diagnostics['dil_scale']*diagnostics['dil_raw_sum']+
         diagnostics['auxiliary_scale']*.1*diagnostics['topk_entropy_raw_sum']+
+        diagnostics['auxiliary_scale']*trainer.v5_config.lambda_topk_mass*diagnostics['topk_mass_raw_sum']+
         .01*diagnostics['text_kl_raw'])/4
+    assert diagnostics['selected_tokens'].item() == (2 if selection == 'clean' else 8)
     torch.testing.assert_close(loss,expected)
     assert any(e['phase']=='recompute' for e in backs[0].events)
     updates=[]
@@ -278,8 +286,12 @@ def test_actual_four_calls_one_parent_backward_native_update_and_reference_owned
     assert trainer._v5_step_stack is None
 
 
-def test_empty_original_blocks_count_but_skip_reference_and_packed(tmp_path):
+@pytest.mark.parametrize('selection', ['all', 'clean'])
+def test_empty_original_blocks_count_but_skip_reference_and_packed(tmp_path, selection):
     trainer,batch,calls,_,backs,_=integrated_fixture(tmp_path,empty=True)
+    if selection == 'clean':
+        from dataclasses import replace
+        trainer.v5_config=replace(trainer.v5_config,selection='clean',preference_entropy_top_percent=20)
     batches,_=trainer.get_batch_samples(iter([batch]),4)
     assert batches[0]['stage1_v5_window'].global_original_steps==2
     trainer.training_step(trainer.model,batches[0])
@@ -397,6 +409,7 @@ def test_get_batch_samples_reduces_original_blocks_once_even_empty_rank(tmp_path
         for rank,slots in enumerate(counts):
             reductions=[]
             trainer=Trainer.__new__(Trainer)
+            trainer.v5_config=Stage1V5Config()
             trainer.args=SimpleNamespace(average_tokens_across_devices=False,gradient_accumulation_steps=4)
             def reduce(value,**kw):
                 reductions.append(value.tolist())

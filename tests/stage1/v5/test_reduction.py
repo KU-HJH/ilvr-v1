@@ -135,6 +135,8 @@ def test_v5_parent_resume_keeps_source_positions_and_syncs_partial_tail(tmp_path
     from stage1.v5_trainer import CustomTrainerStage1V5
     from stage1.v5_metadata import V5BatchMetadata,V5Block
     trainer = CustomTrainerStage1V5.__new__(CustomTrainerStage1V5)
+    from stage1.v5_config import Stage1V5Config
+    trainer.v5_config = Stage1V5Config()
     trainer.args = TrainingArguments(str(tmp_path),use_cpu=True,per_device_train_batch_size=1,
         gradient_accumulation_steps=4,max_steps=6,report_to=[])
     from transformers.trainer_callback import TrainerState

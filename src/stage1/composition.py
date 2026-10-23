@@ -378,7 +378,7 @@ def build_stage1_training_arguments(args) -> SFTConfig:
         logging_steps=20,
         save_strategy=args.save_strategy,
         save_steps=args.save_steps,
-        save_total_limit=1,
+        save_total_limit=getattr(args, "save_total_limit", 1),
         optim="adamw_torch" if getattr(args, "use_cpu", False) else "adamw_torch_fused",
         bf16=not getattr(args, "use_cpu", False),
         use_cpu=bool(getattr(args, "use_cpu", False)),

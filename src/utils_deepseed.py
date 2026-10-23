@@ -128,6 +128,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--stage2b_preflight_only", action="store_true", help=argparse.SUPPRESS
     )
     parser.add_argument("--save_steps", type=int, default=612)
+    parser.add_argument("--save_total_limit", type=int, default=1)
     parser.add_argument("--compress_strategy", type=str, default='average', choices=['average'])
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--epochs", type=float, default=2)
@@ -264,6 +265,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         raise ValueError("per_device_train_batch_size must be at least 1")
     if args.gradient_accumulation_steps < 1:
         raise ValueError("gradient_accumulation_steps must be at least 1")
+    if args.save_total_limit < 1:
+        raise ValueError("save_total_limit must be at least 1")
     if args.stage2_diagnostics_interval < 0:
         raise ValueError("Stage 2 diagnostics interval must be non-negative")
     if args.stage == "stage1" and args.resume_from_checkpoint_path and args.ce_weight is None:

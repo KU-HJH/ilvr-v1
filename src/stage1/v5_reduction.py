@@ -21,7 +21,7 @@ class V5Window:
 
 def v5_dil_scale(window: V5Window) -> float:
     # Compensate the same native GAS division and rank averaging as auxiliaries,
-    # but use the eligible token count instead of original blocks.
+    # but use the configured mask's token count instead of original blocks.
     return (window.configured_gas * window.world_size / window.global_dil_tokens
             if window.global_dil_tokens else 0.)
 

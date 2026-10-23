@@ -5,6 +5,8 @@ from pathlib import Path
 import shlex
 import subprocess
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[3]
 REMOTE = Path('/root/workspace/ILVR/.worktrees/v5 managed')
 HOST = Path('/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/v5 managed')
@@ -60,28 +62,41 @@ def test_recipe_half_entropy_mass_reaches_both_worker_parsers_after_stale_settin
         assert args.seed == 42
 
 
-def test_managed_coordinator_generates_each_node_worker_and_preflight_paths():
+@pytest.mark.parametrize('selection', ['all', 'clean'])
+def test_managed_coordinator_generates_each_node_worker_and_preflight_paths(selection):
+    from utils_deepseed import parse_args
+    profile = list(PROFILE)
+    if selection == 'clean':
+        profile[profile.index('--stage1-v5-selection')+1] = 'clean'
+        profile[profile.index('--lambda-topk-mass')+1] = '.05'
+        profile += ['--preference-entropy-top-percent', '20', '--epochs', '10',
+                    '--save-strategy', 'steps', '--save-steps', '216', '--save-total-limit', '10']
     completed = subprocess.run([str(ROOT/'run_multinode_stage1_training.sh'),
         '--run-id','v5-command-test','--zero-stage','1','--main-process-port','29683',
         '--local-repo-root',str(ROOT),'--remote-repo-root',str(REMOTE),
         '--remote-host-repo-root',str(HOST),'--dry-run','--method','dora',
         '--model','/root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct',
         '--data-path',str(ROOT/'data/TRAIN.jsonl'),'--image-root',str(ROOT/'data/images_comt'),
-        *PROFILE], text=True,capture_output=True,env={**os.environ,"PYTHONDONTWRITEBYTECODE":"1"})
+        *profile], text=True,capture_output=True,env={**os.environ,"PYTHONDONTWRITEBYTECODE":"1"})
     assert completed.returncode == 0, completed.stderr
     value=json.loads(completed.stdout)
     assert value['plan']['world_size']==4
+    assert value['plan']['cluster']['remote_host']=='korea@172.16.11.41'
+    assert value['plan']['cluster']['master_addr']=='172.16.11.41'
+    assert value['plan']['cluster']['socket_ifname']=='bond0.11'
     assert value['plan']['cluster']['local_repo_root']==str(ROOT)
     from src.multinode import decode_launch_plan
     from src.multinode_runtime import build_owned_tmux_commands, build_preflight_commands
     plan=decode_launch_plan(json.dumps(value['plan']).encode())
     commands=build_owned_tmux_commands(plan,commit='a'*40,stage_arguments=[
         '--method','dora','--model','/original/base','--data-path',str(ROOT/'data/TRAIN.jsonl'),
-        '--image-root',str(ROOT/'data/images_comt'),*PROFILE])
+        '--image-root',str(ROOT/'data/images_comt'),*profile])
     assert [x.machine_rank for x in commands.node_specs]==[0,1]
     for spec,root in zip(commands.node_specs,(REMOTE,ROOT)):
         env=dict(spec.environment)
         assert env['ILVR_NUM_PROCESSES']=='4' and env['ILVR_NUM_MACHINES']=='2'
+        assert env['ILVR_MAIN_PROCESS_IP']=='172.16.11.41'
+        assert env['ILVR_SOCKET_IFNAME']=='bond0.11'
         assert str(root/'run_stage1_training.sh') in spec.command
         assert str(root/'data/TRAIN.jsonl') in spec.command
         assert spec.ownership_path.is_relative_to(root/'logs')
@@ -96,6 +111,16 @@ def test_managed_coordinator_generates_each_node_worker_and_preflight_paths():
         assert vals['lambda_topk_entropy']=='.1' and vals['preference_topk_k']=='50'
         assert vals['loss_chunk_positions']=='128'
         assert '--no-topk_include_gt' in worker
+        assert vals['main_process_ip']=='172.16.11.41'
+        args=parse_args(worker[worker.index('src/main.py')+1:])
+        assert args.stage1_v5_config.selection == selection
+        if selection == 'clean':
+            assert args.stage1_v5_config.preference_entropy_top_percent == 20
+            assert args.stage1_v5_config.lambda_topk_entropy == .1
+            assert args.stage1_v5_config.lambda_topk_mass == .05
+            assert args.epochs == 10
+            assert args.save_strategy == 'steps' and args.save_steps == 216
+            assert args.save_total_limit == 10
     pre=build_preflight_commands(plan,input_paths=(ROOT/'data/TRAIN.jsonl',),artifact_roots=(),remote_run_paths=(),local_run_paths=(),remote_tmux_sessions=(),local_tmux_sessions=())
     assert str(REMOTE/'data/TRAIN.jsonl') in pre.remote_node_info[-1]
     assert str(ROOT/'data/TRAIN.jsonl') in pre.local_node_info

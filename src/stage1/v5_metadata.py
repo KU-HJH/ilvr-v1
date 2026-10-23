@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from fractions import Fraction
+import math
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 import torch
 
 if TYPE_CHECKING:
     from .data import PreparedStage1Example
+    from .v5_config import Stage1V5Config
     from .types import Stage1BatchMetadata
 
 
@@ -62,6 +65,22 @@ class V5BatchMetadata:
     @property
     def query_keys(self) -> tuple[tuple[int, int], ...]:
         return tuple((b.batch_index, q) for b in self.blocks for q in b.query_positions)
+
+    def selected_token_count(self, config: Stage1V5Config) -> int:
+        """Count the deterministic cardinality of the sample-local training mask.
+
+        Clean ranking changes membership, never cardinality. Match the selector's
+        decimal rational exactly, rounding each sample before any window sum.
+        """
+        from .v5_config import validate_v5_training_config
+        validate_v5_training_config(config)
+        if config.selection == 'all':
+            return len(self.query_keys)
+        counts = {}
+        for block in self.blocks:
+            counts[block.batch_index] = counts.get(block.batch_index, 0) + len(block.target_ids)
+        fraction = Fraction(str(config.preference_entropy_top_percent)) / 100
+        return sum(math.ceil(count * fraction) for count in counts.values())
 
     @property
     def original_step_count(self) -> int:

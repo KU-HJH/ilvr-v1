@@ -84,11 +84,20 @@ TOKEN_WINDOWS = (
 )
 
 
+@pytest.mark.parametrize('selection', ['all', 'clean'])
 @pytest.mark.parametrize('counts', TOKEN_WINDOWS)
-def test_actual_parent_dispatch_matches_global_token_and_block_gradient(counts, tmp_path):
+def test_actual_parent_dispatch_matches_global_token_and_block_gradient(counts, tmp_path, selection):
     from stage1.v5_trainer import CustomTrainerStage1V5
     from stage1.v5_reduction import v5_dil_scale, v5_auxiliary_scale
-    tokens = sum(sum(blocks) for rank in counts for blocks in rank)
+    # Literal clean20 allocation in predictor-position order for these tied rows.
+    selected = {(2, 1): (1, 0), (0, 0): (0, 0), (1, 0): (1, 0),
+                (0, 2): (0, 1), (0, 1): (0, 1), (3, 0): (1, 0), (1, 1): (1, 0)}
+    oracle_counts = counts if selection == 'all' else tuple(
+        tuple(selected[lengths] for lengths in rank) for rank in counts)
+    tokens = sum(sum(blocks) for rank in oracle_counts for blocks in rank)
+    config = Stage1V5Config(text_kl_weight=0., lambda_topk_entropy=.2,
+        lambda_topk_mass=.3, preference_topk_k=2, selection=selection,
+        preference_entropy_top_percent=20 if selection == 'clean' else None)
     blocks = 2 * sum(map(len, counts))
     gradients, values, kwargs_seen = [], [], []
 
@@ -102,8 +111,6 @@ def test_actual_parent_dispatch_matches_global_token_and_block_gradient(counts, 
         clean = p * torch.tensor([.2, -.5, .8]).repeat(n, 1)
         ref = torch.tensor([.3, .6, -.4]).repeat(n, 1)
         off = p * torch.tensor([.6, -.2, .1]).repeat(n, 1)
-        config = Stage1V5Config(text_kl_weight=0., lambda_topk_entropy=.2,
-                               lambda_topk_mass=.3, preference_topk_k=2)
         return compute_v5_loss_sums(clean, ref, off, None, meta, config)
 
     for rank in counts:
@@ -111,6 +118,7 @@ def test_actual_parent_dispatch_matches_global_token_and_block_gradient(counts, 
         model = torch.nn.Linear(1, 1)
         model.weight = p
         trainer = CustomTrainerStage1V5.__new__(CustomTrainerStage1V5)
+        trainer.v5_config = config
         trainer.args = TrainingArguments(str(tmp_path), use_cpu=True,
             gradient_accumulation_steps=4, report_to=[])
         trainer.state = SimpleNamespace(global_step=0)
@@ -134,7 +142,8 @@ def test_actual_parent_dispatch_matches_global_token_and_block_gradient(counts, 
                 + v5_auxiliary_scale(w)*(.2*sums.entropy_sum + .3*sums.mass_sum))
         trainer.compute_loss = compute
         batches, _ = trainer.get_batch_samples(iter(batch_for(n) for n in rank), 4)
-        assert reductions == [([2*len(rank), sum(map(sum, rank))], {'reduction': 'sum'})]
+        local_oracle = rank if selection == 'all' else (selected[x] for x in rank)
+        assert reductions == [([2*len(rank), sum(map(sum, local_oracle))], {'reduction': 'sum'})]
         assert len({id(b['stage1_v5_window']) for b in batches}) == 1
         values.append(sum(Trainer.training_step(trainer, model, b) for b in batches))
         gradients.append(p.grad.clone())
@@ -143,7 +152,7 @@ def test_actual_parent_dispatch_matches_global_token_and_block_gradient(counts, 
     # Independent token formula and original-block support formulas. No product
     # objective or scales are used to construct this oracle.
     dil, aux = p*0, p*0
-    for rank in counts:
+    for rank in oracle_counts:
         for lengths in rank:
             for target, n in enumerate(lengths):
                 if not n: continue

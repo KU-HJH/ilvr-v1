@@ -75,7 +75,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 raise ValueError('missing v5 original-block metadata')
         counts = torch.tensor([
             sum(b['stage1_v5_metadata'].original_step_count for b in batches),
-            sum(len(b['stage1_v5_metadata'].query_keys) for b in batches),
+            sum(b['stage1_v5_metadata'].selected_token_count(self.v5_config) for b in batches),
         ], device=self.accelerator.device, dtype=torch.int64)
         totals = self.accelerator.reduce(counts, reduction='sum').tolist()
         window = V5Window(totals[0], len(batches), self.args.gradient_accumulation_steps,
@@ -245,7 +245,8 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 gas*self.accelerator.num_processes*self.args.per_device_train_batch_size)[1],
             final_window_microbatches=(microbatches-1)%gas+1 if microbatches else 0,
             tail_native_denominator='configured_gas_world_size',
-            dil_denominator='actual_window_eligible_dil_tokens',
+            dil_denominator=('actual_window_selected_dil_tokens' if self.v5_config.selection == 'clean'
+                             else 'actual_window_eligible_dil_tokens'),
             auxiliary_denominator='actual_window_original_blocks_including_empty')
         execution = {key:getattr(self.args,key) for key in (
             'per_device_train_batch_size','gradient_accumulation_steps','bf16','seed',

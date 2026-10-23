@@ -80,7 +80,7 @@ def test_new_schema_rejects_malformed_or_conflicting_reduction(tmp_path, mutatio
     with pytest.raises(ValueError): validate_v5_resume(saved, {})
 
 
-@pytest.mark.parametrize('selector', ['clean', 'voff', 'gap', 'intersection'])
+@pytest.mark.parametrize('selector', ['voff', 'gap', 'intersection'])
 def test_fresh_resolution_and_parser_reject_unsupported_token_selectors(selector):
     from utils_deepseed import parse_args
     with pytest.raises(ValueError, match='token.mean.*selection=all'):
@@ -107,7 +107,7 @@ def test_parser_rejects_old_training_before_model_loading(tmp_path, monkeypatch)
     assert calls == []
 
 
-@pytest.mark.parametrize('case', ['historical', 'clean', 'voff', 'gap', 'intersection'])
+@pytest.mark.parametrize('case', ['historical', 'voff', 'gap', 'intersection'])
 def test_direct_composition_rejects_before_any_model_or_processor_loader(tmp_path, monkeypatch, case):
     from deepspeed_runtime import bind_deepspeed_runtime_profile
     from stage1 import composition
@@ -142,3 +142,36 @@ def test_direct_composition_rejects_before_any_model_or_processor_loader(tmp_pat
         composition.build_stage1_training_components(args, dependencies=dependencies,
                                                      deepspeed_runtime_profile=profile)
     assert 'LOADER' not in calls
+
+
+@pytest.mark.parametrize('mutation', ['selection', 'percent', 'reduction', 'units', 'schema', 'denominator'])
+def test_clean_contract_roundtrips_and_rejects_changed_meaning(tmp_path, mutation):
+    import copy
+    from stage1.v5_resume import build_v5_contract
+    from stage1.v5_reference import V5ReferenceIdentity
+    config = resolve_v5_config({'selection': 'clean', 'preference_entropy_top_percent': 20,
+        'lambda_topk_entropy': .1, 'preference_topk_k': 50})
+    old = contract()
+    saved = build_v5_contract(config, V5ReferenceIdentity(**old['reference']),
+        **old['coefficients'], execution=old['execution'],
+        schedule={'dil_denominator': 'actual_window_selected_dil_tokens'})
+    assert saved['schema_version'] == 3
+    assert saved['semantics']['reduction'] == 'global_actual_window_selected_dil_tokens_aux_original_blocks_v3'
+    assert saved['semantics']['dil_sum_units'] == 'selected_token_loss_sum'
+    (tmp_path/'stage1_v5.json').write_text(json.dumps(saved))
+    assert load_v5_contract(tmp_path) == saved
+    assert validate_v5_resume(saved, {}) == config
+    if mutation in ('selection', 'percent'):
+        values = ({'selection': 'all'} if mutation == 'selection'
+                  else {'preference_entropy_top_percent': 50})
+        with pytest.raises(ValueError, match='conflict'):
+            validate_v5_resume(saved, values)
+        return
+    bad = copy.deepcopy(saved)
+    if mutation == 'reduction': bad['semantics']['reduction'] = old['semantics']['reduction']
+    elif mutation == 'units': bad['semantics']['dil_sum_units'] = 'eligible_token_loss_sum'
+    elif mutation == 'schema': bad['schema_version'] = 2
+    else: bad['schedule']['dil_denominator'] = 'actual_window_eligible_dil_tokens'
+    (tmp_path/'stage1_v5.json').write_text(json.dumps(bad))
+    with pytest.raises(ValueError): load_v5_contract(tmp_path)
+    with pytest.raises(ValueError): validate_v5_resume(bad, {})

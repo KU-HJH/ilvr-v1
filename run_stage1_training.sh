@@ -110,8 +110,8 @@ if [[ $ilvr_multinode == true ]]; then
     [[ $ilvr_num_machines == 2 ]] || { printf 'error: ILVR_NUM_MACHINES must be exactly 2\n' >&2; exit 2; }
     [[ $ilvr_num_processes == 4 ]] || { printf 'error: ILVR_NUM_PROCESSES must be exactly 4\n' >&2; exit 2; }
     [[ $ilvr_machine_rank == 0 || $ilvr_machine_rank == 1 ]] || { printf 'error: ILVR_MACHINE_RANK must be a machine rank of 0 or 1\n' >&2; exit 2; }
-    [[ $ilvr_main_process_ip == 10.1.102.41 ]] || { printf 'error: ILVR_MAIN_PROCESS_IP must be 10.1.102.41\n' >&2; exit 2; }
-    [[ $ilvr_socket_ifname == bond1.102 ]] || { printf 'error: ILVR_SOCKET_IFNAME must be interface bond1.102\n' >&2; exit 2; }
+    [[ $ilvr_main_process_ip == 172.16.11.41 ]] || { printf 'error: ILVR_MAIN_PROCESS_IP must be 172.16.11.41\n' >&2; exit 2; }
+    [[ $ilvr_socket_ifname == bond0.11 ]] || { printf 'error: ILVR_SOCKET_IFNAME must be interface bond0.11\n' >&2; exit 2; }
     if [[ ! $ilvr_main_process_port =~ ^[0-9]+$ ]] || \
         (( 10#$ilvr_main_process_port < 1024 || 10#$ilvr_main_process_port > 65535 )); then
         printf 'error: ILVR_MAIN_PROCESS_PORT must be an integer between 1024 and 65535\n' >&2
@@ -215,6 +215,10 @@ while (( $# )); do
         --attention-implementation) require_value "$@"; attention_implementation=$2; shift 2 ;;
         --save-strategy) require_value "$@"; save_strategy=$2; shift 2 ;;
         --save-steps) require_value "$@"; save_steps=$2; shift 2 ;;
+        --save-total-limit)
+            require_value "$@"
+            [[ $2 =~ ^[1-9][0-9]*$ ]] || { printf 'error: save_total_limit must be a positive integer\n' >&2; exit 2; }
+            extra_worker_arguments+=(--save_total_limit "$2"); shift 2 ;;
         --textual_states) require_value "$@"; textual_states=$2; shift 2 ;;
         --resume) require_value "$@"; resume_path=$2; shift 2 ;;
         --log-file) require_value "$@"; log_file=$2; shift 2 ;;

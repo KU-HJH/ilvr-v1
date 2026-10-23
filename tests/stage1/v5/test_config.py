@@ -135,9 +135,12 @@ def test_standard_and_stage2_keep_existing_defaults():
     assert (stage2.step_preference_beta, stage2.step_preference_margin) == (10., .5)
 
 
-def test_percentage_selection_is_historical_only_for_token_mean_training():
-    with pytest.raises(ValueError, match='token.mean.*selection=all'):
-        api().resolve_v5_config({'preference_entropy_top_percent': 50})
+def test_percentage_selection_resolves_clean_training():
+    resolved = api().resolve_v5_config({'preference_entropy_top_percent': 20,
+        'lambda_topk_entropy': .1, 'preference_topk_k': 50})
+    assert resolved.selection == 'clean'
+    assert resolved.preference_entropy_top_percent == 20
+    assert resolved.lambda_topk_mass == .05
     for values in ({'selection': 'all', 'preference_entropy_top_percent': 50},
                    {'selection': 'clean'}):
         with pytest.raises(ValueError):

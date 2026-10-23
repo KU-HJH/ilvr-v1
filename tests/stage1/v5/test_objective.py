@@ -112,9 +112,10 @@ def test_text_kl_t_squared_detaches_clean_and_averages_queries_per_valid_sample(
     assert ref.grad is None
 
 
-def test_same_percentile_mask_for_dil_entropy_mass_but_not_text_kl():
+@pytest.mark.parametrize('percent', [20, 50])
+def test_same_percentile_mask_for_dil_entropy_mass_but_not_text_kl(percent):
     clean, ref, off, text = fixture()
-    config = Stage1V5Config(selection='clean', preference_entropy_top_percent=50,
+    config = Stage1V5Config(selection='clean', preference_entropy_top_percent=percent,
         lambda_topk_entropy=.1, preference_topk_k=2, lambda_topk_mass=.2)
     # In sample0 position0 has higher full-vocab clean entropy; sample1 always retained.
     sums = compute(clean, ref, off, text, metadata(), config)

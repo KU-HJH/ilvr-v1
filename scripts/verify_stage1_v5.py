@@ -364,6 +364,7 @@ def tiny_engine_witness(directory, *, use_cpu=False, deepspeed=None):
             super().__init__(); self.p=torch.nn.Parameter(torch.tensor(.2))
         def forward(self,**kwargs): return self.p
     class WitnessTrainer(CustomTrainerStage1V5):
+        v5_config=config
         # Scalar engine fixture uses v5 schedule/prefetch with parent lifecycle;
         # production composition below owns Qwen/reference/PEFT-specific hooks.
         __init__=Trainer.__init__

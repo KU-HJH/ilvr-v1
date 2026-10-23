@@ -131,11 +131,11 @@ def resolve_v5_config(values: Mapping[str, object], *, saved: Mapping[str, objec
 
 
 def validate_v5_training_config(config: Stage1V5Config) -> None:
-    """Keep historical selector contracts readable without enabling new training."""
+    """Support metadata-countable masks while keeping historical selectors readable."""
     if not isinstance(config, Stage1V5Config):
         raise ValueError('v5 training requires Stage1V5Config')
-    if config.selection != 'all':
-        raise ValueError('Stage1-v5 token-mean training requires selection=all')
+    if config.selection not in ('all', 'clean'):
+        raise ValueError('Stage1-v5 token-mean training requires selection=all or clean')
 
 
 def v5_formula_id(config: Stage1V5Config) -> str:

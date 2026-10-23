@@ -28,7 +28,12 @@ _SEMANTICS_V2 = {
     'dil_sum_units': 'eligible_token_loss_sum',
     'auxiliary_sum_units': 'original_block_token_mean_sum',
 }
-_SCHEMA_SEMANTICS = {1: _SEMANTICS_V1, 2: _SEMANTICS_V2}
+_SEMANTICS_V3 = {
+    **_SEMANTICS_V2,
+    'reduction': 'global_actual_window_selected_dil_tokens_aux_original_blocks_v3',
+    'dil_sum_units': 'selected_token_loss_sum',
+}
+_SCHEMA_SEMANTICS = {1: _SEMANTICS_V1, 2: _SEMANTICS_V2, 3: _SEMANTICS_V3}
 
 
 def _json_copy(value):
@@ -58,7 +63,8 @@ def build_v5_contract(config, reference: V5ReferenceIdentity, *, ce_weight: floa
                       execution: Mapping[str, object]) -> dict:
     validate_v5_training_config(config)
     return _build_contract(config, reference, ce_weight=ce_weight, sim_weight=sim_weight,
-                           schedule=schedule, execution=execution, schema_version=2)
+                           schedule=schedule, execution=execution,
+                           schema_version=3 if config.selection == 'clean' else 2)
 
 
 def _build_contract(config, reference, *, ce_weight, sim_weight, schedule, execution,
@@ -73,6 +79,11 @@ def _build_contract(config, reference, *, ce_weight, sim_weight, schedule, execu
     if not isinstance(schedule, Mapping):
         raise ValueError('invalid v5 sampler schedule')
     _execution(execution)
+    if schema_version == 2 and config.selection != 'all':
+        raise ValueError('schema-2 v5 token mean requires selection=all; clean requires a fresh run')
+    if schema_version == 3 and (config.selection != 'clean' or
+            schedule.get('dil_denominator') != 'actual_window_selected_dil_tokens'):
+        raise ValueError('schema-3 v5 requires clean selection and selected-token schedule denominator')
     return _json_copy({'schema_version': schema_version, 'variant': 'v5', 'formula_id': v5_formula_id(config),
                        'config': asdict(config), 'coefficients': {'ce_weight': ce_weight, 'sim_weight': sim_weight},
                        'semantics': _SCHEMA_SEMANTICS[schema_version], 'reference': asdict(reference),
@@ -94,7 +105,7 @@ def _validate(saved: Mapping[str, object]) -> Stage1V5Config:
         raise ValueError('incomplete saved v5 objective')
     try:
         result = Stage1V5Config(**config)
-        if version == 2:
+        if version in (2, 3):
             validate_v5_training_config(result)
         reference = V5ReferenceIdentity(**saved['reference'])
         rebuilt = _build_contract(result, reference, **saved['coefficients'],
