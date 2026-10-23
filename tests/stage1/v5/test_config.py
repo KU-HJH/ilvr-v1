@@ -11,6 +11,35 @@ def api():
     return importlib.import_module('stage1.v5_config')
 
 
+@pytest.mark.parametrize('values, expected', [
+    ({}, 0.0),
+    ({'lambda_topk_entropy': .1, 'preference_topk_k': 50}, .05),
+    ({'lambda_topk_entropy': .4, 'step_preference_topk': 50}, .2),
+    ({'lambda_topk_entropy': .1, 'preference_topk_k': 50,
+      'step_preference_lambda_topk_mass': 0.0}, 0.0),
+    ({'lambda_topk_entropy': .1, 'preference_topk_k': 50,
+      'lambda_topk_mass': .3}, .3),
+])
+def test_fresh_mass_defaults_to_half_entropy_but_explicit_mass_wins(values, expected):
+    assert api().resolve_v5_config(values).lambda_topk_mass == expected
+
+
+@pytest.mark.parametrize('entropy', ['.1', None, True, float('nan'), float('inf'), -0.1])
+def test_omitted_mass_keeps_entropy_validation_errors(entropy):
+    with pytest.raises(ValueError, match='lambda_topk_entropy must be'):
+        api().resolve_v5_config({'lambda_topk_entropy': entropy, 'preference_topk_k': 50})
+
+
+def test_historical_zero_mass_resume_does_not_apply_fresh_default():
+    historical = api().Stage1V5Config(lambda_topk_entropy=.1, preference_topk_k=50)
+    saved = asdict(historical)
+    assert historical.lambda_topk_mass == 0.0
+    assert api().resolve_v5_config({}, saved=saved) == historical
+    assert api().resolve_v5_config({'lambda_topk_entropy': .1}, saved=saved) == historical
+    with pytest.raises(ValueError, match='conflicts with saved'):
+        api().resolve_v5_config({'lambda_topk_mass': .05}, saved=saved)
+
+
 def test_orig_alias_defaults_and_formula_identity():
     config = api().resolve_v5_config({'loss_type': 'dil-bce-orig'})
     assert config.loss_type == 'dil_bce_orig'

@@ -114,6 +114,9 @@ def resolve_v5_config(values: Mapping[str, object], *, saved: Mapping[str, objec
     """Resolve explicit inputs; omitted resume inputs inherit the saved objective."""
     explicit = _canonical_values(values)
     if saved is None:
+        if 'lambda_topk_mass' not in explicit:
+            explicit['lambda_topk_mass'] = 0.5 * _finite(
+                'lambda_topk_entropy', explicit.get('lambda_topk_entropy', 0.0))
         if explicit.get('preference_entropy_top_percent') is not None and 'selection' not in explicit:
             explicit['selection'] = 'clean'
         config = Stage1V5Config(**explicit)

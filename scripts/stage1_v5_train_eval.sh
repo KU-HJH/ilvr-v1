@@ -63,7 +63,7 @@ train=("$repo_root/run_multinode_stage1_training.sh" --run-id "$run_id" --zero-s
     --method dora --model "$base" --data-path "$repo_root/data/TRAIN.jsonl" --image-root "$repo_root/data/images_comt"
     --stage1-variant v5 --no-stage1-v5-debug --stage1-loss-type dil-bce-orig --ce-weight 0.1 --sim-weight 0.1
     --lambda-preference 1 --lambda-topk-entropy 0.1 --preference-topk-k 50 --preference-topk-mode independent
-    --no-topk-include-gt --lambda-topk-mass 0 --stage1-v5-selection all --stage1-v5-text-kl-weight 0.01
+    --no-topk-include-gt --stage1-v5-selection all --stage1-v5-text-kl-weight 0.01
     --loss-chunk-positions 128 --step-preference-beta 1 --step-preference-margin 0
     --micro-batch 1 --gradient-accumulation 4 --epochs 1 --max-steps "$max_steps" --learning-rate 5e-5
     --seed 42 --warm-up-steps 10 --ema-tau 1.0 --latent-size 8 --attention-implementation sdpa

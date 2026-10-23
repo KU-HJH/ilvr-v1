@@ -18,6 +18,48 @@ PROFILE = ['--stage1-variant','v5','--stage1-loss-type','dil-bce-orig',
     '--micro-batch','1','--gradient-accumulation','4','--seed','42',
     '--attention-implementation','sdpa','--max-steps','3']
 
+
+def test_recipe_half_entropy_mass_reaches_both_worker_parsers_after_stale_settings(tmp_path):
+    from utils_deepseed import parse_args
+    settings = tmp_path/'stale.sh'
+    settings.write_text('export STAGE1_CE_WEIGHT=1 CE_WEIGHT=1 STAGE1_GRADIENT_ACCUMULATION=2\n'
+                        'export STAGE1_SEED=123 STAGE1_MODEL=trained/previous\n')
+    environment = {**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'CUDA_VISIBLE_DEVICES': '',
+                   'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1'}
+    recipe = subprocess.run(['bash', str(ROOT/'scripts/stage1_v5_train_eval.sh'),
+        '--run-id', 'v5-half-mass-test', '--main-process-port', '29683',
+        '--remote-repo-root', str(REMOTE), '--remote-host-repo-root', str(HOST),
+        '--max-steps', '3', '--settings', str(settings), '--dry-run'],
+        cwd=ROOT, env=environment, text=True, capture_output=True)
+    assert recipe.returncode == 0, recipe.stderr
+    train = shlex.split(recipe.stdout.splitlines()[0])
+    coordinator = subprocess.run([*train, '--dry-run'], cwd=ROOT, env=environment,
+                                 text=True, capture_output=True)
+    assert coordinator.returncode == 0, coordinator.stderr
+    commands = json.loads(coordinator.stdout)
+    assert commands['plan']['world_size'] == 4
+    remote = shlex.split(shlex.split(commands['remote'][-1])[-1])
+    # Inspect the real emitted commands without executing SSH or node-run.
+    for rank, owned in ((0, remote), (1, commands['local'])):
+        cursor = owned.index('-i') + 2
+        worker_environment = {}
+        while '=' in owned[cursor] and not owned[cursor].startswith('--'):
+            name, value = owned[cursor].split('=', 1)
+            worker_environment[name] = value
+            cursor += 1
+        stage = owned[max(i for i, value in enumerate(owned) if value == '--')+1:]
+        worker = subprocess.run(['bash', str(ROOT/'run_stage1_training.sh'), *stage[2:], '--dry-run'],
+            cwd=ROOT, env={**environment, **worker_environment}, text=True, capture_output=True)
+        assert worker.returncode == 0, worker.stderr
+        argv = shlex.split(worker.stdout)
+        assert argv[argv.index('--machine_rank')+1] == str(rank)
+        args = parse_args(argv[argv.index('src/main.py')+1:])
+        assert args.stage1_v5_config.lambda_topk_entropy == .1
+        assert args.stage1_v5_config.lambda_topk_mass == .05
+        assert args.ce_weight == .1 and args.gradient_accumulation_steps == 4
+        assert args.seed == 42
+
+
 def test_managed_coordinator_generates_each_node_worker_and_preflight_paths():
     completed = subprocess.run([str(ROOT/'run_multinode_stage1_training.sh'),
         '--run-id','v5-command-test','--zero-stage','1','--main-process-port','29683',

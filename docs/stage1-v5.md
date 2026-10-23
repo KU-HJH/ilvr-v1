@@ -2,10 +2,15 @@
 
 The reviewed v5 path uses original Qwen2.5-VL-3B initialization and a frozen
 EMA1 reference. The selected objective is
-`0.1 CE + 0.1 alignment + 1 D + 0.1 U + 0.01 K`, with independent k50
-supports, no GT union, mass0, all eligible targets, beta1/margin0, Text T2,
+`0.1 CE + 0.1 alignment + 1 D + 0.1 U + 0.05 mass KL + 0.01 K`, with independent k50
+supports, no GT union, all eligible targets, beta1/margin0, Text T2,
 no KL warmup and exact chunk128 reductions. Standard Stage1 and Stage2 loss
 selectors retain their existing behavior.
+
+Fresh runs derive omitted `lambda_topk_mass` as half `lambda_topk_entropy`;
+omitted entropy means zero. The recipe's entropy0.1 therefore selects mass0.05.
+Explicit mass overrides, including zero, remain supported, and resumes retain
+their saved coefficients exactly.
 
 Read canonical `/root/workspace/ILVR/AGENTS.md`,
 `/root/workspace/ILVR/documents/training-defaults.md` and
