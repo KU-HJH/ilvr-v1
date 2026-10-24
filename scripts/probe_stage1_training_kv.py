@@ -237,6 +237,11 @@ def run_probe(args):
         report['runtime']['backend']=apply_backend(saved)
         model,teacher=restore_models(args.checkpoint,args.base,processor,saved,device=args.device)
         report['runtime']['constructed']=runtime_model_profile(model,teacher)
+        trained_adapter=report['runtime']['constructed'].get('nonzero_lora_B') is True
+        report['runtime']['trained_adapter_prerequisite']=dict(passed=trained_adapter,
+            criterion='at least one nonzero trained LoRA B tensor; sparse-row gradients do not satisfy this prerequisite')
+        if not trained_adapter:
+            raise ValueError('nonzero trained-adapter prerequisite failed: missing or zero LoRA B tensors')
         trainer=make_carrier(model,teacher,processor,saved)
         working={k:v.to(args.device) if isinstance(v,Tensor) else v for k,v in batch.items()}
         # The original selected sample's canonical ID defines source dropout. It is not the raw source string.

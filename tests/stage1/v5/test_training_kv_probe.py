@@ -684,3 +684,44 @@ def test_arm_identity_detects_frozen_parameter_mutation(tmp_path,owner):
     assert before[name]['sha256']!=after[name]['sha256']
     assert set(arm.evidence['trainable_inventory'])==set(arm.gradients)
     assert set(arm.evidence['trainable_inventory'])<student_names
+
+
+@pytest.mark.parametrize('zero_scope',['all_adapters','lora_B_only'])
+def test_cli_rejects_zero_trained_adapters_before_measurement(tmp_path,monkeypatch,zero_scope):
+    """Catches accepting nonzero sparse-row gradients as trained-adapter activity."""
+    from tests.stage1.v5.test_trainer import integrated_fixture
+    from stage1.v5_reference import V5ReferenceIdentity
+    from stage1.v5_resume import build_v5_contract
+    from stage1.equivalence import read_stage1_backend_settings
+    trainer,batch,*_=integrated_fixture(tmp_path/'fixture',debug=False)
+    trainer.model.train()
+    adapters={name:p for name,p in trainer.model.named_parameters() if 'lora_' in name}
+    assert len(adapters)==42
+    with torch.no_grad():
+        for name,p in adapters.items():
+            if zero_scope=='all_adapters' or 'lora_B' in name: p.zero_()
+    if zero_scope=='all_adapters': assert all(not p.count_nonzero() for p in adapters.values())
+    saved=build_v5_contract(trainer.v5_config,V5ReferenceIdentity(1,'a'*64,'b'*64,'c'*64,('selected',)),
+        ce_weight=.1,sim_weight=.1,schedule={},execution=dict(backend=read_stage1_backend_settings()))
+    artifact=tmp_path/'artifact'; artifact.mkdir(); (artifact/'trainer_state.json').write_text('{"global_step":648}')
+    monkeypatch.setattr(api(),'ROOT',tmp_path)
+    monkeypatch.setattr(api(),'prepare_inputs',lambda args:(None,batch,{'source_index':7},deepcopy(saved),{}))
+    monkeypatch.setattr(api(),'restore_models',lambda *a,**kw:(trainer.model,trainer.ema_teacher))
+    monkeypatch.setattr(api(),'make_carrier',lambda *a:trainer)
+    actual=api().four_passes
+    measurement_calls=[]
+    def measured(*a,**kw):
+        measurement_calls.append('four_passes')
+        return actual(*a,**kw)
+    monkeypatch.setattr(api(),'four_passes',measured)
+    args=argparse.Namespace(run_id='zero-adapters',prepare_only=True,device='cpu',checkpoint=str(artifact),base='substituted')
+    assert api().run_probe(args)['status']=='prepared'
+    args.prepare_only=False
+    report=api().run_probe(args)
+    assert measurement_calls==[]
+    assert report['status']=='incomplete' and report['arms']=={}
+    assert 'nonzero trained-adapter prerequisite' in report['reason']
+    assert report['runtime']['constructed']['nonzero_lora_B'] is False
+    assert report['runtime']['trained_adapter_prerequisite']['passed'] is False
+    saved_report=json.loads((tmp_path/'results/zero-adapters/report.json').read_text())
+    assert saved_report['status']=='incomplete' and saved_report['arms']=={}
