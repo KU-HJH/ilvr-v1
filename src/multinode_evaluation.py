@@ -224,7 +224,8 @@ def _validate_generation_config(
     from evaluation.numerics import validate_numerical_policy
     numerical_policy = validate_numerical_policy(value.get("numerical_policy", "historical"),
         protocol=evaluation_protocol, stage="stage1",
-        disable_latent_generation=value.get("disable_latent_generation", False))
+        disable_latent_generation=value.get("disable_latent_generation", False),
+        static_inference_cache=value.get("static_inference_cache", False))
     max_new_tokens = value["max_new_tokens"]
     max_sequence_length = value.get("max_sequence_length")
     repetition_penalty = value.get("repetition_penalty")
@@ -633,7 +634,8 @@ def merge_shards(
             from evaluation.numerics import validate_numerical_policy
             row_policy = validate_numerical_policy(row.get("numerical_policy", "historical"),
                 protocol="original" if original else "continuous", stage="stage1",
-                disable_latent_generation=(manifest.get("generation_config") or {}).get("disable_latent_generation", False))
+                disable_latent_generation=(manifest.get("generation_config") or {}).get("disable_latent_generation", False),
+                static_inference_cache=(manifest.get("generation_config") or {}).get("static_inference_cache", False))
             manifest_policy = (manifest.get("generation_config") or {}).get("numerical_policy", "historical")
             if row_policy != manifest_policy:
                 raise ValueError("numerical policy mismatch between row and manifest")

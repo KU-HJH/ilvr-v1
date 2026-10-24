@@ -571,7 +571,7 @@ def numerical_config(policy=None):
     return result
 
 
-@pytest.mark.parametrize('policy', ['tf32_off', 'full_accumulation', 'math_sdpa'])
+@pytest.mark.parametrize('policy', ['tf32_off', 'full_accumulation', 'math_sdpa', 'adapter_token_fp64', 'adapter_token_fp64_math_sdpa'])
 def test_merge_roundtrips_matching_numerical_policy(policy, tmp_path):
     rows = {i: dict(index=i, task_name='task', match=True, numerical_policy=policy) for i in range(4)}
     shards = _write_fake_shards(tmp_path, generation_configs=[numerical_config(policy)]*4, row_overrides=rows)
@@ -604,5 +604,29 @@ def test_merge_rejects_row_manifest_numerical_disagreement(row_policy, tmp_path)
     rows = {i: dict(index=i, task_name='task', match=True, numerical_policy='tf32_off') for i in range(4)}
     rows[2]['numerical_policy'] = row_policy
     shards = _write_fake_shards(tmp_path, generation_configs=[numerical_config('tf32_off')]*4, row_overrides=rows)
+    with pytest.raises(ValueError, match='numerical policy'):
+        _merge(tmp_path, shards, 4)
+
+
+@pytest.mark.parametrize('other', ['historical', 'full_accumulation', 'adapter_token_fp64_math_sdpa'])
+def test_merge_rejects_new_adapter_policy_mixing(other, tmp_path):
+    configs = [numerical_config(p) for p in ['adapter_token_fp64', other, 'adapter_token_fp64', 'adapter_token_fp64']]
+    shards = _write_fake_shards(tmp_path, generation_configs=configs)
+    with pytest.raises(ValueError):
+        _merge(tmp_path, shards, 4)
+
+
+@pytest.mark.parametrize('policy', ['adapter_token_fp64', 'adapter_token_fp64_math_sdpa'])
+def test_new_adapter_static_manifest_is_rejected(policy, tmp_path):
+    config = dict(numerical_config(policy), static_inference_cache=True, use_kv_cache=True)
+    with pytest.raises(ValueError):
+        _write_fake_shards(tmp_path, generation_configs=[config]*4)
+
+
+@pytest.mark.parametrize('row_policy', ['historical', 'adapter_token_fp64_math_sdpa'])
+def test_new_adapter_row_manifest_disagreement_is_rejected(row_policy, tmp_path):
+    rows = {i: dict(index=i, task_name='task', match=True, numerical_policy='adapter_token_fp64') for i in range(4)}
+    rows[2]['numerical_policy'] = row_policy
+    shards = _write_fake_shards(tmp_path, generation_configs=[numerical_config('adapter_token_fp64')]*4, row_overrides=rows)
     with pytest.raises(ValueError, match='numerical policy'):
         _merge(tmp_path, shards, 4)

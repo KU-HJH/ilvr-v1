@@ -67,7 +67,8 @@ from evaluation import original_scoring
 from evaluation.original_ilvr import (generate_original, load_original_model, execution_identity, config_resolution)
 from evaluation.protocol import resolve_protocol, resolve_options, validate_inference_options, validate_execution_identity
 from evaluation.numerics import (NUMERICAL_POLICIES, validate_numerical_policy,
-    numerical_policy_scope, observe_numerical_policy)
+    numerical_execution_scope, observe_numerical_policy)
+from evaluation.adapter_numerics import AdapterNumericsError, ADAPTER_TOKEN_FP64_POLICIES
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -385,7 +386,7 @@ def run_one_example(
     stage = getattr(qwen_model.config, "stage", None)
     evaluation_protocol = resolve_protocol(evaluation_protocol, stage)
     validate_numerical_policy(numerical_policy, protocol=evaluation_protocol, stage=stage,
-        disable_latent_generation=disable_latent_generation)
+        disable_latent_generation=disable_latent_generation, static_inference_cache=static_inference_cache)
     validate_inference_options(evaluation_protocol, stage,
         disable_latent_generation=disable_latent_generation, use_kv_cache=use_kv_cache,
         static_inference_cache=static_inference_cache)
@@ -455,10 +456,10 @@ def run_one_example(
         torch.cuda.synchronize(effective_device)
     start_time = time.perf_counter()
 
-    with numerical_policy_scope(numerical_policy), torch.inference_mode():
+    with numerical_execution_scope(numerical_policy, qwen_model) as execution, torch.inference_mode():
         numerical_metadata = ({"numerical_policy": numerical_policy,
             "numerical_observation": observe_numerical_policy(numerical_policy, qwen_model)}
-            if numerical_policy != "historical" else {})
+            if numerical_policy != "historical" and execution is None else {})
         if evaluation_protocol == "original":
             generation_result = generate_original(model, inputs, gen_kwargs, tokenizer=processor.tokenizer,
                 static_inference_cache=static_inference_cache)
@@ -490,6 +491,9 @@ def run_one_example(
                 return_latent_states=False,
             )
             out_ids = generation_result.sequences
+        if execution is not None:
+            numerical_metadata = {"numerical_policy": numerical_policy,
+                "numerical_observation": observe_numerical_policy(numerical_policy, qwen_model, execution=execution)}
 
     if torch.device(effective_device).type == "cuda":
         torch.cuda.synchronize(effective_device)
@@ -531,11 +535,11 @@ def publish_evaluation_runtime_identity(model, model_dir, output_path, *, evalua
         from step_preference.capacity_evidence import git_identity
         qwen = resolve_qwen2_5_vl_model(model)
         identity = validate_execution_identity(execution_identity(qwen, evaluation_protocol, generation_kwargs or {}))
-        with numerical_policy_scope(numerical_policy):
+        with numerical_execution_scope(numerical_policy, qwen) as execution:
             value = dict(schema_version=1, kind="numerical-policy-evaluation-runtime-identity",
                 git_commit=git_identity(), model_dir=str(Path(model_dir).resolve(strict=True)),
                 execution_identity=identity, numerical_policy=numerical_policy,
-                numerical_observation=observe_numerical_policy(numerical_policy, qwen))
+                numerical_observation=observe_numerical_policy(numerical_policy, qwen, execution=execution))
         with Path(output_path).open("x", encoding="utf-8") as stream:
             json.dump(value, stream, sort_keys=True, allow_nan=False)
             stream.write("\n")
@@ -608,10 +612,11 @@ def main():
     if numerical_policy != "historical":
         qwen = resolve_qwen2_5_vl_model(model)
         validate_numerical_policy(numerical_policy, protocol=protocol, stage=qwen.config.stage,
-            disable_latent_generation=getattr(args, "disable_latent_generation", False))
-        with numerical_policy_scope(numerical_policy):
+            disable_latent_generation=getattr(args, "disable_latent_generation", False),
+            static_inference_cache=getattr(args, "static_inference_cache", False))
+        with numerical_execution_scope(numerical_policy, qwen) as execution:
             numerical_metadata = dict(numerical_policy=numerical_policy,
-                numerical_observation=observe_numerical_policy(numerical_policy, qwen))
+                numerical_observation=observe_numerical_policy(numerical_policy, qwen, execution=execution))
     args.repetition_penalty, args.generation_limit_policy = resolve_options(protocol,args.repetition_penalty,getattr(args,"generation_limit_policy",None))
     if protocol == "original":
         validate_inference_options(protocol, resolve_qwen2_5_vl_model(model).config.stage,
@@ -746,6 +751,8 @@ def main():
                     "inference_time_sec": sample_infer_time,
                 })
 
+            if numerical_policy in ADAPTER_TOKEN_FP64_POLICIES:
+                results[-1]["numerical_observation"] = pred["numerical_observation"]
             if protocol == "original" and args.task_name != "vsp-spatial-planning-cot":
                 diagnostic_keys = ("prediction_parse_status","prediction_parse_detail","prediction_normalized","gold_parse_status","gold_parse_detail","gold_normalized","invalid_gold_reason")
                 results[-1]["corrected_scoring_diagnostic"] = {key:results[-1].pop(key) for key in diagnostic_keys}
@@ -759,6 +766,8 @@ def main():
                     f"{success/progress:.4f}"
                 )
 
+        except AdapterNumericsError:
+            raise
         except Exception as e:
             logging.error(f"[{i}] Evaluation failed: {e}")
             if protocol != "original":
@@ -814,7 +823,10 @@ def main():
           or getattr(args, "model_identity", None) is not None) else {}
     diagnostic_identity.update(numerical_metadata)
     for row in results:
+        row_observation = row.get("numerical_observation")
         row.update(diagnostic_identity)
+        if row_observation is not None:
+            row["numerical_observation"] = row_observation
         if actual_identity is not None:
             row["evaluation_protocol"] = protocol
 

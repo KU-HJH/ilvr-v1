@@ -155,3 +155,42 @@ def test_environment_observations_read_actual_process_controls(monkeypatch):
     monkeypatch.delenv('TORCH_ALLOW_TF32_CUBLAS_OVERRIDE', raising=False)
     assert numerics().observe_numerical_policy('historical')['environment_controls'] == {
         'NVIDIA_TF32_OVERRIDE': '0', 'TORCH_ALLOW_TF32_CUBLAS_OVERRIDE': None}
+
+
+@pytest.mark.parametrize('policy', ['adapter_token_fp64', 'adapter_token_fp64_math_sdpa'])
+def test_new_adapter_policy_controls_restore_medium_and_math(policy):
+    from tests.evaluation.test_adapter_numerics import tiny_dora
+    n = numerics()
+    assert hasattr(n, 'numerical_execution_scope'), 'shared adapter execution scope is missing'
+    torch.set_float32_matmul_precision('medium')
+    before = state()
+    model = tiny_dora()
+    with n.numerical_execution_scope(policy, model) as execution:
+        assert execution.snapshot()['token_calls'] == 0
+        assert state()[0:3] == ('highest', False, False)
+        if policy.endswith('math_sdpa'):
+            assert state()[3] == (True, False, False, False)
+        with torch.inference_mode():
+            model(torch.ones(1, 1, 4))
+        assert n.observe_numerical_policy(policy, execution=execution)['adapter_token_arithmetic']['token_calls'] == 2
+    assert state() == before
+    with pytest.raises(RuntimeError, match='body'):
+        with n.numerical_execution_scope(policy, model):
+            raise RuntimeError('body')
+    assert state() == before
+    assert 'adapter_token_arithmetic' not in n.observe_numerical_policy('full_accumulation')
+
+
+def test_execution_scope_rejects_incompatible_nesting_before_global_mutation():
+    from tests.evaluation.test_adapter_numerics import tiny_dora, bindings, assert_bindings
+    from evaluation.adapter_numerics import AdapterNumericsError
+    n, model = numerics(), tiny_dora()
+    saved = bindings(model)
+    with n.numerical_execution_scope('adapter_token_fp64', model):
+        before = state()
+        for other in ('historical', 'full_accumulation', 'adapter_token_fp64_math_sdpa'):
+            with pytest.raises(AdapterNumericsError):
+                with n.numerical_execution_scope(other, model):
+                    pass
+            assert state() == before
+    assert_bindings(saved)

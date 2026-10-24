@@ -418,3 +418,107 @@ def test_main_records_new_policy_runtime_and_row_identity(shards, tmp_path, monk
     if shards == 4:
         manifest = json.loads(Path(args.output_json_path+'.manifest.json').read_text())
         assert manifest['generation_config']['numerical_policy'] == 'tf32_off'
+
+
+def adapter_model():
+    from peft.tuners.lora.layer import Linear
+    model = tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage = 'stage1'
+    attention = model.model.layers[0].self_attn
+    attention.q_proj = Linear(attention.q_proj, 'default', r=2, lora_alpha=4, use_dora=True).eval()
+    with torch.no_grad():
+        attention.q_proj.lora_B['default'].weight.fill_(.1)
+    return model
+
+
+@pytest.mark.parametrize('cache', [False, True])
+@pytest.mark.parametrize('policy', ['adapter_token_fp64', 'adapter_token_fp64_math_sdpa'])
+def test_evaluator_observes_actual_fp64_after_generation_and_no_historical_leak(cache, policy, tmp_path, monkeypatch):
+    module = _import_entry_point('eval', monkeypatch)
+    from step_preference import capacity_evidence
+    monkeypatch.setattr(capacity_evidence, 'git_identity', lambda: 'a'*40)
+    model, processor = adapter_model(), FakeProcessor(include_visual_inputs=False)
+    runtime_path = tmp_path/'adapter-runtime.json'
+    module.publish_evaluation_runtime_identity(model, tmp_path, runtime_path, numerical_policy=policy)
+    runtime = json.loads(runtime_path.read_text())
+    assert runtime['numerical_observation']['adapter_token_arithmetic']['token_calls'] == 0
+    before = state()
+    kwargs = dict(max_new_tokens=2, repetition_penalty=1.05, temperature=0., top_p=1.)
+    result = module.run_one_example(model, processor, {'text_input': 'question'}, kwargs,
+        disable_latent_generation=True, use_kv_cache=cache, numerical_policy=policy)
+    arithmetic = result['numerical_observation']['adapter_token_arithmetic']
+    assert arithmetic['token_calls'] > 0
+    assert arithmetic['actual_operand_dtypes']['input'] == 'torch.float64'
+    assert result['numerical_policy'] == policy
+    assert state() == before
+    historical = module.run_one_example(model, processor, {'text_input': 'question'}, kwargs,
+        disable_latent_generation=True, use_kv_cache=cache)
+    assert 'numerical_observation' not in historical
+    assert 'forward' not in model.model.layers[0].self_attn.q_proj.lora_A['default'].__dict__
+
+
+@pytest.mark.parametrize('static', [False, True])
+def test_new_policy_rejects_static_or_unsupported_model_before_outputs(static, tmp_path, monkeypatch):
+    module = _import_entry_point('eval', monkeypatch)
+    args = policy_main_args(tmp_path, policy='adapter_token_fp64')
+    args.runtime_identity_path = None
+    args.static_inference_cache = static
+    args.use_kv_cache = static
+    monkeypatch.setattr(module, 'get_eval_args', lambda: args)
+    model = adapter_model() if static else tiny_stage2_qwen().eval()
+    model.config.stage = 'stage1'
+    monkeypatch.setattr(module, 'load_evaluation_artifacts', lambda **_kw: (model, FakeProcessor()))
+    with pytest.raises(ValueError):
+        module.main()
+    from pathlib import Path
+    assert not Path(args.output_json_path).exists()
+
+
+def test_role_error_is_fatal_before_success_summary(tmp_path, monkeypatch):
+    from evaluation.adapter_numerics import AdapterNumericsError
+    module = _import_entry_point('eval', monkeypatch)
+    args = policy_main_args(tmp_path, policy='adapter_token_fp64')
+    args.runtime_identity_path = None
+    monkeypatch.setattr(module, 'get_eval_args', lambda: args)
+    model = adapter_model()
+    a = model.model.layers[0].self_attn.q_proj.lora_A['default']
+    handle = a.register_forward_pre_hook(lambda _m, args: (torch.zeros_like(args[0]),) if args[0].ndim == 2 else None)
+    monkeypatch.setattr(module, 'load_evaluation_artifacts',
+        lambda **_kw: (model, FakeProcessor(include_visual_inputs=False)))
+    try:
+        with pytest.raises(AdapterNumericsError):
+            module.main()
+    finally:
+        handle.remove()
+    from pathlib import Path
+    path = Path(args.output_json_path)
+    assert not path.exists() or 'summary' not in path.read_text()
+
+
+@pytest.mark.parametrize('shards', [1, 4])
+@pytest.mark.parametrize('policy', ['adapter_token_fp64', 'adapter_token_fp64_math_sdpa'])
+def test_main_adapter_rows_keep_own_post_generation_interval(shards, policy, tmp_path, monkeypatch):
+    # Main must not overwrite each real row with its zero-call preflight snapshot.
+    from pathlib import Path
+    from step_preference import capacity_evidence
+    module = _import_entry_point('eval', monkeypatch)
+    monkeypatch.setattr(capacity_evidence, 'git_identity', lambda: 'a'*40)
+    args = policy_main_args(tmp_path, shards=shards, policy=policy)
+    data = Path(args.test_data_path)
+    data.write_text(data.read_text()*4)
+    model = adapter_model()
+    monkeypatch.setattr(module, 'get_eval_args', lambda: args)
+    monkeypatch.setattr(module, 'load_evaluation_artifacts',
+        lambda **_kw: (model, FakeProcessor(include_visual_inputs=False)))
+    assert module.main() == (0 if shards == 4 else None)
+    rows = [json.loads(line) for line in Path(args.output_json_path).read_text().splitlines()]
+    rows = [row for row in rows if not row.get('summary')]
+    assert len(rows) == (1 if shards == 4 else 4)
+    assert [row['numerical_observation']['adapter_token_arithmetic']['token_calls'] for row in rows] == [4]*len(rows)
+    assert all(row['numerical_observation']['adapter_token_arithmetic']['actual_operand_dtypes']['input'] == 'torch.float64' for row in rows)
+    runtime = json.loads(Path(args.runtime_identity_path).read_text())
+    assert runtime['numerical_observation']['adapter_token_arithmetic']['token_calls'] == 0
+    if shards == 4:
+        manifest = json.loads(Path(args.output_json_path+'.manifest.json').read_text())
+        assert manifest['generation_config']['numerical_policy'] == policy
+        assert 'adapter_token_arithmetic' not in manifest['generation_config']

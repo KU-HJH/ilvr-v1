@@ -13,13 +13,16 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
-from evaluation.numerics import (NUMERICAL_POLICIES, numerical_policy_scope,
+from evaluation.numerics import (NUMERICAL_POLICIES, numerical_policy_scope, numerical_execution_scope,
     observe_numerical_policy, validate_numerical_policy)
+from evaluation.adapter_numerics import (ADAPTER_TOKEN_FP64_POLICIES,
+    temporary_fp64_token_linear)
 
 
 MODEL = 'checkpoints/evaluation-staging/stage1-v5-mn-g16-e3-s648-20261014-150317/prepared-model'
 BASE = '/root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct'
 SOURCE = 'data/TEST-stage1-v5-static-cache-source12-20261015-r1.jsonl'
+FP64_BASELINE_REPORT = Path('results/kv-mlp-isolation-20261024T081537Z/probe-r1/report.json')
 PROFILE = dict(max_new_tokens=32, max_sequence_length=32768, repetition_penalty=1.05,
                temperature=0., top_p=1., generation_limit_policy='bounded')
 
@@ -88,8 +91,9 @@ class MLPComponents:
     Retain the actual outer operand for replay. Component values are private
     snapshots; JSON exposes summaries. No internal arithmetic is intercepted.
     """
-    def __init__(self, module, *, enabled=lambda: True):
+    def __init__(self, module, *, enabled=lambda: True, retain_adapter_operands=False):
         self.module, self.enabled = module, enabled
+        self.retain_adapter_operands = retain_adapter_operands
         self.stack = ExitStack()
         self.events = []
         self.operand = self.output = None
@@ -140,6 +144,8 @@ class MLPComponents:
         event = dict(component=component, adapter=adapter, role=role,
             role_evidence=evidence, start_order=self.order, operand=operand_layout(x),
             state=self.state(module), _operand=x)
+        if self.retain_adapter_operands and role == 'token' and component in ('lora_A', 'lora_B'):
+            event.update(_module=module, input_capture_sha256=tensor_record(x)['sha256'])
         self.order += 1
         self.events.append(event)
         self.pending.setdefault((component, adapter), []).append(event)
@@ -152,6 +158,8 @@ class MLPComponents:
         self.order += 1
         value = output if event['role'] != 'token' else output[..., -1:, :]
         event['_value'] = value.detach().clone()
+        if self.retain_adapter_operands and event['role'] == 'token' and component in ('lora_A', 'lora_B'):
+            event.update(_native_output=output, output_capture_sha256=tensor_record(output)['sha256'])
         if component == 'lora_A':
             event['_output'] = output
             self.last_a[adapter] = event
@@ -185,9 +193,12 @@ class MLPComponents:
     def __exit__(self, *exception):
         self.closed = True
         result = self.stack.__exit__(*exception)
-        # Only the original outer operand must remain live for exact-operand replay.
+        # Keep actual DoRA/A/B operands only for the opt-in precheck; the
+        # separate original outer reference remains available for outer replay.
         for event in self.events:
-            event.pop('_operand', None)
+            if not (self.retain_adapter_operands and event['role'] == 'token'
+                    and event['component'] in ('dora', 'lora_A', 'lora_B')):
+                event.pop('_operand', None)
             event.pop('_output', None)
         self.last_a.clear()
         return result
@@ -232,9 +243,9 @@ def compare_mlp_components(off, on, *, numerical_policy):
         report['reason'] = 'mutated retained operand or unequal/nonfinite actual newest inputs'
         return report
     for side, trace in (('off', off), ('on', on)):
-        with numerical_policy_scope(numerical_policy), torch.inference_mode():
-            observation = observe_numerical_policy(numerical_policy)
+        with numerical_execution_scope(numerical_policy, trace.module, require_adapters=False) as execution, torch.inference_mode():
             actual = trace.module(trace.operand)[..., -1:, :]
+            observation = observe_numerical_policy(numerical_policy, execution=execution)
         difference = tensor_difference(actual, trace.output)
         report['replay'][side].update(numerical_observation=observation,
             output=tensor_record(actual), difference=difference,
@@ -258,6 +269,231 @@ def compare_mlp_components(off, on, *, numerical_policy):
     return report
 
 
+def _fp64_operand_precheck(off, on, *, baseline_fidelity):
+    """Replay captured original A/B operands before trying temporary arithmetic."""
+    report = dict(status='inconclusive', baseline_fidelity=list(baseline_fidelity),
+        input_difference=None, native_replays_match={'A': [False, False], 'B': [False, False]},
+        protected_A_difference=None, A64_B32_difference=None, A64_B64_difference=None,
+        temporary_operand_dtypes=None)
+    if baseline_fidelity != [True, True]:
+        report['reason'] = 'original baseline fidelity incomplete'
+        return report
+    selected = []
+    expected = [('outer', 'token'), ('base', 'token'), ('dora', 'token'),
+                ('lora_A', 'identity_reconstruction'), ('lora_B', 'identity_reconstruction'),
+                ('lora_A', 'token'), ('lora_B', 'token')]
+    for trace in (off, on):
+        if (trace is None or not trace.closed or
+                [(e['component'], e['role']) for e in trace.events] != expected):
+            report['reason'] = 'missing/incomplete actual A/B roles'
+            return report
+        a, b = trace.events[5:]
+        for label, event in (('A', a), ('B', b)):
+            x, output, module = (event.get(key) for key in ('_operand', '_native_output', '_module'))
+            if (not isinstance(x, torch.Tensor) or not isinstance(output, torch.Tensor)
+                    or type(module) is not torch.nn.Linear or x.ndim != 3 or x.dtype != torch.float32
+                    or module is not getattr(trace.module, 'lora_'+label)[event['adapter']]
+                    or getattr(module.forward, '__func__', None) is not torch.nn.Linear.forward
+                    or event.get('input_capture_sha256') != tensor_record(x)['sha256']
+                    or event['operand'] != operand_layout(x)
+                    or event.get('output_capture_sha256') != tensor_record(output)['sha256']
+                    or not torch.isfinite(x).all() or not torch.isfinite(output).all()
+                    or not torch.equal(output[..., -1:, :], event['_value'])):
+                report['reason'] = 'mutated, nonfinite, unsupported, or missing original A/B operand/output'
+                return report
+        if (a['_operand'] is not trace.events[2].get('_operand')
+                or b['_operand'] is not a['_native_output']):
+            report['reason'] = 'actual token A/B linkage changed'
+            return report
+        selected.append((a, b))
+    report['input_difference'] = tensor_difference(selected[0][0]['_operand'][..., -1:, :],
+                                                  selected[1][0]['_operand'][..., -1:, :])
+    if not report['input_difference']['equal'] or not report['input_difference'].get('finite'):
+        report['reason'] = 'unequal/nonfinite actual newest A inputs'
+        return report
+    with torch.inference_mode():
+        # All four FP32 positive controls precede every protected operation.
+        for index, label in enumerate(('A', 'B')):
+            for side, events in enumerate(selected):
+                event = events[index]
+                replay = event['_module'](event['_operand'])
+                difference = tensor_difference(replay, event['_native_output'])
+                report['native_replays_match'][label][side] = difference['equal'] and difference.get('finite', False)
+        if not all(all(values) for values in report['native_replays_match'].values()):
+            report['reason'] = 'original full-operand A/B replay did not reproduce native output'
+            return report
+        protected_a, ordinary_b, protected_b = [], [], []
+        for a, b in selected:
+            a64, a_dtype = temporary_fp64_token_linear(a['_module'], a['_operand'])
+            b32 = b['_module'](a64)
+            b64, b_dtype = temporary_fp64_token_linear(b['_module'], a64)
+            protected_a.append(a64[..., -1:, :])
+            ordinary_b.append(b32[..., -1:, :])
+            protected_b.append(b64[..., -1:, :])
+        report.update(protected_A_difference=tensor_difference(*protected_a),
+            A64_B32_difference=tensor_difference(*ordinary_b),
+            A64_B64_difference=tensor_difference(*protected_b),
+            temporary_operand_dtypes={'A': a_dtype, 'B': b_dtype})
+    required = (report['protected_A_difference'], report['A64_B64_difference'])
+    if not all(d.get('finite') for d in required):
+        report['reason'] = 'protected replay is nonfinite or shape-incompatible'
+    elif not all(d['equal'] for d in required):
+        report.update(status='fail', reason='finite witnessed protected A or A/B difference')
+    else:
+        report['status'] = 'pass'
+    return report
+
+
+def fp64_adapter_precheck(model, processor, sample, *, baseline_report: dict) -> dict:
+    """Cheap two-prediction original-profile reproduction, then exact-operand shadows.
+
+    This is a local premise witness only. It cannot establish full32 correction.
+    """
+    import eval as evaluation
+    from peft_common import resolve_qwen2_5_vl_model
+    report = dict(status='inconclusive', baseline_fidelity=[False, False], input_difference=None,
+        native_replays_match={'A': [False, False], 'B': [False, False]}, protected_A_difference=None,
+        A64_B32_difference=None, A64_B64_difference=None, temporary_operand_dtypes=None,
+        profile=dict(PROFILE, max_new_tokens=2), controls=[], results=[])
+    baseline = baseline_report if isinstance(baseline_report, dict) else {}
+    if (any(baseline.get(k) != value for k, value in dict(model=MODEL, base=BASE, source=SOURCE,
+            source_index=12, profile=PROFILE, numerical_policy='full_accumulation').items())
+            or baseline.get('observer_fidelity') != [True, True]
+            or not isinstance(baseline.get('results'), list) or len(baseline['results']) != 2
+            or not isinstance(baseline.get('mlp_components'), dict)
+            or baseline['mlp_components'].get('status') != 'observed'
+            or not isinstance(baseline['mlp_components'].get('observed'), dict)):
+        report['reason'] = 'missing/changed original source12 full_accumulation baseline identity'
+        return report
+    frozen = baseline['results']
+    if any(not isinstance(row, dict) or len(row.get('generated_suffix_token_ids', [])) != 32
+           for row in frozen):
+        report['reason'] = 'baseline lacks the original full32 suffix'
+        return report
+    qwen = resolve_qwen2_5_vl_model(model)
+    traces, fidelity = [], []
+    with numerical_execution_scope('full_accumulation', qwen), torch.inference_mode():
+        for cached in (False, True):
+            report['controls'].append(evaluation.run_one_example(model, processor, sample, report['profile'],
+                disable_latent_generation=True, use_kv_cache=cached,
+                evaluation_protocol='continuous', numerical_policy='full_accumulation'))
+        for side, cached in enumerate((False, True)):
+            with PassiveTrace(qwen, max_steps=2, mlp_components=True, retain_adapter_operands=True) as trace:
+                actual = evaluation.run_one_example(model, processor, sample, report['profile'],
+                    disable_latent_generation=True, use_kv_cache=cached,
+                    evaluation_protocol='continuous', numerical_policy='full_accumulation')
+            report['results'].append(actual)
+            traces.append(trace)
+            matches = True
+            try:
+                require_fidelity(actual, report['controls'][side], expected_steps=2)
+                require_fidelity(actual, dict(frozen[side],
+                    generated_suffix_token_ids=frozen[side]['generated_suffix_token_ids'][:2]), expected_steps=2)
+            except ValueError:
+                matches = False
+            observed = trace.mlp_components
+            saved = baseline['mlp_components'].get('observed', {}).get(('off', 'on')[side], [])
+            if observed is None or len(observed.events) != 7 or len(saved) != 7:
+                matches = False
+            else:
+                for index in (5, 6):
+                    event, original = observed.events[index], saved[index]
+                    value = tensor_record(event['_value'])
+                    matches &= (event['component'] == original.get('component')
+                        and event['role'] == original.get('role') == 'token'
+                        and event['operand'] == original.get('operand')
+                        and all(value[k] == original.get('value', {}).get(k) for k in
+                            ('shape', 'dtype', 'sha256', 'finite_count', 'count'))
+                        and value['finite_count'] == value['count'])
+            fidelity.append(bool(matches))
+        result = _fp64_operand_precheck(*(trace.mlp_components for trace in traces), baseline_fidelity=fidelity)
+    report.update(result)
+    return report
+
+
+def math_sdpa_eligible(report: dict) -> bool:
+    """Derive the first unequal boundary from ordered actual comparisons."""
+    rows = report.get('comparisons', [])
+    if not rows or any(not isinstance(row.get('difference'), dict) for row in rows):
+        return False
+    if any(row['difference'].get('finite') is not True for row in rows):
+        return False
+    first_index = next((i for i, row in enumerate(rows)
+                        if row['difference'].get('equal') is not True), None)
+    if first_index is None:
+        return False
+    first = rows[first_index]
+    if not first.get('operation', '').endswith('.sdpa.output'):
+        return False
+    step = first.get('step')
+    prefix = first['operation'][:-len('sdpa.output')]
+    if type(step) is not int or step < 0:
+        return False
+    layer_counts = report.get('decoder_layer_counts')
+    if (not isinstance(layer_counts, list) or len(layer_counts) != 2
+            or any(type(count) is not int or count < 1 for count in layer_counts)
+            or layer_counts[0] != layer_counts[1]):
+        return False
+    layer_prefixes = [f'layer.{index}.' for index in range(layer_counts[0])]
+    if prefix not in layer_prefixes:
+        return False
+    target_layer = layer_prefixes.index(prefix)
+    # Require the native hook sequence from prediction zero, rather than infer
+    # coverage from present rows. Both loaded decoders supply their layer count.
+    layer_boundaries = ('input', 'cache_position', 'input_norm', 'q_proj', 'k_proj', 'v_proj',
+        'sdpa.q', 'sdpa.k', 'sdpa.v', 'sdpa.visibility', 'sdpa.output', 'o_proj',
+        'post_attention_norm.input_residual', 'post_attention_norm',
+        'mlp_gate', 'mlp_up', 'mlp_down', 'mlp', 'output')
+    expected = []
+    for prediction in range(step+1):
+        expected.extend((prediction, name) for name in
+                        ('decoder.embedding', 'decoder.mask2d', 'decoder.mrope'))
+        for layer in range(layer_counts[0] if prediction < step else target_layer+1):
+            boundaries = layer_boundaries
+            if prediction == step and layer == target_layer:
+                boundaries = boundaries[:boundaries.index('sdpa.output')+1]
+            expected.extend((prediction, layer_prefixes[layer]+name) for name in boundaries)
+        if prediction < step:
+            expected.extend((prediction, name) for name in
+                            ('decoder.final_norm', 'logits.raw', 'logits.post_penalty'))
+    observed = [(row.get('step'), row.get('operation')) for row in rows[:first_index+1]]
+    if observed != expected:
+        return False
+    operands = {}
+    for operation in ('input', 'input_norm', 'q_proj', 'k_proj', 'v_proj',
+                      'sdpa.q', 'sdpa.k', 'sdpa.v', 'sdpa.visibility'):
+        selected = [r for r in rows if r.get('step') == step and r.get('operation') == prefix+operation]
+        if len(selected) != 1 or selected[0]['difference'].get('equal') is not True:
+            return False
+        operands[operation] = selected[0]
+    off, on = report.get('decoder_off', []), report.get('decoder_on', [])
+    if len(off) <= step or len(on) <= step:
+        return False
+    prompt = off[0].get('query_length')
+    if type(prompt) is not int or prompt <= 0:
+        return False
+    for index in range(step+1):
+        for cached, decoder in ((False, off[index]), (True, on[index])):
+            wanted = (1 if cached and index else prompt+index,
+                      prompt+index-1 if cached and index else 0, cached,
+                      prompt+index if cached else None)
+            if tuple(decoder.get(k) for k in ('query_length', 'past_length', 'use_cache', 'returned_cache_length')) != wanted:
+                return False
+    for operation in ('sdpa.k', 'sdpa.v'):
+        for side in ('off', 'on'):
+            row = operands[operation]
+            value = row.get(side, {})
+            if (value.get('shape') != row.get('physical_shape_'+side)
+                    or len(value.get('shape', [])) != 4 or value['shape'][-2] != prompt+step
+                    or value.get('finite_count') != value.get('count')):
+                return False
+    for side in ('off', 'on'):
+        visibility = operands['sdpa.visibility'].get(side, {})
+        if visibility.get('shape') != [prompt+step]:
+            return False
+    return True
+
+
 class PassiveTrace:
     """Scoped hooks on the unchanged native path, with restoring call wrappers.
 
@@ -265,7 +501,7 @@ class PassiveTrace:
     Keep exact replay inputs only for layer 0 rowwise boundaries, bounding memory.
     No cache object is retained and wrappers return the original result object.
     """
-    def __init__(self, model, *, max_steps, mlp_components=False):
+    def __init__(self, model, *, max_steps, mlp_components=False, retain_adapter_operands=False):
         self.model = model
         self.max_steps = max_steps
         self.steps = []
@@ -273,6 +509,7 @@ class PassiveTrace:
         self.active_layer = None
         self.stack = ExitStack()
         self.mlp_components_requested = mlp_components
+        self.retain_adapter_operands = retain_adapter_operands
         self.mlp_components = None
 
     def record(self, name, value, *, full=False, row_axis=-2, module=None, operand=None):
@@ -319,7 +556,8 @@ class PassiveTrace:
             if self.mlp_components_requested and len(self.model.model.layers) > 24:
                 self.mlp_components = self.stack.enter_context(MLPComponents(
                     self.model.model.layers[24].mlp.up_proj,
-                    enabled=lambda: self.current is not None and len(self.steps) == 2))
+                    enabled=lambda: self.current is not None and len(self.steps) == 2,
+                    retain_adapter_operands=self.retain_adapter_operands))
             h = self.model.model.register_forward_pre_hook(self.decoder_pre, with_kwargs=True)
             self.stack.callback(h.remove)
             def after_decoder(_m, _a, output):
@@ -399,11 +637,11 @@ class PassiveTrace:
 
 def replay_row_operation(module, full_input, *, numerical_policy="historical"):
     """Identical actual operands, two original row geometries, no observer hooks."""
-    with numerical_policy_scope(numerical_policy), torch.inference_mode():
-        metadata = ({"numerical_observation": observe_numerical_policy(numerical_policy)}
-                    if numerical_policy != "historical" else {})
+    with numerical_execution_scope(numerical_policy, module, require_adapters=False) as execution, torch.inference_mode():
         full = module(full_input)
         newest = module(full_input[..., -1:, :].contiguous())
+        metadata = ({"numerical_observation": observe_numerical_policy(numerical_policy, execution=execution)}
+                    if numerical_policy != "historical" else {})
     return dict(**metadata, kind='rowwise geometry replay', synthetic_preceding_rows=False,
                 full_shape=list(full_input.shape), newest_shape=list(full_input[..., -1:, :].shape),
                 difference=tensor_difference(full[..., -1:, :], newest),
@@ -453,15 +691,20 @@ def compare_traces(off, on, *, numerical_policy="historical"):
                         replay = replay_row_operation(left['module'], operand, numerical_policy=numerical_policy)
                         replay['observed_difference'] = difference
                         replay['scope'] = 'same actual OFF full input and identical newest operand; rowwise geometry sensitivity'
-    return dict(compared_steps=compared, first_unequal_observed=first, replay=replay,
+    report = dict(compared_steps=compared, first_unequal_observed=first, replay=replay,
                 replay_limitation=('Replay clones may change original strides/layout; internal kernel identity remains unobserved.'
                                    if replay else 'No trustworthy exact-operand geometry replay at first unequal observed boundary.'),
                 comparisons=rows, decoder_off=[s['decoder'] for s in off.steps[:compared]],
                 decoder_on=[s['decoder'] for s in on.steps[:compared]])
+    if numerical_policy in ADAPTER_TOKEN_FP64_POLICIES:
+        report['decoder_layer_counts'] = [
+            len(trace.model.model.layers) if trace.model is not None else None for trace in (off, on)]
+    return report
 
 
 def alignment_verdict(off_trace: PassiveTrace, on_trace: PassiveTrace,
-                      off_result: dict, on_result: dict, *, expected_steps: int) -> dict:
+                      off_result: dict, on_result: dict, *, expected_steps: int,
+                      numerical_policy="historical", component_report=None) -> dict:
     """Accept only exact required tensors on equal logical histories and real KV geometry.
 
     Missing evidence is inconclusive. Equal token choices alone never establish
@@ -529,6 +772,18 @@ def alignment_verdict(off_trace: PassiveTrace, on_trace: PassiveTrace,
                     if all(seen[name] for name in names[1:]) else None)
     failed = (not finite or tokens_equal is False or q_equal is False
               or logits_equal is False or not geometry)
+    if numerical_policy in ADAPTER_TOKEN_FP64_POLICIES:
+        boundaries = (component_report or {}).get('observed', {}).get('boundaries', [])
+        selected = [row for row in boundaries if row.get('component') in ('lora_A', 'lora_B')
+                    and row.get('role') == 'token']
+        components_complete = ((component_report or {}).get('status') == 'observed'
+                               and len(selected) == 2
+                               and {r['component'] for r in selected} == {'lora_A', 'lora_B'})
+        coverage &= components_complete and expected_steps == 32
+        for row in selected:
+            difference = row.get('difference', {})
+            failed |= difference.get('equal') is False or difference.get('finite') is False
+            coverage &= difference.get('equal') is True and difference.get('finite') is True
     status = 'fail' if failed else 'pass' if coverage else 'inconclusive'
     return dict(status=status, q_equal=q_equal, logits_equal=logits_equal,
         tokens_equal=tokens_equal, coverage_complete=coverage, finite=finite,
@@ -581,8 +836,11 @@ def main(argv=None):
     parser.add_argument('--mlp-components', action='store_true')
     args = parser.parse_args(argv)
     if args.mlp_components and (not args.fresh_controls or args.source_index != 12
-                                or args.numerical_policy != 'full_accumulation'):
+                                or args.numerical_policy not in ('full_accumulation',) + ADAPTER_TOKEN_FP64_POLICIES):
         parser.error('--mlp-components requires --fresh-controls --source-index 12 --numerical-policy full_accumulation')
+    if (args.numerical_policy in ADAPTER_TOKEN_FP64_POLICIES and args.source_index == 12
+            and not args.mlp_components):
+        parser.error('source12 adapter profile requires --mlp-components')
     if not args.fresh_controls and (not args.frozen_off or not args.frozen_on):
         parser.error('provide both frozen controls or --fresh-controls')
     if args.numerical_policy != 'historical' and not args.fresh_controls:
@@ -596,6 +854,7 @@ def main(argv=None):
     import eval as evaluation
     from peft_common import resolve_qwen2_5_vl_model
     traces, results, controls, fidelity = [], [], [], []
+    precheck = None
     try:
         model, processor = evaluation.load_evaluation_artifacts(model_dir=MODEL, base_model_dir=BASE,
             cache_dir='data/hf-cache', evaluation_protocol='continuous')
@@ -603,8 +862,21 @@ def main(argv=None):
         qwen = resolve_qwen2_5_vl_model(model)
         validate_numerical_policy(args.numerical_policy, protocol='continuous', stage=qwen.config.stage,
                                   disable_latent_generation=True)
-        with numerical_policy_scope(args.numerical_policy):
-            observation = observe_numerical_policy(args.numerical_policy, qwen)
+        if args.numerical_policy in ADAPTER_TOKEN_FP64_POLICIES and args.source_index == 12:
+            try:
+                baseline = json.loads(FP64_BASELINE_REPORT.read_text())
+            except (OSError, ValueError):
+                baseline = {}
+            precheck = fp64_adapter_precheck(model, processor, sample, baseline_report=baseline)
+            if precheck['status'] != 'pass':
+                report = dict(status=precheck['status'], precheck=precheck, numerical_policy=args.numerical_policy,
+                    results=[], fresh_controls=[], observer_fidelity=[], source_index=args.source_index,
+                    alignment_verdict=dict(status='inconclusive', executed=False))
+                with (destination/'report.json').open('x') as stream:
+                    json.dump(report, stream, indent=2, allow_nan=False)
+                return
+        with numerical_execution_scope(args.numerical_policy, qwen) as execution:
+            observation = observe_numerical_policy(args.numerical_policy, qwen, execution=execution)
             if args.fresh_controls:
                 for cached in (False, True):
                     controls.append(evaluation.run_one_example(model, processor, sample, PROFILE,
@@ -627,7 +899,14 @@ def main(argv=None):
                     *(trace.mlp_components for trace in traces), numerical_policy=args.numerical_policy)
             expected = 32 if args.source_index == 12 else max(
                 len(row['generated_suffix_token_ids']) for row in results)
-            verdict = alignment_verdict(*traces, *results, expected_steps=expected)
+            verdict = alignment_verdict(*traces, *results, expected_steps=expected,
+                numerical_policy=args.numerical_policy if args.source_index == 12 else 'historical',
+                component_report=report.get('mlp_components'))
+            observation = observe_numerical_policy(args.numerical_policy, qwen, execution=execution)
+        if precheck is not None:
+            report['precheck'] = precheck
+        if args.numerical_policy in ADAPTER_TOKEN_FP64_POLICIES:
+            report['math_sdpa_eligible'] = math_sdpa_eligible(report)
         report.update(status=verdict['status'] if args.fresh_controls else 'faithful',
             alignment_verdict=verdict, observer_fidelity=fidelity, fresh_controls=controls,
             numerical_policy=args.numerical_policy, numerical_observation=observation,

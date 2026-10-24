@@ -3,12 +3,15 @@
 These are observed PyTorch API settings, not evidence of a CUDA kernel identity.
 The historical policy deliberately performs no state mutation.
 """
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import os
 
 import torch
 
-NUMERICAL_POLICIES = ('historical', 'tf32_off', 'full_accumulation', 'math_sdpa')
+from .adapter_numerics import (ADAPTER_TOKEN_FP64_POLICIES, AdapterTokenEvidence,
+    adapter_token_fp64_scope, AdapterNumericsError)
+
+NUMERICAL_POLICIES = ('historical', 'tf32_off', 'full_accumulation', 'math_sdpa') + ADAPTER_TOKEN_FP64_POLICIES
 _SDPA = dict(math='math', flash='flash', efficient='mem_efficient', cudnn='cudnn')
 
 
@@ -19,16 +22,18 @@ def _policy(policy):
 
 
 def validate_numerical_policy(policy: str, *, protocol: str, stage: str,
-                              disable_latent_generation: bool) -> str:
+                              disable_latent_generation: bool, static_inference_cache: bool = False) -> str:
     policy = _policy(policy)
     if policy != 'historical' and not (
             protocol == 'continuous' and stage == 'stage1'
             and disable_latent_generation is True):
         raise ValueError('numerical policy requires explicit continuous Stage 1 with latent generation disabled')
+    if policy in ADAPTER_TOKEN_FP64_POLICIES and static_inference_cache:
+        raise ValueError('adapter numerical policy does not support static inference cache')
     return policy
 
 
-def observe_numerical_policy(policy: str, model=None) -> dict:
+def observe_numerical_policy(policy: str, model=None, *, execution=None) -> dict:
     """Read active controls and actual first-Q base/active-adapter parameters."""
     _policy(policy)
     parameters = {}
@@ -42,7 +47,7 @@ def observe_numerical_policy(policy: str, model=None) -> dict:
                     name.startswith(f'{kind}.{adapter}.')
                     for adapter in active for kind in ('lora_A', 'lora_B', 'lora_magnitude_vector')):
                 parameters[name] = str(value.dtype)
-    return dict(policy=policy, float32_matmul_precision=torch.get_float32_matmul_precision(),
+    result = dict(policy=policy, float32_matmul_precision=torch.get_float32_matmul_precision(),
                 matmul_allow_tf32=torch.backends.cuda.matmul.allow_tf32,
                 bf16_reduced_precision_reduction=torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
                 sdpa_enabled={key: getattr(torch.backends.cuda, name+'_sdp_enabled')()
@@ -50,6 +55,10 @@ def observe_numerical_policy(policy: str, model=None) -> dict:
                 parameter_dtypes=parameters,
                 environment_controls={key: os.environ.get(key) for key in
                     ('NVIDIA_TF32_OVERRIDE', 'TORCH_ALLOW_TF32_CUBLAS_OVERRIDE')})
+    if policy in ADAPTER_TOKEN_FP64_POLICIES:
+        result['adapter_token_arithmetic'] = (execution.snapshot() if execution is not None
+            else dict(AdapterTokenEvidence(()).snapshot(), status='not_observed'))
+    return result
 
 
 @contextmanager
@@ -65,9 +74,9 @@ def numerical_policy_scope(policy: str):
     try:
         torch.set_float32_matmul_precision('highest')
         torch.backends.cuda.matmul.allow_tf32 = False
-        if policy in ('full_accumulation', 'math_sdpa'):
+        if policy in ('full_accumulation', 'math_sdpa') + ADAPTER_TOKEN_FP64_POLICIES:
             torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = False
-        if policy == 'math_sdpa':
+        if policy in ('math_sdpa', 'adapter_token_fp64_math_sdpa'):
             for key, name in _SDPA.items():
                 getattr(torch.backends.cuda, 'enable_'+name+'_sdp')(key == 'math')
         if torch.backends.cuda.matmul.allow_tf32 or torch.get_float32_matmul_precision() != 'highest':
@@ -80,3 +89,24 @@ def numerical_policy_scope(policy: str):
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = previous['bf16_reduced_precision_reduction']
         for key, name in _SDPA.items():
             getattr(torch.backends.cuda, 'enable_'+name+'_sdp')(previous['sdpa_enabled'][key])
+
+
+_execution_policies = []
+
+
+@contextmanager
+def numerical_execution_scope(policy: str, model, *, require_adapters: bool = True):
+    """One shared model/global scope for generation, observation and partial replay."""
+    _policy(policy)
+    if _execution_policies and policy != _execution_policies[-1] and (
+            policy in ADAPTER_TOKEN_FP64_POLICIES or _execution_policies[-1] in ADAPTER_TOKEN_FP64_POLICIES):
+        raise AdapterNumericsError('incompatible numerical execution scope nesting')
+    with ExitStack() as stack:
+        execution = (stack.enter_context(adapter_token_fp64_scope(model, policy=policy,
+            require_adapters=require_adapters)) if policy in ADAPTER_TOKEN_FP64_POLICIES else None)
+        stack.enter_context(numerical_policy_scope(policy))
+        _execution_policies.append(policy)
+        try:
+            yield execution
+        finally:
+            _execution_policies.pop()

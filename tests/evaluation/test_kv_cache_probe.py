@@ -532,3 +532,371 @@ def test_mlp_components_require_full_32_token_fidelity_before_attribution(tmp_pa
     with pytest.raises(ValueError, match='full 32-token suffix'):
         p.main(['--output-dir', 'results/short', '--fresh-controls', '--mlp-components',
                 '--numerical-policy', 'full_accumulation'])
+
+
+def retained_pair():
+    """Actual installed DoRA calls with original full-row operands."""
+    p, module = probe(), tiny_dora()
+    # Integer/power-of-two weights make equality independent of CPU GEMM shapes.
+    with torch.no_grad():
+        module.lora_A['default'].weight.fill_(.25)
+        module.lora_B['default'].weight.fill_(.5)
+    x = torch.arange(12.).reshape(1, 3, 4)
+    with torch.inference_mode():
+        with p.MLPComponents(module, retain_adapter_operands=True) as off:
+            module(x)
+        with p.MLPComponents(module, retain_adapter_operands=True) as on:
+            module(x[..., -1:, :])
+    return off, on
+
+
+def test_precheck_replays_actual_original_A_B_before_fp64(monkeypatch):
+    # Catches shadow arithmetic before four original-operand positive controls.
+    p = probe()
+    assert hasattr(p, 'fp64_adapter_precheck'), 'missing operand precheck'
+    off, on = retained_pair()
+    calls = []
+    native = F.linear
+    def observe(x, weight, bias=None):
+        calls.append(x.dtype)
+        return native(x, weight, bias)
+    monkeypatch.setattr(F, 'linear', observe)
+    report = p._fp64_operand_precheck(off, on, baseline_fidelity=[True, True])
+    assert report['status'] == 'pass'
+    assert calls[:4] == [torch.float32]*4
+    assert report['native_replays_match'] == {'A': [True, True], 'B': [True, True]}
+    assert report['input_difference']['equal'] is True
+    assert report['protected_A_difference']['equal'] is True
+    assert report['A64_B64_difference']['equal'] is True
+    assert report['temporary_operand_dtypes']['A']['input'] == 'torch.float64'
+    import json
+    json.dumps(report, allow_nan=False)
+
+
+@pytest.mark.parametrize('damage', ['mutation', 'missing', 'nan', 'unequal', 'baseline', 'unreproduced'])
+def test_precheck_requires_equal_actual_A_inputs_and_finite_reproduced_baseline(damage):
+    p = probe()
+    assert hasattr(p, 'fp64_adapter_precheck'), 'missing operand precheck'
+    off, on = retained_pair()
+    fidelity = [True, True]
+    if damage == 'mutation':
+        with torch.no_grad():
+            off.events[5]['_operand'].add_(1)
+    elif damage == 'missing':
+        on.events.pop()
+    elif damage == 'nan':
+        with torch.no_grad():
+            on.events[5]['_operand'].fill_(float('nan'))
+    elif damage == 'unequal':
+        with torch.no_grad():
+            on.events[5]['_operand'].add_(1)
+        # Honest capture of an actually different original operand.
+        on.events[5]['input_capture_sha256'] = p.tensor_record(on.events[5]['_operand'])['sha256']
+    elif damage == 'baseline':
+        fidelity[1] = False
+    else:
+        with torch.no_grad():
+            off.module.lora_A['default'].weight.add_(1)
+    report = p._fp64_operand_precheck(off, on, baseline_fidelity=fidelity)
+    assert report['status'] == 'inconclusive'
+
+
+def ordered_math_report(*, layer_count=1, target_layer=0):
+    """Literal native boundary order with a real tensor difference at step1 SDPA."""
+    from types import SimpleNamespace
+    p = probe()
+    off, on = complete_trace(count=2), complete_trace(True, count=2)
+    for trace in (off, on):
+        trace.model = SimpleNamespace(model=SimpleNamespace(layers=[None]*layer_count))
+        for i, step in enumerate(trace.steps):
+            values = {name: torch.ones(1, 1, 2) for name in
+                      ('decoder.embedding', 'decoder.mask2d', 'decoder.mrope')}
+            for layer in range(layer_count):
+                # Hand-written actual hook order, independent of production gate helpers.
+                for name in ('input', 'cache_position', 'input_norm', 'q_proj', 'k_proj', 'v_proj'):
+                    values[f'layer.{layer}.{name}'] = torch.ones(1, 1, 2)
+                values[f'layer.{layer}.sdpa.q'] = torch.ones(1, 1, 1, 2)
+                values[f'layer.{layer}.sdpa.k'] = torch.ones(1, 1, 2+i, 2)
+                values[f'layer.{layer}.sdpa.v'] = torch.ones(1, 1, 2+i, 2)
+                values[f'layer.{layer}.sdpa.visibility'] = torch.ones(2+i, dtype=torch.bool)
+                values[f'layer.{layer}.sdpa.output'] = torch.ones(1, 1, 1, 2)
+                for name in ('o_proj', 'post_attention_norm.input_residual', 'post_attention_norm',
+                             'mlp_gate', 'mlp_up', 'mlp_down', 'mlp', 'output'):
+                    values[f'layer.{layer}.{name}'] = torch.ones(1, 1, 2)
+            for name in ('decoder.final_norm', 'logits.raw', 'logits.post_penalty'):
+                values[name] = torch.ones(1, 1, 5 if name.startswith('logits.') else 2)
+            step['events'] = {name: dict(value=value, shape=list(value.shape)) for name, value in values.items()}
+    on.steps[1]['events'][f'layer.{target_layer}.sdpa.output']['value'].add_(1)
+    return p.compare_traces(off, on, numerical_policy='adapter_token_fp64')
+
+
+@pytest.mark.parametrize('damage', ['earlier_step', 'earlier_layer', 'earlier_projection',
+    'earlier_step_projection', 'reordered_projection', 'duplicate_projection', 'layer_counts'])
+def test_math_gate_rejects_missing_or_unordered_earlier_numeric_coverage(damage):
+    p, report = probe(), ordered_math_report(layer_count=2, target_layer=1)
+    assert p.math_sdpa_eligible(report) is True
+    if damage == 'earlier_step':
+        report['comparisons'] = [row for row in report['comparisons'] if row['step'] != 0]
+    elif damage == 'earlier_layer':
+        report['comparisons'] = [row for row in report['comparisons']
+            if not (row['step'] == 1 and row['operation'].startswith('layer.0.'))]
+    elif damage in ('earlier_projection', 'earlier_step_projection'):
+        damaged_step = 0 if damage == 'earlier_step_projection' else 1
+        report['comparisons'] = [row for row in report['comparisons']
+            if (row['step'], row['operation']) != (damaged_step, 'layer.0.q_proj')]
+    elif damage in ('reordered_projection', 'duplicate_projection'):
+        index = next(i for i, row in enumerate(report['comparisons'])
+                     if (row['step'], row['operation']) == (1, 'layer.0.q_proj'))
+        if damage == 'reordered_projection':
+            report['comparisons'][index:index+2] = reversed(report['comparisons'][index:index+2])
+        else:
+            report['comparisons'].insert(index, report['comparisons'][index])
+    else:
+        report.pop('decoder_layer_counts', None)
+    assert p.math_sdpa_eligible(report) is False
+
+
+def test_math_gate_requires_first_sdpa_output_and_equal_operands():
+    # Ordered real tensor comparisons, not a trusted first-difference label.
+    p, report = probe(), ordered_math_report()
+    assert p.math_sdpa_eligible(report) is True
+    from copy import deepcopy
+    for operation in ('layer.0.q_proj', 'layer.0.sdpa.k', 'layer.0.sdpa.v', 'layer.0.sdpa.visibility'):
+        damaged = deepcopy(report)
+        row = next(r for r in damaged['comparisons'] if r['step'] == 1 and r['operation'] == operation)
+        row['difference']['equal'] = False
+        assert p.math_sdpa_eligible(damaged) is False
+    for damage in ('missing', 'nonfinite', 'geometry', 'declared_only'):
+        damaged = deepcopy(report)
+        if damage == 'missing':
+            damaged['comparisons'] = [r for r in damaged['comparisons'] if r['operation'] != 'layer.0.sdpa.v']
+        elif damage == 'nonfinite':
+            damaged['comparisons'][0]['difference']['finite'] = False
+        elif damage == 'geometry':
+            damaged['decoder_on'][1]['query_length'] = 3
+        else:
+            damaged['comparisons'] = []
+        assert p.math_sdpa_eligible(damaged) is False
+
+
+def test_candidate_requires_full32_selected_A_B_Q_and_logits():
+    p = probe()
+    off, on = complete_trace(count=32), complete_trace(True, count=32)
+    import inspect
+    assert 'numerical_policy' in inspect.signature(p.alignment_verdict).parameters, 'missing candidate component gate'
+    assert p.alignment_verdict(off, on, result_tokens(32), result_tokens(32), expected_steps=32,
+        numerical_policy='adapter_token_fp64')['status'] == 'inconclusive'
+    a, b = retained_pair()
+    components = p.compare_mlp_components(a, b, numerical_policy='full_accumulation')
+    assert p.alignment_verdict(off, on, result_tokens(32), result_tokens(32), expected_steps=32,
+        numerical_policy='adapter_token_fp64', component_report=components)['status'] == 'pass'
+    next(row for row in components['observed']['boundaries']
+         if row['component'] == 'lora_B' and row['role'] == 'token')['difference']['equal'] = False
+    assert p.alignment_verdict(off, on, result_tokens(32), result_tokens(32), expected_steps=32,
+        numerical_policy='adapter_token_fp64', component_report=components)['status'] == 'fail'
+    assert p.alignment_verdict(complete_trace(), complete_trace(True), result_tokens(), result_tokens(), expected_steps=32,
+        numerical_policy='adapter_token_fp64', component_report=components)['status'] != 'pass'
+
+
+def baseline_native_fixture(monkeypatch):
+    from copy import deepcopy
+    from peft.tuners.lora.layer import Linear
+    from tests.stage2.test_eval_integration import _import_entry_point, FakeProcessor
+    evaluation, p = _import_entry_point('eval', monkeypatch), probe()
+    model = tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage = 'stage1'
+    model.model.layers.extend([deepcopy(model.model.layers[0]) for _ in range(24)])
+    for i, layer in enumerate(model.model.layers):
+        layer.self_attn.layer_idx = i
+    layer = model.model.layers[24].mlp
+    layer.up_proj = Linear(layer.up_proj, 'default', r=2, lora_alpha=4, use_dora=True).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+        layer.up_proj.base_layer.weight.fill_(.125)
+        layer.up_proj.lora_A['default'].weight.fill_(.25)
+        layer.up_proj.lora_B['default'].weight.fill_(.5)
+        layer.up_proj.lora_magnitude_vector['default'].weight.fill_(1.)
+    processor, sample = FakeProcessor(include_visual_inputs=False), {'text_input': 'question'}
+    traces, results = [], []
+    for cached in (False, True):
+        with p.PassiveTrace(model, max_steps=32, mlp_components=True) as trace:
+            results.append(evaluation.run_one_example(model, processor, sample, p.PROFILE,
+                disable_latent_generation=True, use_kv_cache=cached, numerical_policy='full_accumulation'))
+        traces.append(trace)
+    baseline = dict(model=p.MODEL, base=p.BASE, source=p.SOURCE, source_index=12, profile=p.PROFILE,
+        numerical_policy='full_accumulation', observer_fidelity=[True, True], results=results,
+        mlp_components=p.compare_mlp_components(*(trace.mlp_components for trace in traces), numerical_policy='full_accumulation'))
+    return evaluation, model, processor, sample, baseline
+
+
+def test_precheck_native_two_token_baseline_reproduces_saved_full_witness(monkeypatch):
+    p = probe()
+    assert hasattr(p, 'fp64_adapter_precheck'), 'missing native local precheck'
+    evaluation, model, processor, sample, baseline = baseline_native_fixture(monkeypatch)
+    starts = []
+    original = evaluation.run_one_example
+    def observe(*args, **kwargs):
+        starts.append((args[3]['max_new_tokens'], kwargs['numerical_policy']))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(evaluation, 'run_one_example', observe)
+    report = p.fp64_adapter_precheck(model, processor, sample, baseline_report=baseline)
+    assert report['status'] == 'pass'
+    assert report['baseline_fidelity'] == [True, True]
+    assert starts == [(2, 'full_accumulation')]*4
+    assert report['profile'] == dict(p.PROFILE, max_new_tokens=2)
+    assert report['native_replays_match'] == {'A': [True, True], 'B': [True, True]}
+    assert not model.model.layers[24].mlp.up_proj.lora_A['default']._forward_hooks
+    from copy import deepcopy
+    for key in ('model', 'profile', 'results', 'mlp_components', 'observed'):
+        damaged = deepcopy(baseline)
+        if key == 'observed':
+            damaged['mlp_components']['observed'] = None
+        else:
+            damaged[key] = None
+        assert p.fp64_adapter_precheck(model, processor, sample, baseline_report=damaged)['status'] == 'inconclusive'
+
+
+def test_precheck_failure_skips_full_candidate_without_faking_alignment(tmp_path, monkeypatch):
+    import json
+    from tests.stage2.test_eval_integration import _import_entry_point, FakeProcessor
+    from tests.evaluation.test_off_kv_cache import adapter_model
+    evaluation, p = _import_entry_point('eval', monkeypatch), probe()
+    assert hasattr(p, 'FP64_BASELINE_REPORT'), 'missing baseline gate'
+    model, processor = adapter_model(), FakeProcessor(include_visual_inputs=False)
+    baseline = tmp_path/'damaged-baseline.json'
+    baseline.write_text(json.dumps({'model': 'changed'}))
+    monkeypatch.setattr(p, 'FP64_BASELINE_REPORT', baseline)
+    monkeypatch.setattr(p, 'selected_sample', lambda index=12: {'text_input': 'question'})
+    monkeypatch.setattr(evaluation, 'load_evaluation_artifacts', lambda **_kw: (model, processor))
+    monkeypatch.chdir(tmp_path)
+    p.main(['--output-dir', 'results/rejected', '--fresh-controls', '--source-index', '12',
+            '--numerical-policy', 'adapter_token_fp64', '--mlp-components'])
+    report = json.loads((tmp_path/'results/rejected/report.json').read_text())
+    assert report['precheck']['status'] == 'inconclusive'
+    assert report['status'] == 'inconclusive'
+    assert report['fresh_controls'] == report['results'] == []
+    assert report['alignment_verdict']['status'] == 'inconclusive'
+    assert report['alignment_verdict']['executed'] is False
+
+
+def test_precheck_reports_finite_protected_difference_as_failure():
+    # Separate real modules supply a literal adversarial protected-output witness;
+    # this exercises the operand comparator, never claims a GPU/model correction.
+    p = probe()
+    assert hasattr(p, '_fp64_operand_precheck'), 'missing protected-output decision'
+    off, _ = retained_pair()
+    other = tiny_dora()
+    with torch.no_grad():
+        other.lora_A['default'].weight.fill_(.5)
+        other.lora_B['default'].weight.fill_(.5)
+    with torch.inference_mode(), p.MLPComponents(other, retain_adapter_operands=True) as on:
+        other(torch.arange(12.).reshape(1, 3, 4)[..., -1:, :])
+    report = p._fp64_operand_precheck(off, on, baseline_fidelity=[True, True])
+    assert report['status'] == 'fail'
+    assert report['native_replays_match'] == {'A': [True, True], 'B': [True, True]}
+    assert report['protected_A_difference']['equal'] is False
+
+
+@pytest.mark.parametrize('policy', ['adapter_token_fp64', 'adapter_token_fp64_math_sdpa'])
+def test_new_profile_real_probe_controls_observation_and_replay_use_same_scope(policy, tmp_path, monkeypatch):
+    import json
+    from tests.stage2.test_eval_integration import _import_entry_point, FakeProcessor
+    from tests.evaluation.test_off_kv_cache import adapter_model
+    from tests.evaluation.test_adapter_numerics import bindings, assert_bindings
+    evaluation, p = _import_entry_point('eval', monkeypatch), probe()
+    model, processor = adapter_model(), FakeProcessor(include_visual_inputs=False)
+    saved = bindings(model)
+    monkeypatch.setattr(evaluation, 'load_evaluation_artifacts', lambda **_kw: (model, processor))
+    monkeypatch.setattr(p, 'selected_sample', lambda index=12: {'text_input': 'question'})
+    monkeypatch.chdir(tmp_path)
+    p.main(['--output-dir', 'results/new-real', '--fresh-controls', '--source-index', '0',
+            '--numerical-policy', policy])
+    report = json.loads((tmp_path/'results/new-real/report.json').read_text())
+    assert report['observer_fidelity'] == [True, True]
+    assert report['decoder_layer_counts'] == [1, 1]
+    for row in report['fresh_controls']+report['results']:
+        arithmetic = row['numerical_observation']['adapter_token_arithmetic']
+        assert arithmetic['token_calls'] == 2*len(row['generated_suffix_token_ids'])
+        assert arithmetic['actual_operand_dtypes']['input'] == 'torch.float64'
+    assert report['decoder_off'][1]['query_length'] == 3
+    assert report['decoder_off'][1]['use_cache'] is False
+    assert report['decoder_off'][1]['returned_cache_length'] is None
+    assert report['decoder_on'][1]['query_length'] == 1
+    assert report['decoder_on'][1]['use_cache'] is True
+    assert report['decoder_on'][1]['past_length'] == 2
+    assert_bindings(saved)
+
+
+def mixed_dtype_retained_pair():
+    """Actual installed PEFT casts BF16 outer inputs to FP32 before DoRA."""
+    from peft.tuners.lora.layer import Linear
+    p = probe()
+    module = Linear(torch.nn.Linear(4, 6, bias=False).bfloat16(), 'default',
+        r=2, lora_alpha=4, use_dora=True).eval()
+    for collection in (module.lora_A, module.lora_B, module.lora_magnitude_vector):
+        collection['default'].float()
+    with torch.no_grad():
+        module.lora_A['default'].weight.fill_(.25)
+        module.lora_B['default'].weight.fill_(.5)
+    x = torch.arange(12., dtype=torch.bfloat16).reshape(1, 3, 4)
+    actual_dora_inputs = []
+    hook = module.lora_magnitude_vector['default'].register_forward_pre_hook(
+        lambda _m, args: actual_dora_inputs.append(args[0]))
+    try:
+        with torch.inference_mode():
+            with p.MLPComponents(module, retain_adapter_operands=True) as off:
+                module(x)
+            with p.MLPComponents(module, retain_adapter_operands=True) as on:
+                module(x[..., -1:, :])
+    finally:
+        hook.remove()
+    return off, on, actual_dora_inputs
+
+
+def test_precheck_uses_actual_mixed_dtype_dora_operand(monkeypatch):
+    p = probe()
+    off, on, actual_dora_inputs = mixed_dtype_retained_pair()
+    for trace, actual in zip((off, on), actual_dora_inputs):
+        assert trace.operand.dtype == torch.bfloat16
+        assert trace.events[1]['operand']['dtype'] == 'torch.bfloat16'
+        assert actual.dtype == torch.float32
+        assert trace.events[5]['_operand'] is actual
+        assert actual is not trace.operand
+        assert torch.equal(actual, trace.operand.float())
+    before = [(parameter, parameter.detach().clone(), parameter.data_ptr(), parameter.dtype)
+              for parameter in off.module.parameters()]
+    delegated = []
+    native = F.linear
+    def observe(operand, weight, bias=None):
+        output = native(operand, weight, bias)
+        delegated.append((operand.dtype, weight.dtype, output.dtype))
+        return output
+    monkeypatch.setattr(F, 'linear', observe)
+    report = p._fp64_operand_precheck(off, on, baseline_fidelity=[True, True])
+    assert report['status'] == 'pass', report
+    assert report['native_replays_match'] == {'A': [True, True], 'B': [True, True]}
+    assert delegated[:4] == [(torch.float32, torch.float32, torch.float32)]*4
+    assert report['input_difference']['equal'] is True
+    assert report['protected_A_difference']['equal'] is True
+    assert report['A64_B64_difference']['equal'] is True
+    for trace, actual in zip((off, on), actual_dora_inputs):
+        assert trace.events[2]['_operand'] is actual
+        assert trace.operand.dtype == torch.bfloat16
+    assert all(torch.equal(parameter, original) and parameter.data_ptr() == pointer and parameter.dtype == dtype
+               for parameter, original, pointer, dtype in before)
+
+
+@pytest.mark.parametrize('damage', ['missing_DoRA', 'replaced_DoRA', 'replaced_B'])
+def test_mixed_dtype_precheck_rejects_missing_or_replaced_actual_linkage(damage):
+    p = probe()
+    off, on, actual_dora_inputs = mixed_dtype_retained_pair()
+    if damage == 'missing_DoRA':
+        off.events[2].pop('_operand', None)
+    elif damage == 'replaced_DoRA':
+        off.events[2]['_operand'] = actual_dora_inputs[0].clone()
+    else:
+        off.events[6]['_operand'] = off.events[6]['_operand'].clone()
+    report = p._fp64_operand_precheck(off, on, baseline_fidelity=[True, True])
+    assert report['status'] == 'inconclusive'
+    assert report['native_replays_match'] == {'A': [False, False], 'B': [False, False]}
