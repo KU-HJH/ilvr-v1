@@ -238,7 +238,7 @@ def test_rank_record_collection_maps_each_global_rank_to_its_node(tmp_path):
     def remote(command,**kwargs):
         text=' '.join(command)
         assert 'llm_kd' in text and 'korea@172.16.11.41' in text
-        assert '/remote/ILVR/scripts/profile_stage1_v5.py' in text
+        assert '-m scripts.profile_stage1_v5' in text
         rank=int(text.rsplit('--rank ',1)[1].rstrip("'"))
         return SimpleNamespace(stdout=json.dumps(dict(rank=rank)),returncode=0)
     runner._run=remote
@@ -366,3 +366,46 @@ def test_replay_processor_roundtrip_restores_only_exact_original_identity(tmp_pa
         assert tuple(restored.tokenizer.convert_tokens_to_ids(t) for t in LATENT_TOKEN_STRINGS)==before_ids
         assert restored.tokenizer.encode(sample)==before_encoding
         assert all(not isinstance(t,str) for t in restored.tokenizer.special_tokens_map_extended['additional_special_tokens'])
+
+
+def test_remote_timing_record_entry_imports_real_modules_without_pythonpath(tmp_path):
+    import os
+    import shlex
+    import shutil
+    import subprocess
+    from src.multinode import build_launch_plan
+    from src.multinode_runtime import SubprocessCoordinatorRunner
+    root=Path(__file__).resolve().parents[3]
+    repository=tmp_path/'remote-repo'
+    for relative in ('scripts/profile_stage1_v5.py','src/multinode.py','src/multinode_runtime.py',
+                     'src/artifact_paths.py','src/deepspeed_runtime.py'):
+        destination=repository/relative
+        destination.parent.mkdir(parents=True,exist_ok=True)
+        shutil.copy2(root/relative,destination)
+    (repository/'venv').mkdir()
+    (repository/'venv/ilvr-venv').symlink_to(root/'venv/ilvr-venv',target_is_directory=True)
+    run_id='timing-reader-subprocess'
+    payload=dict(rank=0,run_id=run_id,identity=dict(commit='87087b3a42dc3131084b242e610f6586c2efc46f'))
+    serialized=json.dumps(payload,sort_keys=True)
+    record=repository/'results'/run_id/'forward-timing-rank-0.json'
+    record.parent.mkdir(parents=True)
+    record.write_text(serialized)
+    plan=build_launch_plan(stage='stage1',tuning_method='dora',zero_stage=1,
+        run_id=run_id,main_process_port=29583,local_repo_root=root,
+        remote_repo_root=repository,remote_host_repo_root=tmp_path/'host-repo')
+    environment=os.environ.copy()
+    environment.pop('PYTHONPATH',None)
+    environment['PYTHONDONTWRITEBYTECODE']='1'
+    def local_container_boundary(command, *, input_bytes, timeout_seconds):
+        # Replace only SSH/container transport. Execute the exact real reader
+        # argv and cwd constructed by production, with actual repository imports.
+        docker=shlex.split(command[-1])
+        working_directory=Path(docker[docker.index('--workdir')+1])
+        argv=shlex.split(docker[-1])
+        return subprocess.run(argv,cwd=working_directory,env=environment,
+            capture_output=True,text=True,check=False,timeout=timeout_seconds)
+    runner=SubprocessCoordinatorRunner(plan,commands=None,commit='a'*40,
+        command_runner=local_container_boundary)
+    raw=runner.read_stage1_v5_forward_timing_record(0)
+    assert raw==(serialized+'\n').encode()
+    assert json.loads(raw)==payload

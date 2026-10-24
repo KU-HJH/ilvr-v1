@@ -2450,7 +2450,7 @@ class SubprocessCoordinatorRunner:
         path=repository/'results'/self.plan.run_id/f'forward-timing-rank-{rank}.json'
         if rank>=2: return _read_regular_file(path,maximum_size=16*1024*1024)
         completed=self._run(build_remote_exec((str(repository/'venv/ilvr-venv/bin/python'),
-            str(repository/'scripts/profile_stage1_v5.py'),'--mode','record-show','--run-id',self.plan.run_id,
+            '-m','scripts.profile_stage1_v5','--mode','record-show','--run-id',self.plan.run_id,
             '--rank',str(rank)),working_directory=repository,cluster=self.plan.cluster))
         raw=completed.stdout.encode()
         if not raw or len(raw)>16*1024*1024: raise ValueError('invalid timing record size')
