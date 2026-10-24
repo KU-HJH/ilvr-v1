@@ -373,9 +373,12 @@ def run_local_backward(trainer,batch,*,stochastic,oracle,observe):
     ambient_cuda_before=[tensor_hash(torch.cuda.get_rng_state(i)) for i in devices]
     named={name:p for name,p in trainer.model.named_parameters() if p.requires_grad}
     for p in trainer.model.parameters(): p.grad=None
-    before=parameter_identity(trainer.model)
-    reference_before={n:tensor_hash(p) for n,p in trainer.ema_teacher.model.named_parameters() if n in trainer.ema_teacher.parameter_names}
-    evidence=dict(blocks_original=[asdict(b) for b in batch['stage1_v5_metadata'].blocks],parameters_before=before,stochastic=asdict(stochastic),oracle=oracle,observed=observe,
+    before=parameter_identity(trainer.model,trainable=False)
+    reference_before=parameter_identity(trainer.ema_teacher.model,trainable=False)
+    evidence=dict(blocks_original=[asdict(b) for b in batch['stage1_v5_metadata'].blocks],parameters_before=before,
+        trainable_inventory={name:before[name] for name in named},
+        parameter_identity_scope='all named student and reference parameters, including frozen values',
+        stochastic=asdict(stochastic),oracle=oracle,observed=observe,
         autocast_enabled=torch.is_autocast_enabled(),debug=False,
         bypasses=['Trainer/SFT constructor and profile initialization','distributed wrappers/engine/optimizer/scheduler',
             'native parent training_step (CPU prerequisite tests cover local loss/4 only)'])
@@ -407,13 +410,14 @@ def run_local_backward(trainer,batch,*,stochastic,oracle,observe):
         evidence['original_inputs_dtype']=str(outputs.inputs_embeds.dtype)
         scaled.backward()
         grads={name:None if p.grad is None else p.grad.detach().cpu().clone() for name,p in named.items()}
-    evidence['parameters_after']=parameter_identity(trainer.model)
+    evidence['parameters_after']=parameter_identity(trainer.model,trainable=False)
     evidence['parameters_unchanged']=evidence['parameters_after']==before
     evidence['execution_closed']=execution.state=='CLOSED'
     evidence['ambient_cpu_rng_restored']=ambient_before==tensor_hash(torch.get_rng_state())
     evidence['ambient_cuda_rng_restored']=ambient_cuda_before==[tensor_hash(torch.cuda.get_rng_state(i)) for i in devices]
     evidence['reference_before']=reference_before
-    evidence['reference_unchanged']=reference_before=={n:tensor_hash(p) for n,p in trainer.ema_teacher.model.named_parameters() if n in trainer.ema_teacher.parameter_names}
+    evidence['reference_after']=parameter_identity(trainer.ema_teacher.model,trainable=False)
+    evidence['reference_unchanged']=reference_before==evidence['reference_after']
     evidence['wall_seconds']=time.monotonic()-started
     return ArmResult(raw,float(scaled.detach()),components,grads,evidence)
 

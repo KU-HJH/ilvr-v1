@@ -650,3 +650,37 @@ def test_empty_textoff_edges_are_reported_unexercised(tmp_path,monkeypatch):
 def test_runtime_rejects_recorded_trainer_hash_mismatch():
     with pytest.raises(ValueError,match='Trainer hash'):
         api().authenticate_runtime({'execution':{'source_sha256':{'stage1_trainer':'0'*64}}})
+
+
+@pytest.mark.parametrize('owner',['student','reference'])
+def test_arm_identity_detects_frozen_parameter_mutation(tmp_path,owner):
+    """Catches omitting frozen tensors from either arm boundary identity."""
+    from tests.stage1.v5.test_trainer import integrated_fixture
+    trainer,batch,*_=integrated_fixture(tmp_path,debug=False)
+    trainer.model.train()
+    model=trainer.model if owner=='student' else trainer.ema_teacher.model
+    name,parameter=next((name,p) for name,p in model.named_parameters()
+        if not p.requires_grad and name.endswith('model.norm.weight'))
+    changed=[]
+    def mutate_before_first_forward(module,args):
+        if not changed:
+            with torch.no_grad(): parameter.add_(.125)
+            changed.append(name)
+    handle=model.register_forward_pre_hook(mutate_before_first_forward)
+    try:
+        arm=api().run_local_backward(trainer,batch,stochastic=stochastic_for(trainer,batch),oracle=False,observe=True)
+    finally: handle.remove()
+    assert changed==[name]
+    flag='parameters_unchanged' if owner=='student' else 'reference_unchanged'
+    assert arm.evidence[flag] is False
+    student_names={name for name,_ in trainer.model.named_parameters()}
+    reference_names={name for name,_ in trainer.ema_teacher.model.named_parameters()}
+    assert set(arm.evidence['parameters_before'])==student_names
+    assert set(arm.evidence['parameters_after'])==student_names
+    assert set(arm.evidence['reference_before'])==reference_names
+    assert set(arm.evidence['reference_after'])==reference_names
+    before=arm.evidence['parameters_before' if owner=='student' else 'reference_before']
+    after=arm.evidence['parameters_after' if owner=='student' else 'reference_after']
+    assert before[name]['sha256']!=after[name]['sha256']
+    assert set(arm.evidence['trainable_inventory'])==set(arm.gradients)
+    assert set(arm.evidence['trainable_inventory'])<student_names
