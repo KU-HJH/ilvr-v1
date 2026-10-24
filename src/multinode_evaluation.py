@@ -204,6 +204,7 @@ def _validate_generation_config(
     accepted_field_sets += tuple(
         fields | {"static_inference_cache"} for fields in accepted_field_sets
     )
+    accepted_field_sets += tuple(fields | {"numerical_policy"} for fields in accepted_field_sets)
     if not isinstance(value, dict) or set(value) not in accepted_field_sets:
         raise ValueError("invalid generation config")
     if "disable_latent_generation" in value and type(value["disable_latent_generation"]) is not bool:
@@ -220,6 +221,10 @@ def _validate_generation_config(
         value.get("use_kv_cache", False) and value.get("disable_latent_generation", False)
     ):
         raise ValueError("static_inference_cache requires OFF with KV cache")
+    from evaluation.numerics import validate_numerical_policy
+    numerical_policy = validate_numerical_policy(value.get("numerical_policy", "historical"),
+        protocol=evaluation_protocol, stage="stage1",
+        disable_latent_generation=value.get("disable_latent_generation", False))
     max_new_tokens = value["max_new_tokens"]
     max_sequence_length = value.get("max_sequence_length")
     repetition_penalty = value.get("repetition_penalty")
@@ -274,6 +279,8 @@ def _validate_generation_config(
         normalized["use_kv_cache"] = value["use_kv_cache"]
     if "static_inference_cache" in value:
         normalized["static_inference_cache"] = value["static_inference_cache"]
+    if numerical_policy != "historical":
+        normalized["numerical_policy"] = numerical_policy
     return normalized
 
 
@@ -623,6 +630,13 @@ def merge_shards(
                 raise ValueError("evaluation execution identity mismatch between row and manifest")
             if identity is None and row.get("evaluation_protocol","continuous") != "continuous":
                 raise ValueError("original protocol requires explicit evaluation execution identity")
+            from evaluation.numerics import validate_numerical_policy
+            row_policy = validate_numerical_policy(row.get("numerical_policy", "historical"),
+                protocol="original" if original else "continuous", stage="stage1",
+                disable_latent_generation=(manifest.get("generation_config") or {}).get("disable_latent_generation", False))
+            manifest_policy = (manifest.get("generation_config") or {}).get("numerical_policy", "historical")
+            if row_policy != manifest_policy:
+                raise ValueError("numerical policy mismatch between row and manifest")
             row_cache = row.get("use_kv_cache", False)
             manifest_cache = (manifest.get("generation_config") or {}).get("use_kv_cache", False)
             if type(row_cache) is not bool or row_cache != manifest_cache:

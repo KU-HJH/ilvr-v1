@@ -13,6 +13,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from transformers.generation.logits_process import RepetitionPenaltyLogitsProcessor
+from evaluation.numerics import (NUMERICAL_POLICIES, numerical_policy_scope,
+    observe_numerical_policy, validate_numerical_policy)
 
 
 MODEL = 'checkpoints/evaluation-staging/stage1-v5-mn-g16-e3-s648-20261014-150317/prepared-model'
@@ -22,12 +24,13 @@ PROFILE = dict(max_new_tokens=32, max_sequence_length=32768, repetition_penalty=
                temperature=0., top_p=1., generation_limit_policy='bounded')
 
 
-def require_fidelity(actual, frozen):
-    for key in ('generated_suffix_token_ids', 'prompt_identity'):
+def require_fidelity(actual, frozen, *, expected_steps=32):
+    for key in ('generated_suffix_token_ids', 'prompt_identity', 'stop_reason',
+                'latent_start_count', 'latent_block_count'):
         if actual.get(key) != frozen.get(key):
             raise ValueError(f'observer fidelity mismatch: {key}; interpretation is inconclusive')
-    if len(actual['generated_suffix_token_ids']) != 32:
-        raise ValueError('observer fidelity requires the full 32-token suffix')
+    if expected_steps is not None and len(actual['generated_suffix_token_ids']) != expected_steps:
+        raise ValueError(f'observer fidelity requires the full {expected_steps}-token suffix')
 
 
 def comparison_steps(left, right):
@@ -53,8 +56,9 @@ def tensor_difference(left, right):
     same = (left == right) | (torch.isnan(left) & torch.isnan(right))
     count = int((~same).sum())
     delta = torch.where(same, 0., (left.float()-right.float()).abs())
-    return dict(value_shape_mismatch=False, equal=count == 0, unequal_count=count,
-                max_abs=float(delta.max()) if delta.numel() else 0.)
+    finite = bool(torch.isfinite(left).all() and torch.isfinite(right).all())
+    return dict(value_shape_mismatch=False, equal=count == 0, unequal_count=count, finite=finite,
+                max_abs=(float(delta.max()) if delta.numel() else 0.) if finite else None)
 
 
 def last_query_visibility(mask, query_length, key_length, is_causal):
@@ -92,10 +96,13 @@ class PassiveTrace:
         if self.current is None or not isinstance(value, torch.Tensor):
             return
         selected = value if full else value.narrow(row_axis, value.shape[row_axis]-1, 1)
-        event = dict(shape=list(value.shape), value=selected.detach().clone())
+        event = dict(shape=list(value.shape), value=selected.detach().clone(),
+                     output_dtype=str(value.dtype), output_stride=list(value.stride()))
         if module is not None and operand is not None:
             event['module'] = module
             event['operand_shape'] = list(operand.shape)
+            event['operand_dtype'] = str(operand.dtype)
+            event['operand_stride'] = list(operand.stride())
             # Exact full inputs only in the earliest layer, for a bounded causal replay.
             if name.startswith('layer.0.'):
                 event['operand'] = operand.detach().clone()
@@ -203,18 +210,20 @@ class PassiveTrace:
         return self.stack.__exit__(*exception)
 
 
-def replay_row_operation(module, full_input):
+def replay_row_operation(module, full_input, *, numerical_policy="historical"):
     """Identical actual operands, two original row geometries, no observer hooks."""
-    with torch.inference_mode():
+    with numerical_policy_scope(numerical_policy), torch.inference_mode():
+        metadata = ({"numerical_observation": observe_numerical_policy(numerical_policy)}
+                    if numerical_policy != "historical" else {})
         full = module(full_input)
         newest = module(full_input[..., -1:, :].contiguous())
-    return dict(kind='rowwise geometry replay', synthetic_preceding_rows=False,
+    return dict(**metadata, kind='rowwise geometry replay', synthetic_preceding_rows=False,
                 full_shape=list(full_input.shape), newest_shape=list(full_input[..., -1:, :].shape),
                 difference=tensor_difference(full[..., -1:, :], newest),
                 full_output=tensor_record(full[..., -1:, :]), newest_output=tensor_record(newest))
 
 
-def compare_traces(off, on):
+def compare_traces(off, on, *, numerical_policy="historical"):
     rows = []
     first = None
     replay = None
@@ -235,6 +244,10 @@ def compare_traces(off, on):
             row = dict(step=step, operation=name, physical_shape_off=left['shape'],
                        physical_shape_on=right['shape'], physical_shape_differs=left['shape'] != right['shape'],
                        difference=difference, off=tensor_record(left['value']), on=tensor_record(right['value']))
+            for side, event in (('off', left), ('on', right)):
+                if 'operand_dtype' in event:
+                    row['outer_operands_'+side] = dict(dtype=event['operand_dtype'],
+                        shape=event['operand_shape'], stride=event['operand_stride'])
             if name.startswith('logits.'):
                 row['top_off'] = top_logits(left['value'])
                 row['top_on'] = top_logits(right['value'])
@@ -250,18 +263,97 @@ def compare_traces(off, on):
                     input_difference = tensor_difference(operand[..., -1:, :], right['operand'][..., -1:, :])
                     first['newest_operand_difference'] = input_difference
                     if input_difference['equal'] and operand.shape[-2] != right['operand'].shape[-2]:
-                        replay = replay_row_operation(left['module'], operand)
+                        replay = replay_row_operation(left['module'], operand, numerical_policy=numerical_policy)
                         replay['observed_difference'] = difference
                         replay['scope'] = 'same actual OFF full input and identical newest operand; rowwise geometry sensitivity'
     return dict(compared_steps=compared, first_unequal_observed=first, replay=replay,
-                replay_limitation=None if replay else 'No trustworthy exact-operand geometry replay at first unequal observed boundary.',
+                replay_limitation=('Replay clones may change original strides/layout; internal kernel identity remains unobserved.'
+                                   if replay else 'No trustworthy exact-operand geometry replay at first unequal observed boundary.'),
                 comparisons=rows, decoder_off=[s['decoder'] for s in off.steps[:compared]],
                 decoder_on=[s['decoder'] for s in on.steps[:compared]])
 
 
+def alignment_verdict(off_trace: PassiveTrace, on_trace: PassiveTrace,
+                      off_result: dict, on_result: dict, *, expected_steps: int) -> dict:
+    """Accept only exact required tensors on equal logical histories and real KV geometry.
+
+    Missing evidence is inconclusive. Equal token choices alone never establish
+    numerical equality. An unequal-history child contributes no tensor comparison.
+    """
+    names = ('layer.0.q_proj', 'logits.raw', 'logits.post_penalty')
+    missing = False
+    finite = True
+    equal = {name: True for name in names}
+    seen = {name: 0 for name in names}
+    histories = True
+    geometry = True
+    compared = 0
+    tokens_off = off_result.get('generated_suffix_token_ids')
+    tokens_on = on_result.get('generated_suffix_token_ids')
+    tokens_equal = None if tokens_off is None or tokens_on is None else tokens_off == tokens_on
+    prompt = off_result.get('prompt_token_length')
+    if type(prompt) is not int or on_result.get('prompt_token_length') != prompt:
+        missing = True
+        prompt = None
+    if off_result.get('prompt_identity') is None or on_result.get('prompt_identity') is None:
+        missing = True
+    elif off_result['prompt_identity'] != on_result['prompt_identity']:
+        histories = False
+    for i, (off, on) in enumerate(zip(off_trace.steps[:expected_steps], on_trace.steps[:expected_steps])):
+        a, b = off.get('history'), on.get('history')
+        if a is None or b is None:
+            missing = True
+            break
+        if a != b:
+            histories = False
+            break
+        if prompt is not None and (len(a) != prompt+i or
+                (tokens_off is not None and a[prompt:] != tokens_off[:i]) or
+                (tokens_on is not None and b[prompt:] != tokens_on[:i])):
+            histories = False
+            break
+        compared += 1
+        for cached, step in ((False, off), (True, on)):
+            decoder = step.get('decoder', {})
+            required = ('query_length', 'past_length', 'use_cache', 'returned_cache_length')
+            if prompt is None or not all(key in decoder for key in required):
+                missing = True
+                continue
+            wanted = (1 if cached and i else prompt+i,
+                      prompt+i-1 if cached and i else 0, cached,
+                      prompt+i if cached else None)
+            if tuple(decoder[key] for key in required) != wanted:
+                geometry = False
+        for name in names:
+            left = off.get('events', {}).get(name, {}).get('value')
+            right = on.get('events', {}).get(name, {}).get('value')
+            if not isinstance(left, torch.Tensor) or not isinstance(right, torch.Tensor):
+                missing = True
+                continue
+            seen[name] += 1
+            finite &= bool(torch.isfinite(left).all() and torch.isfinite(right).all())
+            equal[name] &= torch.equal(left, right)
+    coverage = (not missing and histories and compared == expected_steps and expected_steps > 0
+                and tokens_off is not None and tokens_on is not None
+                and len(tokens_off) == len(tokens_on) == expected_steps
+                and all(count == expected_steps for count in seen.values()))
+    q_equal = equal[names[0]] if seen[names[0]] else None
+    logits_equal = (all(equal[name] for name in names[1:])
+                    if all(seen[name] for name in names[1:]) else None)
+    failed = (not finite or tokens_equal is False or q_equal is False
+              or logits_equal is False or not geometry)
+    status = 'fail' if failed else 'pass' if coverage else 'inconclusive'
+    return dict(status=status, q_equal=q_equal, logits_equal=logits_equal,
+        tokens_equal=tokens_equal, coverage_complete=coverage, finite=finite,
+        history_equal=histories, cache_geometry_expected=geometry,
+        compared_steps=compared, expected_steps=expected_steps,
+        completed_lengths=[None if tokens is None else len(tokens) for tokens in (tokens_off, tokens_on)])
+
+
 def top_logits(value):
     values, ids = value.float().reshape(-1).topk(5)
-    return [dict(token_id=int(i), value=float(v)) for i, v in zip(ids, values)]
+    return [dict(token_id=int(i), value=float(v) if torch.isfinite(v) else None)
+            for i, v in zip(ids, values)]
 
 
 def read_row(path):
@@ -272,9 +364,12 @@ def read_row(path):
     return selected[0]
 
 
-def selected_sample():
+def selected_sample(source_index=12):
     from multinode_evaluation import resolve_evaluation_image_paths
-    sample = read_row(SOURCE)
+    if type(source_index) is not int or source_index not in (0, 3, 12):
+        raise ValueError('source index must be 0, 3 or 12')
+    sample = (read_row(SOURCE) if source_index == 12 else
+              json.loads(Path('data/TEST.jsonl').read_text().splitlines()[source_index]))
     sample['image_input'] = resolve_evaluation_image_paths(sample.get('image_input', []), Path('data').resolve())
     return sample
 
@@ -291,38 +386,67 @@ def output_directory(path):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir', required=True)
-    parser.add_argument('--frozen-off', required=True)
-    parser.add_argument('--frozen-on', required=True)
+    parser.add_argument('--frozen-off')
+    parser.add_argument('--frozen-on')
+    parser.add_argument('--numerical-policy', choices=NUMERICAL_POLICIES, default='historical')
+    parser.add_argument('--source-index', type=int, choices=(0, 3, 12), default=12)
+    parser.add_argument('--fresh-controls', action='store_true')
     args = parser.parse_args(argv)
-    frozen = [read_row(args.frozen_off), read_row(args.frozen_on)]
-    sample = selected_sample()
-    steps = comparison_steps(*(row['generated_suffix_token_ids'] for row in frozen))
+    if not args.fresh_controls and (not args.frozen_off or not args.frozen_on):
+        parser.error('provide both frozen controls or --fresh-controls')
+    if args.numerical_policy != 'historical' and not args.fresh_controls:
+        parser.error('nonhistorical numerical policy requires --fresh-controls')
+    frozen = [] if args.fresh_controls else [read_row(args.frozen_off), read_row(args.frozen_on)]
+    sample = selected_sample(args.source_index)
+    steps = PROFILE['max_new_tokens'] if args.fresh_controls else comparison_steps(
+        *(row['generated_suffix_token_ids'] for row in frozen))
     destination = output_directory(args.output_dir)
     # Import the proven loader/runner, preserving their configured dtype and backends.
     import eval as evaluation
     from peft_common import resolve_qwen2_5_vl_model
-    traces, results = [], []
+    traces, results, controls, fidelity = [], [], [], []
     try:
         model, processor = evaluation.load_evaluation_artifacts(model_dir=MODEL, base_model_dir=BASE,
             cache_dir='data/hf-cache', evaluation_protocol='continuous')
         model.eval()
         qwen = resolve_qwen2_5_vl_model(model)
-        for cached, reference in zip((False, True), frozen):
-            with PassiveTrace(qwen, max_steps=steps) as trace:
-                result = evaluation.run_one_example(model, processor, sample, PROFILE,
-                    disable_latent_generation=True, use_kv_cache=cached, evaluation_protocol='continuous')
-            results.append(result)
-            require_fidelity(result, reference)
-            traces.append(trace)
-        report = compare_traces(*traces)
-        report.update(status='faithful', results=results, profile=PROFILE,
-            source=SOURCE, model=MODEL, base=BASE,
-            interpretation='Actual boundary tensors and SDPA operands observed. Kernel identity unobserved. '
+        validate_numerical_policy(args.numerical_policy, protocol='continuous', stage=qwen.config.stage,
+                                  disable_latent_generation=True)
+        with numerical_policy_scope(args.numerical_policy):
+            observation = observe_numerical_policy(args.numerical_policy, qwen)
+            if args.fresh_controls:
+                for cached in (False, True):
+                    controls.append(evaluation.run_one_example(model, processor, sample, PROFILE,
+                        disable_latent_generation=True, use_kv_cache=cached,
+                        evaluation_protocol='continuous', numerical_policy=args.numerical_policy))
+            references = controls if args.fresh_controls else frozen
+            for cached, reference in zip((False, True), references):
+                with PassiveTrace(qwen, max_steps=steps) as trace:
+                    result = evaluation.run_one_example(model, processor, sample, PROFILE,
+                        disable_latent_generation=True, use_kv_cache=cached,
+                        evaluation_protocol='continuous', numerical_policy=args.numerical_policy)
+                results.append(result)
+                require_fidelity(result, reference, expected_steps=None if args.fresh_controls else 32)
+                fidelity.append(True)
+                traces.append(trace)
+            report = compare_traces(*traces, numerical_policy=args.numerical_policy)
+            expected = 32 if args.source_index == 12 else max(
+                len(row['generated_suffix_token_ids']) for row in results)
+            verdict = alignment_verdict(*traces, *results, expected_steps=expected)
+        report.update(status=verdict['status'] if args.fresh_controls else 'faithful',
+            alignment_verdict=verdict, observer_fidelity=fidelity, fresh_controls=controls,
+            numerical_policy=args.numerical_policy, numerical_observation=observation,
+            results=results, profile=PROFILE, max_new_tokens=32, source_index=args.source_index,
+            source=SOURCE if args.source_index == 12 else 'data/TEST.jsonl', model=MODEL, base=BASE,
+            interpretation='Actual outer boundary tensors and SDPA operands observed. Kernel identity and internal GEMM operands unobserved. '
+                           'Parameter dtypes describe loaded tensors; operand/output dtypes describe outer module calls. '
                            'Residual sums observed at post-attention norm input and layer output; internal arithmetic not traced. '
                            'Penalty logits precede native latent-control token suppression. '
-                           'Histories observed at native repetition call; decoder input_ids are normally absent.')
+                           'Histories observed at native repetition call; decoder input_ids are normally absent. '
+                           'Replay clones may not preserve original strides/layout; replay cannot establish kernel identity.')
     except Exception as error:
-        report = dict(status='inconclusive', error=f'{type(error).__name__}: {error}', results=results)
+        report = dict(status='inconclusive', error=f'{type(error).__name__}: {error}', results=results,
+                      fresh_controls=controls, observer_fidelity=fidelity, numerical_policy=args.numerical_policy)
         with (destination/'report.json').open('x') as stream:
             json.dump(report, stream, indent=2, allow_nan=False)
         raise

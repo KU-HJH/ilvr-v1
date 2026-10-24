@@ -309,3 +309,112 @@ def test_summary_cli_keeps_execution_metadata_out_of_semantic_profile(explicit_b
     summary = json.loads(output.read_text())
     assert summary['off_use_kv_cache'] is True
     assert summary['generation_profile'] == {'max_new_tokens': 4096}
+
+
+from tests.evaluation.test_numerics import restore_precision, state
+
+
+@pytest.mark.parametrize('cache', [False, True])
+@pytest.mark.parametrize('policy', ['historical', 'tf32_off', 'full_accumulation', 'math_sdpa'])
+def test_eval_policy_is_separate_scoped_and_records_active_controls(cache, policy, monkeypatch):
+    # Losing the inference scope, leaking kwargs or metadata, or retaining precision fails here.
+    module = _import_entry_point('eval', monkeypatch)
+    model = tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage = 'stage1'
+    processor = FakeProcessor(include_visual_inputs=False)
+    torch.set_float32_matmul_precision('medium')
+    before = state()
+    observed = []
+    handle = model.model.layers[0].self_attn.q_proj.register_forward_pre_hook(
+        lambda _m, _a: observed.append(state()))
+    kwargs = dict(max_new_tokens=2, repetition_penalty=1.05, temperature=0., top_p=1.)
+    try:
+        result = module.run_one_example(model, processor, {'text_input': 'question'}, kwargs,
+            disable_latent_generation=True, use_kv_cache=cache, numerical_policy=policy)
+        assert state() == before
+        assert kwargs == dict(max_new_tokens=2, repetition_penalty=1.05, temperature=0., top_p=1.)
+        if policy == 'historical':
+            assert 'numerical_policy' not in result and 'numerical_observation' not in result
+            assert all(s == before for s in observed)
+        else:
+            assert result['numerical_policy'] == policy
+            assert result['numerical_observation']['float32_matmul_precision'] == 'highest'
+            assert result['numerical_observation']['matmul_allow_tf32'] is False
+            assert result['numerical_observation']['parameter_dtypes']['weight'] == 'torch.float32'
+            assert all(s[0] == 'highest' and s[1] is False for s in observed)
+        observed.clear()
+        module.run_one_example(model, processor, {'text_input': 'question'}, kwargs,
+                               disable_latent_generation=True, use_kv_cache=cache)
+        assert all(s == before for s in observed)
+    finally:
+        handle.remove()
+
+
+def test_eval_parser_accepts_explicit_policy_and_preserves_historical_default(monkeypatch):
+    module = _import_entry_point('eval', monkeypatch)
+    argv = ['eval', '--model_dir', 'model', '--test_data_path', 'data', '--task_name',
+            'zebra-cot', '--runtime_identity_path', 'runtime']
+    monkeypatch.setattr(sys, 'argv', argv)
+    assert module.get_eval_args().numerical_policy == 'historical'
+    monkeypatch.setattr(sys, 'argv', argv+['--numerical-policy', 'full_accumulation'])
+    assert module.get_eval_args().numerical_policy == 'full_accumulation'
+    monkeypatch.setattr(sys, 'argv', argv+['--numerical-policy', 'unknown'])
+    with pytest.raises(SystemExit):
+        module.get_eval_args()
+
+
+def policy_main_args(tmp_path, *, shards=1, policy='tf32_off', protocol='continuous', disable=True):
+    from types import SimpleNamespace
+    dataset = tmp_path/'policy-data.jsonl'
+    dataset.write_text(json.dumps(dict(text_input='question', image_input=[], original_final_answer='42'))+'\n')
+    return SimpleNamespace(model_dir=str(tmp_path), base_model_dir=None, cache_dir='data/hf-cache',
+        test_data_path=str(dataset), output_json_path=str(tmp_path/'policy-worker.jsonl'),
+        task_name='zebra-cot', max_new_tokens=2, max_sequence_length=32, repetition_penalty=1.05,
+        temperature=0., top_p=1., num_shards=shards, shard_index=0, model_identity='model-A',
+        disable_latent_generation=disable, use_kv_cache=False, evaluation_protocol=protocol,
+        numerical_policy=policy, runtime_identity_path=str(tmp_path/'runtime.json'))
+
+
+@pytest.mark.parametrize('protocol,stage,disable', [('original','stage1',False),
+    ('continuous','stage2',True), ('continuous','stage1',False)])
+def test_main_rejects_unsupported_policy_globally_before_any_output(protocol, stage, disable, tmp_path, monkeypatch):
+    module = _import_entry_point('eval', monkeypatch)
+    from step_preference import capacity_evidence
+    monkeypatch.setattr(capacity_evidence, 'git_identity', lambda: 'a'*40)
+    args = policy_main_args(tmp_path, protocol=protocol, disable=disable)
+    args.runtime_identity_path = None
+    monkeypatch.setattr(module, 'get_eval_args', lambda: args)
+    model = tiny_stage2_qwen().eval()
+    model.config.stage = stage
+    monkeypatch.setattr(module, 'load_evaluation_artifacts', lambda **_kw: (model, FakeProcessor()))
+    with pytest.raises(ValueError, match='numerical policy'):
+        module.main()
+    from pathlib import Path
+    assert not Path(args.output_json_path).exists()
+    assert not (tmp_path/'runtime.json').exists()
+
+
+@pytest.mark.parametrize('shards', [1, 4])
+def test_main_records_new_policy_runtime_and_row_identity(shards, tmp_path, monkeypatch):
+    module = _import_entry_point('eval', monkeypatch)
+    from step_preference import capacity_evidence
+    monkeypatch.setattr(capacity_evidence, 'git_identity', lambda: 'a'*40)
+    args = policy_main_args(tmp_path, shards=shards)
+    monkeypatch.setattr(module, 'get_eval_args', lambda: args)
+    model = tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage = 'stage1'
+    monkeypatch.setattr(module, 'load_evaluation_artifacts',
+                        lambda **_kw: (model, FakeProcessor(include_visual_inputs=False)))
+    assert module.main() == (0 if shards == 4 else None)
+    from pathlib import Path
+    rows = [json.loads(line) for line in Path(args.output_json_path).read_text().splitlines()]
+    assert all(r['numerical_policy'] == 'tf32_off' for r in rows)
+    assert all(r['numerical_observation']['matmul_allow_tf32'] is False for r in rows)
+    runtime = json.loads(Path(args.runtime_identity_path).read_text())
+    assert runtime['kind'] == 'numerical-policy-evaluation-runtime-identity'
+    assert runtime['numerical_policy'] == 'tf32_off'
+    assert runtime['numerical_observation']['float32_matmul_precision'] == 'highest'
+    assert runtime['execution_identity']['evaluation_protocol'] == 'continuous'
+    if shards == 4:
+        manifest = json.loads(Path(args.output_json_path+'.manifest.json').read_text())
+        assert manifest['generation_config']['numerical_policy'] == 'tf32_off'

@@ -65,7 +65,9 @@ from evaluation.continuous_latent import (
 from evaluation.runtime import prepare_evaluation_input
 from evaluation import original_scoring
 from evaluation.original_ilvr import (generate_original, load_original_model, execution_identity, config_resolution)
-from evaluation.protocol import resolve_protocol, resolve_options, validate_inference_options
+from evaluation.protocol import resolve_protocol, resolve_options, validate_inference_options, validate_execution_identity
+from evaluation.numerics import (NUMERICAL_POLICIES, validate_numerical_policy,
+    numerical_policy_scope, observe_numerical_policy)
 
 try:
     from mathruler.grader import extract_boxed_content
@@ -144,6 +146,7 @@ def get_eval_args():
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--disable-latent-generation", action="store_true",
                         help="Stage 1 diagnostic: suppress latent START generation.")
+    parser.add_argument("--numerical-policy", choices=NUMERICAL_POLICIES, default="historical")
     parser.add_argument("--use-kv-cache", action="store_true",
                         help="Cache Stage 1 OFF decoding (requires --disable-latent-generation).")
     parser.add_argument("--static-inference-cache", action="store_true",
@@ -372,6 +375,7 @@ def run_one_example(
     gen_kwargs: Dict[str, Any],
     *, disable_latent_generation: bool = False, use_kv_cache: bool = False,
     static_inference_cache: bool = False, evaluation_protocol: str = "continuous",
+    numerical_policy: str = "historical",
 ) -> Dict[str, Any]:
     """
     Run inference on a single example and return raw output,
@@ -380,6 +384,8 @@ def run_one_example(
     qwen_model = resolve_qwen2_5_vl_model(model)
     stage = getattr(qwen_model.config, "stage", None)
     evaluation_protocol = resolve_protocol(evaluation_protocol, stage)
+    validate_numerical_policy(numerical_policy, protocol=evaluation_protocol, stage=stage,
+        disable_latent_generation=disable_latent_generation)
     validate_inference_options(evaluation_protocol, stage,
         disable_latent_generation=disable_latent_generation, use_kv_cache=use_kv_cache,
         static_inference_cache=static_inference_cache)
@@ -449,7 +455,10 @@ def run_one_example(
         torch.cuda.synchronize(effective_device)
     start_time = time.perf_counter()
 
-    with torch.inference_mode():
+    with numerical_policy_scope(numerical_policy), torch.inference_mode():
+        numerical_metadata = ({"numerical_policy": numerical_policy,
+            "numerical_observation": observe_numerical_policy(numerical_policy, qwen_model)}
+            if numerical_policy != "historical" else {})
         if evaluation_protocol == "original":
             generation_result = generate_original(model, inputs, gen_kwargs, tokenizer=processor.tokenizer,
                 static_inference_cache=static_inference_cache)
@@ -500,6 +509,7 @@ def run_one_example(
         assistant_only = extract_assistant_content(assistant_text)
         extracted = extract_final_answer(assistant_only).extracted
     return {
+        **numerical_metadata,
         **({"evaluation_protocol":evaluation_protocol} if evaluation_protocol=="original" else {}),
         "prompt_identity": prepared.prompt_identity,
         "prompt_token_length": prepared.prompt_token_length,
@@ -516,7 +526,20 @@ def run_one_example(
     }
 
 
-def publish_evaluation_runtime_identity(model, model_dir, output_path, *, evaluation_protocol="continuous", base_model_dir=None, generation_kwargs=None):
+def publish_evaluation_runtime_identity(model, model_dir, output_path, *, evaluation_protocol="continuous", base_model_dir=None, generation_kwargs=None, numerical_policy="historical"):
+    if numerical_policy != "historical":
+        from step_preference.capacity_evidence import git_identity
+        qwen = resolve_qwen2_5_vl_model(model)
+        identity = validate_execution_identity(execution_identity(qwen, evaluation_protocol, generation_kwargs or {}))
+        with numerical_policy_scope(numerical_policy):
+            value = dict(schema_version=1, kind="numerical-policy-evaluation-runtime-identity",
+                git_commit=git_identity(), model_dir=str(Path(model_dir).resolve(strict=True)),
+                execution_identity=identity, numerical_policy=numerical_policy,
+                numerical_observation=observe_numerical_policy(numerical_policy, qwen))
+        with Path(output_path).open("x", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+        return Path(output_path)
     if evaluation_protocol == "original":
         from step_preference.capacity_evidence import git_identity
         qwen = resolve_qwen2_5_vl_model(model)
@@ -580,6 +603,15 @@ def main():
         **({"evaluation_protocol": args.evaluation_protocol} if hasattr(args,"evaluation_protocol") else {}),
     )
     protocol = resolve_protocol(args.evaluation_protocol, resolve_qwen2_5_vl_model(model).config.stage) if hasattr(args,"evaluation_protocol") else "continuous"
+    numerical_policy = getattr(args, "numerical_policy", "historical")
+    numerical_metadata = {}
+    if numerical_policy != "historical":
+        qwen = resolve_qwen2_5_vl_model(model)
+        validate_numerical_policy(numerical_policy, protocol=protocol, stage=qwen.config.stage,
+            disable_latent_generation=getattr(args, "disable_latent_generation", False))
+        with numerical_policy_scope(numerical_policy):
+            numerical_metadata = dict(numerical_policy=numerical_policy,
+                numerical_observation=observe_numerical_policy(numerical_policy, qwen))
     args.repetition_penalty, args.generation_limit_policy = resolve_options(protocol,args.repetition_penalty,getattr(args,"generation_limit_policy",None))
     if protocol == "original":
         validate_inference_options(protocol, resolve_qwen2_5_vl_model(model).config.stage,
@@ -613,6 +645,7 @@ def main():
     actual_identity = execution_identity(resolve_qwen2_5_vl_model(model),protocol,gen_kwargs) if hasattr(args,"evaluation_protocol") else None
     if runtime_identity_path is not None:
         publish_evaluation_runtime_identity(model,args.model_dir,runtime_identity_path,
+            **(dict(numerical_policy=numerical_policy, generation_kwargs=gen_kwargs) if numerical_policy != "historical" else {}),
             **(dict(evaluation_protocol=protocol,base_model_dir=args.base_model_dir,generation_kwargs=gen_kwargs) if protocol=="original" else {}))
     total = len(data)
     owned_samples = (
@@ -639,6 +672,7 @@ def main():
             )
             pred = run_one_example(
                 model, processor, evaluation_sample, gen_kwargs,
+                **({"numerical_policy": numerical_policy} if numerical_policy != "historical" else {}),
                 **({"evaluation_protocol":protocol} if hasattr(args,"evaluation_protocol") else {}),
                 **({"disable_latent_generation": True}
                    if getattr(args, "disable_latent_generation", False) else {}),
@@ -778,6 +812,7 @@ def main():
     } if (getattr(args, "disable_latent_generation", False)
           or getattr(args, "static_inference_cache", False)
           or getattr(args, "model_identity", None) is not None) else {}
+    diagnostic_identity.update(numerical_metadata)
     for row in results:
         row.update(diagnostic_identity)
         if actual_identity is not None:
@@ -834,6 +869,7 @@ def main():
                 args.model_dir, args.model_identity
             ),
             generation_config={
+                **({"numerical_policy": numerical_policy} if numerical_policy != "historical" else {}),
                 "max_new_tokens": args.max_new_tokens,
                 "max_sequence_length": args.max_sequence_length,
                 "repetition_penalty": actual_identity["generation_config"]["repetition_penalty"] if protocol=="original" else args.repetition_penalty,

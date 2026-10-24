@@ -561,3 +561,48 @@ def test_merge_never_overwrites_or_partially_publishes_outputs(tmp_path):
 
     assert not (tmp_path / "merged.jsonl").exists()
     assert summary_path.read_text(encoding="utf-8") == "owned-by-another-run\n"
+
+
+def numerical_config(policy=None):
+    result = dict(max_new_tokens=32, max_sequence_length=128, repetition_penalty=1.05,
+                  temperature=0., top_p=1., disable_latent_generation=True)
+    if policy is not None:
+        result['numerical_policy'] = policy
+    return result
+
+
+@pytest.mark.parametrize('policy', ['tf32_off', 'full_accumulation', 'math_sdpa'])
+def test_merge_roundtrips_matching_numerical_policy(policy, tmp_path):
+    rows = {i: dict(index=i, task_name='task', match=True, numerical_policy=policy) for i in range(4)}
+    shards = _write_fake_shards(tmp_path, generation_configs=[numerical_config(policy)]*4, row_overrides=rows)
+    assert _merge(tmp_path, shards, 4)['generation_config']['numerical_policy'] == policy
+
+
+def test_merge_missing_and_explicit_historical_policy_are_compatible(tmp_path):
+    rows = {i: dict(index=i, task_name='task', match=True, **({'numerical_policy':'historical'} if i%2 else {}))
+            for i in range(4)}
+    shards = _write_fake_shards(tmp_path, generation_configs=[numerical_config(p) for p in [None,'historical',None,'historical']], row_overrides=rows)
+    assert 'numerical_policy' not in _merge(tmp_path, shards, 4)['generation_config']
+
+
+def test_merge_rejects_mixed_numerical_policies(tmp_path):
+    shards = _write_fake_shards(tmp_path, generation_configs=[numerical_config(p) for p in ['tf32_off','full_accumulation','tf32_off','tf32_off']])
+    with pytest.raises(ValueError, match='generation config mismatch'):
+        _merge(tmp_path, shards, 4)
+
+
+@pytest.mark.parametrize('policy', ['unknown', True, None])
+def test_manifest_rejects_unknown_or_nonstring_numerical_policy(policy, tmp_path):
+    config = numerical_config()
+    config['numerical_policy'] = policy
+    with pytest.raises(ValueError, match='numerical policy'):
+        _write_fake_shards(tmp_path, generation_configs=[config]*4)
+
+
+@pytest.mark.parametrize('row_policy', ['full_accumulation', 'historical', 'unknown', True, None])
+def test_merge_rejects_row_manifest_numerical_disagreement(row_policy, tmp_path):
+    rows = {i: dict(index=i, task_name='task', match=True, numerical_policy='tf32_off') for i in range(4)}
+    rows[2]['numerical_policy'] = row_policy
+    shards = _write_fake_shards(tmp_path, generation_configs=[numerical_config('tf32_off')]*4, row_overrides=rows)
+    with pytest.raises(ValueError, match='numerical policy'):
+        _merge(tmp_path, shards, 4)
