@@ -1,4 +1,4 @@
-# Trained Stage1-v5 K/V reuse loss and gradient diagnostic — v1
+# Trained Stage1-v5 K/V reuse loss and gradient diagnostic — v2
 
 Status: design proposal for human review; no diagnostic source implementation authorized yet.
 
@@ -24,9 +24,9 @@ from approval of this design.
 
 - The checkpoint is `checkpoints/stage1-v5-mn-g16-e3-s648-20261014-150317/checkpoint-648`.
   The original Qwen2.5-VL-3B base and `stage1_v5_reference.pt` are present.
-- Historical revision `07eb774281925866502e72bdfcaa4df54073103a` jointly matches
-  the checkpoint's recorded Stage1 and Stage1-v5 Trainer SHA256 values. This
-  does not authenticate every historical runtime byte or environment detail.
+- Historical revision `07eb774281925866502e72bdfcaa4df54073103a` matches the
+  checkpoint's recorded Stage1, Stage1-v5 and framework Trainer SHA256 values.
+  This does not authenticate every historical runtime byte or environment detail.
 - Current code uses a different DIL normalization. The probe must execute the
   historical objective, not silently substitute today's token normalization.
 - The saved student uses BF16, DoRA r32/alpha64/dropout0.05, SDPA decoder,
@@ -114,16 +114,28 @@ substituted engine pieces. It does not validate historical ZeRO/DDP scaling.
 
 ## Independent full-prefix counterfactual
 
-The native arm is unmodified. Only the oracle arm temporarily replaces the
-native `run_v5_packed_replay` call target. Preserve exact original binding
-presence/value on success and exception exits.
+The native arithmetic is unmodified. Only the oracle arm temporarily replaces
+the native `run_v5_packed_replay` call target. A separate passive observer may
+wrap the actual native entropy-support builder, returning its unmodified result.
+Preserve exact original binding presence/value on success and exception exits.
 
-The oracle recomputes complete decoder sequences from controlled source
-embeddings, position IDs and padding. It may consume frozen selected block/
-target coordinates as experimental inputs, but it must not read captured
-K/V, native visibility/planner output or prefix-state tensors. Supply neither
-past_key_values nor stage2_prefix_key_values. CPU sentinels must detect an
-attempt to read the captured K/V bank.
+The oracle recomputes complete decoder sequences from controlled original
+decoder inputs. Specify their channel separately: a passive student-decoder
+pre-hook records the first native F call's live prepared inputs_embeds,
+position IDs and padding, before prefix computation. Preserve the live graph
+from trainable token rows; helper targets remain detached by native preparation.
+The oracle receives only this restricted input view and frozen block/target
+coordinates. It does not extract inputs or positions from the native trace,
+and cannot read captured K/V, attention rows, native visibility/planner output
+or prefix-state tensors. Supply neither past_key_values nor
+stage2_prefix_key_values. CPU sentinels must detect forbidden trace reads.
+
+Sharing the original input-preparation graph is intentional: this isolates
+decoder-prefix state computation, not separate full-policy embedding/image
+preparation. CPU witnesses must cover a live token-row gradient, detached
+helper targets and two overlapping prefixes, and detect detachment of the live
+input channel. Do not claim that this oracle independently re-embeds images or
+tokens for every branch.
 
 Build masks independently from literal causal and source coordinates. Keep
 the whole prefix subgraph clean. V-off removes latent-body keys only from the
@@ -137,13 +149,29 @@ the native arm. Use the original source-coordinate policy, not arbitrary
 RNG reseeding as a substitute. Checkpoint recomputation must retain those
 bindings. All native loss reduction functions remain unchanged.
 
+Use saved seed42 and the checkpoint's recorded global_step as a declared
+diagnostic context key, with the selected sample's raw/canonical identity,
+valid length and exact stochastic-site inventory recorded. This defines a
+common local realization; it is not evidence of the historical training draw.
+
 ## Measurements and validity
 
-Run fresh native A, native A-repeat and oracle B with identical represented
-parameters, input, reference, helper targets and controlled stochastic context.
-Freeze selected text keys/support as common input. Verify helper, reference,
-clean output and coordinate fidelity before interpreting the branch contrast.
-If they differ, report attribution as inconclusive.
+Run fresh unobserved native U, observed native A, observed native A-repeat and
+observed oracle B with identical represented parameters, input, reference,
+helper targets and controlled stochastic context. Verify native observer
+fidelity U/A and native repeat A/A-repeat before interpreting the contrast.
+If those controls change loss/gradient or helper/reference/clean state,
+attribution is inconclusive; do not weaken a control after seeing results.
+
+Clean-derived Text-off keys and original block coordinates must match across
+arms. Entropy supports are different: the saved `independent` mode derives them
+from each arm's V-off logits through the unmodified native
+`build_entropy_support`. Preserve and passively observe each actual result;
+never substitute A's support into B or force a common support. Record indices/
+hashes, overlap and equality for the actual calls. If supports differ, report
+the native loss/gradient contrast as including a discrete selection-mediated
+effect. That difference alone does not make the native comparison invalid,
+but it cannot support an isolated fixed-support rounding claim.
 
 Use autograd without optimizer or parameter updates. Compare every trainable
 named parameter, including sparse token/head rows and DoRA magnitude. Distinguish
@@ -162,13 +190,22 @@ declared equivalent using FP32 tolerances. A discrepancy establishes the
 concrete native-versus-oracle contrast, not a located cache defect, wrong
 optimizer gradients or a precision remedy.
 
+Record active V-off/Text-off edges, scored queries and component magnitudes.
+Keep the fixed first-row selection rule if a branch is inactive and label it
+unexercised. Matching the total represented BF16 parameter gradients does not
+establish equality of each OFF-branch Jacobian or hidden intermediate; no such
+claim follows without a separate component-gradient witness.
+
 ## First nail and execution gates
 
 The load-bearing premise is fidelity of the carrier and oracle to the same
 historical local objective and stochastic realization. Before GPU, demonstrate
 the CPU carrier/native-parent match and detect detached-prefix and wrong-
-visibility controls with nonzero DoRA/row gradients. Those tests are proposed
-work, not evidence already obtained for this diagnostic.
+visibility controls with nonzero DoRA/row gradients. Also force a controlled
+V-off ranking crossing in CPU fixtures: each native independent support must
+remain arm-specific and be observed without replacement. The passive observer
+must preserve native loss/gradient and restore all bindings. Those tests are
+proposed work, not evidence already obtained for this diagnostic.
 
 On GPU, native-repeat helper/reference/clean/selection/dtype fidelity precedes
 the oracle comparison. Missing evidence, unsupported runtime, nonfinite values,
@@ -193,3 +230,13 @@ authentication; do not overstate it.
 
 This document is Superpowers control material. The approved budget does not
 authorize source implementation before this design's final approval.
+
+The independent builder question on v1 identified the entropy-support issue.
+Its source-based answer is incorporated above. v1 was not implemented or
+human-approved. Existing saved formulas remain authoritative; this revision
+does not add a fixed-support objective.
+
+Controller proposals made explicit for human review are the local repeated-
+example normalization, shared original input-preparation graph, standalone
+pre-engine boundary and declared diagnostic stochastic context. They are not
+being represented as previously agreed historical execution details.
