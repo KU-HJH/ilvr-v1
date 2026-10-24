@@ -253,7 +253,7 @@ def test_replay_seeds_original_entry_backend_before_composition(monkeypatch):
     monkeypatch.setattr(torch.backends.cudnn,'deterministic',False)
     monkeypatch.setattr(torch.backends.cudnn,'benchmark',True)
     sentinel=object()
-    def loading_boundary(parsed):
+    def loading_boundary(parsed, **kwargs):
         assert torch.backends.cudnn.deterministic is True
         assert torch.backends.cudnn.benchmark is False
         assert torch.initial_seed()==42
@@ -315,3 +315,54 @@ def test_replay_output_passes_real_cross_experiment_peft_resume_guard(tmp_path, 
     # Exercise the unchanged cross-experiment guard that real composition calls.
     # The former <run-id>/replay destination is rejected by this real validator.
     checkpointing._validate_peft_resume_location(output,args.source_checkpoint)
+
+
+@pytest.mark.parametrize('drift', ['none', 'image', 'tokens'])
+def test_replay_processor_roundtrip_restores_only_exact_original_identity(tmp_path, drift):
+    module=api()
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import AutoProcessor, Qwen2TokenizerFast, Qwen2VLImageProcessor, Qwen2_5_VLProcessor
+    from stage1.composition import LATENT_TOKEN_STRINGS, _add_fresh_latent_tokens
+    from stage1.v5_reference import _processor_identity
+    from tests.stage1.v5.test_resume import contract
+    backend=Tokenizer(WordLevel({'<unk>':0,'<eos>':1,'<pad>':2,'hello':3,'world':4},unk_token='<unk>'))
+    backend.pre_tokenizer=Whitespace()
+    tokenizer=Qwen2TokenizerFast(tokenizer_object=backend,unk_token='<unk>',eos_token='<eos>',pad_token='<pad>')
+    _add_fresh_latent_tokens(tokenizer)
+    processor=Qwen2_5_VLProcessor(image_processor=Qwen2VLImageProcessor(min_pixels=16,max_pixels=64),
+        tokenizer=tokenizer,chat_template='{{ messages }}')
+    expected=_processor_identity(processor)
+    checkpoint=tmp_path/'checkpoint-2160'
+    processor.save_pretrained(checkpoint)
+    saved=contract()
+    saved['reference']['processor_sha256']=expected
+    (checkpoint/'stage1_v5.json').write_text(json.dumps(saved))
+    reloaded=AutoProcessor.from_pretrained(checkpoint,local_files_only=True)
+    # Real HF save/reload loses the AddedToken representation in this map.
+    assert _processor_identity(reloaded)!=expected
+    sample='hello '+ ' '.join(LATENT_TOKEN_STRINGS)+' world'
+    before_vocab=reloaded.tokenizer.get_vocab()
+    before_ids=tuple(reloaded.tokenizer.convert_tokens_to_ids(t) for t in LATENT_TOKEN_STRINGS)
+    before_encoding=reloaded.tokenizer.encode(sample)
+    before_size=len(reloaded.tokenizer)
+    if drift=='image':
+        config=checkpoint/'preprocessor_config.json'
+        settings=json.loads(config.read_text())
+        settings['min_pixels']+=1
+        config.write_text(json.dumps(settings))
+    elif drift=='tokens':
+        reloaded.tokenizer.additional_special_tokens=list(LATENT_TOKEN_STRINGS[:2])
+        reloaded.save_pretrained(checkpoint)
+    if drift!='none':
+        with pytest.raises(ValueError,match='processor.*identity|latent.*tokens'):
+            module.load_replay_processor(checkpoint,local_files_only=True)
+    else:
+        restored=module.load_replay_processor(checkpoint,local_files_only=True)
+        assert _processor_identity(restored)==expected
+        assert restored.tokenizer.get_vocab()==before_vocab
+        assert len(restored.tokenizer)==before_size
+        assert tuple(restored.tokenizer.convert_tokens_to_ids(t) for t in LATENT_TOKEN_STRINGS)==before_ids
+        assert restored.tokenizer.encode(sample)==before_encoding
+        assert all(not isinstance(t,str) for t in restored.tokenizer.special_tokens_map_extended['additional_special_tokens'])

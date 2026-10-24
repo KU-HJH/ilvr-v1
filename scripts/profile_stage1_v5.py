@@ -450,12 +450,42 @@ def _sha(path):
     return digest.hexdigest()
 
 
+def load_replay_processor(source, **kwargs):
+    """Restore only HF's latent special-token representation roundtrip drift."""
+    from tokenizers import AddedToken
+    from stage1.composition import DEFAULT_STAGE1_DEPENDENCIES, LATENT_TOKEN_STRINGS
+    from stage1.v5_reference import _processor_identity
+    from stage1.v5_resume import load_v5_contract
+    processor=DEFAULT_STAGE1_DEPENDENCIES.load_processor(source,**kwargs)
+    tokenizer=processor.tokenizer
+    if tuple(tokenizer.additional_special_tokens)!=LATENT_TOKEN_STRINGS:
+        raise ValueError('diagnostic latent special tokens differ from original layout')
+    ids=tuple(tokenizer.convert_tokens_to_ids(t) for t in LATENT_TOKEN_STRINGS)
+    if ids!=tuple(range(len(tokenizer)-3,len(tokenizer))):
+        raise ValueError('diagnostic latent tokens must retain original appended IDs')
+    try:
+        values=[tokenizer.added_tokens_decoder[index] for index in ids]
+    except KeyError as error:
+        raise ValueError('diagnostic latent tokens require existing AddedToken objects') from error
+    if any(not isinstance(value,AddedToken) or str(value)!=token for value,token in zip(values,LATENT_TOKEN_STRINGS)):
+        raise ValueError('diagnostic latent tokens require matching existing AddedToken objects')
+    # This supported setter changes only the map representation. It never calls
+    # add_tokens/add_special_tokens or changes the fast-tokenizer backend/IDs.
+    tokenizer.additional_special_tokens=values
+    expected=load_v5_contract(Path(source))['reference']['processor_sha256']
+    if _processor_identity(processor)!=expected:
+        raise ValueError('diagnostic processor content identity mismatch')
+    return processor
+
+
 def compose_seeded_replay(parsed):
+    from dataclasses import replace
     from utils_deepseed import seed_everything
-    from stage1.composition import build_stage1_training_components
+    from stage1.composition import DEFAULT_STAGE1_DEPENDENCIES, build_stage1_training_components
     # Match src/main.py before model/reference construction and contract capture.
     seed_everything(parsed.seed)
-    return build_stage1_training_components(parsed)
+    dependencies=replace(DEFAULT_STAGE1_DEPENDENCIES,load_processor=load_replay_processor)
+    return build_stage1_training_components(parsed,dependencies=dependencies)
 
 
 def replay(args):
