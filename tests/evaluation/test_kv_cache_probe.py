@@ -340,3 +340,195 @@ def test_replay_uses_requested_policy_records_active_controls_and_preserves_layo
     assert report['replay']['numerical_observation']['policy'] == 'full_accumulation'
     assert report['replay']['numerical_observation']['float32_matmul_precision'] == 'highest'
     assert 'layout' in report['replay_limitation']
+
+
+def tiny_dora():
+    from peft.tuners.lora.layer import Linear
+    torch.manual_seed(17)
+    module = Linear(torch.nn.Linear(4, 6, bias=False), 'default', r=2,
+                    lora_alpha=4, use_dora=True).eval()
+    with torch.no_grad():
+        module.lora_B['default'].weight.fill_(.2)
+    return module
+
+
+def test_mlp_components_keep_real_calls_roles_layout_state_and_output_identity():
+    # Dropping earlier A/B calls, casting operands, or replacing outputs loses evidence.
+    p, module = probe(), tiny_dora()
+    assert hasattr(p, 'MLPComponents'), 'missing actual component observer'
+    x = torch.arange(24.).reshape(1, 3, 8)[..., 1::2]
+    returned = []
+    h = module.register_forward_hook(lambda _m, _a, out: returned.append(out))
+    with torch.inference_mode():
+        expected = module(x)
+        with p.MLPComponents(module) as observer:
+            actual = module(x)
+    h.remove()
+    assert actual is returned[-1] and torch.equal(actual, expected)
+    assert observer.operand is x
+    assert [(e['component'], e['role']) for e in observer.events] == [
+        ('outer', 'token'), ('base', 'token'), ('dora', 'token'),
+        ('lora_A', 'identity_reconstruction'), ('lora_B', 'identity_reconstruction'),
+        ('lora_A', 'token'), ('lora_B', 'token')]
+    assert [e['start_order'] for e in observer.events] == [0, 1, 3, 4, 6, 8, 10]
+    outer = observer.events[0]
+    assert outer['operand']['stride'] == [24, 8, 2]
+    assert outer['operand']['storage_offset'] == 1
+    assert outer['operand']['dtype'] == outer['output']['dtype'] == 'torch.float32'
+    assert outer['state']['active_adapters'] == ['default']
+    assert outer['state']['training'] is False
+    assert outer['state']['autocast_enabled'] is False
+    assert 'Linear.forward' in outer['state']['forward']['qualname']
+    assert outer['state']['forward']['bound_to_module'] is True
+    assert outer['state']['parameters']['base_layer.weight']['dtype'] == 'torch.float32'
+    assert observer.events[2]['end_order'] > observer.events[-1]['end_order']
+    assert not module._forward_pre_hooks and not module._forward_hooks
+
+
+def test_mlp_component_hooks_restore_on_real_forward_exception():
+    # An exception in an actual component must not leave observer hooks installed.
+    p, module = probe(), tiny_dora()
+    assert hasattr(p, 'MLPComponents'), 'missing actual component observer'
+    before = [(len(m._forward_hooks), len(m._forward_pre_hooks), m.forward) for m in module.modules()]
+    with pytest.raises(RuntimeError):
+        with p.MLPComponents(module):
+            module(torch.ones(1, 2, 3))  # actual incompatible base GEMM
+    assert before == [(len(m._forward_hooks), len(m._forward_pre_hooks), m.forward) for m in module.modules()]
+
+
+@pytest.mark.parametrize('damage', ['none', 'mutation', 'missing', 'ambiguous', 'unequal', 'replay'])
+def test_mlp_component_attribution_requires_both_original_replays_and_complete_evidence(damage):
+    # Mutation/missing roles/input differences/nonreproducing output must veto attribution.
+    p, module = probe(), tiny_dora()
+    assert hasattr(p, 'MLPComponents'), 'missing actual component observer'
+    assert hasattr(p, 'compare_mlp_components'), 'missing evidence-gated component comparison'
+    x = torch.arange(12.).reshape(1, 3, 4)
+    with torch.inference_mode():
+        with p.MLPComponents(module) as off:
+            module(x)
+        with p.MLPComponents(module) as on:
+            module(x[..., -1:, :])
+    if damage == 'mutation':
+        x.add_(1)
+    elif damage == 'missing':
+        on.events.pop()
+    elif damage == 'ambiguous':
+        on.events[-1]['role'] = 'ambiguous'
+    elif damage == 'unequal':
+        with torch.inference_mode():
+            with p.MLPComponents(module) as on:
+                module(torch.zeros(1, 1, 4))
+    elif damage == 'replay':
+        with torch.inference_mode():
+            on.output.add_(1)
+    before_count = [len(off.events), len(on.events)]
+    report = p.compare_mlp_components(off, on, numerical_policy='full_accumulation')
+    assert [len(off.events), len(on.events)] == before_count  # replay after hooks removed
+    assert report['status'] == ('observed' if damage == 'none' else 'inconclusive')
+    if damage != 'none':
+        assert report['invocation_geometry_layout_sensitivity'] is False
+    assert report['internal_accumulator_dtype'] == report['cuda_kernel_identity'] == 'unobserved'
+    assert report['internal_normalization_correction_add_cast'] == 'unobserved'
+    if damage == 'none':
+        assert all(report['replay'][side]['matches_observed'] for side in ('off', 'on'))
+        assert all(report['replay'][side]['numerical_observation']['policy'] == 'full_accumulation'
+                   for side in ('off', 'on'))
+        assert report['observed']['newest_input_difference']['equal']
+        assert report['replay']['off']['operand_unchanged']
+        # Real CPU GEMMs may themselves differ by invocation geometry.
+        differ = not torch.equal(off.output, on.output)
+        assert report['invocation_geometry_layout_sensitivity'] == differ
+        assert (report['observed']['earliest_differing_boundary'] is not None) == differ
+    import json
+    json.dumps(report, allow_nan=False)
+
+
+def test_mlp_components_native_trace_targets_only_second_prediction_layer24():
+    # Attaching to every step/layer would capture unrelated adapter calls.
+    p = probe()
+    import inspect
+    assert 'mlp_components' in inspect.signature(p.PassiveTrace).parameters, 'missing opt-in native target gate'
+    model = tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage = 'stage1'
+    from copy import deepcopy
+    model.model.layers.extend([deepcopy(model.model.layers[0]) for _ in range(24)])
+    for index, layer in enumerate(model.model.layers):
+        layer.self_attn.layer_idx = index
+    model.model.layers[24].mlp.up_proj = tiny_dora_native = __import__(
+        'peft.tuners.lora.layer', fromlist=['Linear']).Linear(
+            model.model.layers[24].mlp.up_proj, 'default', r=2, lora_alpha=4, use_dora=True).eval()
+    with p.PassiveTrace(model, max_steps=3, mlp_components=True) as trace:
+        generate(model, False)
+    assert trace.mlp_components.operand.shape == (1, 9, 8)
+    assert len(trace.mlp_components.events) == 7
+    assert trace.mlp_components.module is tiny_dora_native
+
+
+@pytest.mark.parametrize('extra', [[], ['--fresh-controls'],
+    ['--fresh-controls', '--numerical-policy', 'full_accumulation', '--source-index', '0']])
+def test_mlp_components_cli_rejects_unapproved_profile_before_loading(extra, tmp_path, monkeypatch, capsys):
+    # Accepting an unsupported flag combination must fail before selecting data or loading models.
+    p = probe()
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit) as error:
+        p.main(['--output-dir', 'results/forbidden', '--mlp-components']+extra)
+    assert error.value.code == 2
+    assert '--mlp-components requires' in capsys.readouterr().err
+    assert not (tmp_path/'results').exists()
+
+
+def test_mlp_component_report_opt_in_preserves_controls_and_alignment(tmp_path, monkeypatch):
+    # A missing report integration or implicit default diagnostic breaks the opt-in contract.
+    from tests.stage2.test_eval_integration import _import_entry_point, FakeProcessor
+    import json
+    evaluation, p = _import_entry_point('eval', monkeypatch), probe()
+    import inspect
+    assert 'mlp_components' in inspect.signature(p.PassiveTrace).parameters, 'missing opt-in diagnostic integration'
+    model = tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage = 'stage1'
+    monkeypatch.setattr(evaluation, 'load_evaluation_artifacts', lambda **_kw: (model, FakeProcessor(include_visual_inputs=False)))
+    monkeypatch.setattr(p, 'selected_sample', lambda index=12: {'text_input': 'question'})
+    monkeypatch.chdir(tmp_path)
+    for flag, path in [([], 'default'), (['--mlp-components'], 'components')]:
+        p.main(['--output-dir', 'results/'+path, '--fresh-controls',
+                '--numerical-policy', 'full_accumulation']+flag)
+    default = json.loads((tmp_path/'results/default/report.json').read_text())
+    report = json.loads((tmp_path/'results/components/report.json').read_text())
+    assert 'mlp_components' not in default
+    assert report['mlp_components']['status'] == 'inconclusive'  # no layer24 in tiny native fixture
+    assert report['alignment_verdict'] == default['alignment_verdict']
+    for actual, reference in zip(report['fresh_controls'], default['fresh_controls']):
+        p.require_fidelity(actual, reference, expected_steps=None)
+
+
+def test_mlp_component_roles_publish_actual_operand_evidence():
+    # Labels alone would hide an assumption that an A/B call used identity input.
+    p, module = probe(), tiny_dora()
+    with torch.inference_mode():
+        with p.MLPComponents(module) as trace:
+            module(torch.ones(1, 3, 4))
+    identity_a, identity_b, token_a, token_b = trace.events[3:]
+    assert identity_a.get('role_evidence') == dict(identity_operand=True, same_as_dora_operand=False)
+    assert token_a.get('role_evidence') == dict(identity_operand=False, same_as_dora_operand=True)
+    assert identity_b.get('role_evidence') == dict(same_as_preceding_a_output=True,
+                                                 preceding_a_start_order=4)
+    assert token_b.get('role_evidence') == dict(same_as_preceding_a_output=True,
+                                              preceding_a_start_order=8)
+
+
+def test_mlp_components_require_full_32_token_fidelity_before_attribution(tmp_path, monkeypatch):
+    # Matching early stopping must not silently admit a shorter source12 attribution.
+    from tests.stage2.test_eval_integration import _import_entry_point, FakeProcessor
+    evaluation, p = _import_entry_point('eval', monkeypatch), probe()
+    model = tiny_stage2_qwen(attn_implementation='sdpa').eval()
+    model.config.stage = 'stage1'
+    monkeypatch.setattr(evaluation, 'load_evaluation_artifacts', lambda **_kw: (model, FakeProcessor(include_visual_inputs=False)))
+    monkeypatch.setattr(p, 'selected_sample', lambda index=12: {'text_input': 'question'})
+    original = evaluation.run_one_example
+    def short_run(model, processor, sample, profile, **kwargs):
+        return original(model, processor, sample, dict(profile, max_new_tokens=1), **kwargs)
+    monkeypatch.setattr(evaluation, 'run_one_example', short_run)
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(ValueError, match='full 32-token suffix'):
+        p.main(['--output-dir', 'results/short', '--fresh-controls', '--mlp-components',
+                '--numerical-policy', 'full_accumulation'])

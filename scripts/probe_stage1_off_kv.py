@@ -77,6 +77,187 @@ def last_query_visibility(mask, query_length, key_length, is_causal):
     return visible
 
 
+def operand_layout(value):
+    return dict(dtype=str(value.dtype), shape=list(value.shape), stride=list(value.stride()),
+                storage_offset=value.storage_offset(), device=str(value.device))
+
+
+class MLPComponents:
+    """Only the requested up-projection; hooks observe, never replace results.
+
+    Retain the actual outer operand for replay. Component values are private
+    snapshots; JSON exposes summaries. No internal arithmetic is intercepted.
+    """
+    def __init__(self, module, *, enabled=lambda: True):
+        self.module, self.enabled = module, enabled
+        self.stack = ExitStack()
+        self.events = []
+        self.operand = self.output = None
+        self.capture_hash = None
+        self.order = 0
+        self.closed = False
+        self.pending = {}
+        self.last_a = {}
+
+    def state(self, module):
+        forward = module.forward
+        function = getattr(forward, '__func__', forward)
+        device_type = next(module.parameters()).device.type
+        return dict(training=module.training,
+            active_adapters=list(getattr(self.module, 'active_adapters', [])),
+            disable_adapters=getattr(self.module, 'disable_adapters', None),
+            merged=getattr(self.module, 'merged', None),
+            autocast_enabled=torch.is_autocast_enabled(device_type),
+            autocast_dtype=str(torch.get_autocast_dtype(device_type)),
+            forward=dict(module=getattr(function, '__module__', None),
+                qualname=getattr(function, '__qualname__', type(function).__qualname__),
+                function_id=id(function), bound_to_module=getattr(forward, '__self__', None) is module),
+            parameters={name: operand_layout(p) for name, p in module.named_parameters()})
+
+    def before(self, component, adapter, module, args):
+        if not self.enabled():
+            return
+        x = args[0]
+        role = 'token'
+        evidence = {}
+        if component == 'outer':
+            # More than one target invocation is preserved, then rejected as ambiguous.
+            self.operand = x
+            self.capture_hash = tensor_record(x)['sha256']
+        elif component == 'lora_A':
+            dora = self.pending.get(('dora', adapter), [])
+            token = bool(dora and x is dora[-1]['_operand'])
+            identity = (x.ndim == 2 and x.shape[0] == x.shape[1]
+                        and torch.equal(x, torch.eye(x.shape[0], device=x.device, dtype=x.dtype)))
+            evidence = dict(identity_operand=identity, same_as_dora_operand=token)
+            role = ('ambiguous' if token == identity else
+                    'identity_reconstruction' if identity else 'token')
+        elif component == 'lora_B':
+            a = self.last_a.get(adapter)
+            role = a['role'] if a is not None and x is a.get('_output') else 'ambiguous'
+            evidence = dict(same_as_preceding_a_output=a is not None and x is a.get('_output'),
+                            preceding_a_start_order=None if a is None else a['start_order'])
+        event = dict(component=component, adapter=adapter, role=role,
+            role_evidence=evidence, start_order=self.order, operand=operand_layout(x),
+            state=self.state(module), _operand=x)
+        self.order += 1
+        self.events.append(event)
+        self.pending.setdefault((component, adapter), []).append(event)
+
+    def after(self, component, adapter, _module, _args, output):
+        if not self.enabled():
+            return
+        event = self.pending[(component, adapter)].pop()
+        event.update(output=operand_layout(output), end_order=self.order)
+        self.order += 1
+        value = output if event['role'] != 'token' else output[..., -1:, :]
+        event['_value'] = value.detach().clone()
+        if component == 'lora_A':
+            event['_output'] = output
+            self.last_a[adapter] = event
+        if component == 'outer':
+            self.output = event['_value']
+
+    def __enter__(self):
+        try:
+            modules = [('outer', None, self.module)]
+            if hasattr(self.module, 'base_layer'):
+                modules.append(('base', None, self.module.base_layer))
+                for adapter in self.module.active_adapters:
+                    for label, attr in [('lora_A', 'lora_A'), ('lora_B', 'lora_B'),
+                                        ('dora', 'lora_magnitude_vector')]:
+                        collection = getattr(self.module, attr, {})
+                        if adapter in collection:
+                            modules.append((label, adapter, collection[adapter]))
+            for label, adapter, module in modules:
+                def pre(m, args, label=label, adapter=adapter):
+                    self.before(label, adapter, m, args)
+                def post(m, args, output, label=label, adapter=adapter):
+                    self.after(label, adapter, m, args, output)
+                self.stack.callback(module.register_forward_pre_hook(pre).remove)
+                self.stack.callback(module.register_forward_hook(post).remove)
+            return self
+        except BaseException:
+            self.stack.close()
+            self.closed = True
+            raise
+
+    def __exit__(self, *exception):
+        self.closed = True
+        result = self.stack.__exit__(*exception)
+        # Only the original outer operand must remain live for exact-operand replay.
+        for event in self.events:
+            event.pop('_operand', None)
+            event.pop('_output', None)
+        self.last_a.clear()
+        return result
+
+
+def compare_mlp_components(off, on, *, numerical_policy):
+    """Report boundaries only after role, operand integrity and two-sided replay gates."""
+    report = dict(status='inconclusive', target=dict(step=1, layer=24, module='mlp.up_proj'),
+        invocation_geometry_layout_sensitivity=False, observed={}, replay={},
+        internal_accumulator_dtype='unobserved', cuda_kernel_identity='unobserved',
+        internal_normalization_correction_add_cast='unobserved',
+        limitation='Module boundaries do not isolate internal primitives, pure geometry, kernels, or final-token causality.')
+    for side, trace in (('off', off), ('on', on)):
+        report['observed'][side] = ([] if trace is None else [
+            dict(**{k: v for k, v in event.items() if not k.startswith('_')},
+                 value=tensor_record(event['_value']) if '_value' in event else None)
+            for event in trace.events])
+    if off is None or on is None:
+        report['reason'] = 'missing target layer/component observation'
+        return report
+    expected = [('outer', 'token'), ('base', 'token'), ('dora', 'token'),
+                ('lora_A', 'identity_reconstruction'), ('lora_B', 'identity_reconstruction'),
+                ('lora_A', 'token'), ('lora_B', 'token')]
+    for trace in (off, on):
+        if (not trace.closed or [(e['component'], e['role']) for e in trace.events] != expected
+                or any('_value' not in e or 'end_order' not in e for e in trace.events)
+                or trace.operand is None or trace.output is None):
+            report['reason'] = 'missing/ambiguous role, incomplete call, or observers still active'
+            return report
+    inputs = tensor_difference(off.operand[..., -1:, :], on.operand[..., -1:, :])
+    report['observed']['newest_input_difference'] = inputs
+    integrity = True
+    for side, trace in (('off', off), ('on', on)):
+        current = tensor_record(trace.operand)['sha256']
+        original_layout = trace.events[0]['operand']
+        unchanged = current == trace.capture_hash and operand_layout(trace.operand) == original_layout
+        report['replay'][side] = dict(capture_sha256=trace.capture_hash, pre_replay_sha256=current,
+            original_layout=original_layout, pre_replay_layout=operand_layout(trace.operand),
+            operand_unchanged=unchanged)
+        integrity &= unchanged
+    if not integrity or not inputs['equal'] or not inputs.get('finite', False):
+        report['reason'] = 'mutated retained operand or unequal/nonfinite actual newest inputs'
+        return report
+    for side, trace in (('off', off), ('on', on)):
+        with numerical_policy_scope(numerical_policy), torch.inference_mode():
+            observation = observe_numerical_policy(numerical_policy)
+            actual = trace.module(trace.operand)[..., -1:, :]
+        difference = tensor_difference(actual, trace.output)
+        report['replay'][side].update(numerical_observation=observation,
+            output=tensor_record(actual), difference=difference,
+            matches_observed=difference['equal'] and difference.get('finite', False))
+    if not all(report['replay'][side]['matches_observed'] for side in ('off', 'on')):
+        report['reason'] = 'one or both original-operand replays did not reproduce observed outputs'
+        return report
+    # End-order is the order in which actual outputs became observable.
+    rows = []
+    for a, b in zip(off.events, on.events):
+        rows.append(dict(component=a['component'], role=a['role'],
+            end_order=a['end_order'], difference=tensor_difference(a['_value'], b['_value'])))
+    rows.sort(key=lambda row: row['end_order'])
+    report['observed']['boundaries'] = rows
+    report['observed']['earliest_differing_boundary'] = next(
+        (row for row in rows if not row['difference']['equal']), None)
+    output_difference = tensor_difference(off.output, on.output)
+    report['status'] = 'observed'
+    report['invocation_geometry_layout_sensitivity'] = (
+        not output_difference['equal'] and off.events[0]['operand'] != on.events[0]['operand'])
+    return report
+
+
 class PassiveTrace:
     """Scoped hooks on the unchanged native path, with restoring call wrappers.
 
@@ -84,13 +265,15 @@ class PassiveTrace:
     Keep exact replay inputs only for layer 0 rowwise boundaries, bounding memory.
     No cache object is retained and wrappers return the original result object.
     """
-    def __init__(self, model, *, max_steps):
+    def __init__(self, model, *, max_steps, mlp_components=False):
         self.model = model
         self.max_steps = max_steps
         self.steps = []
         self.current = None
         self.active_layer = None
         self.stack = ExitStack()
+        self.mlp_components_requested = mlp_components
+        self.mlp_components = None
 
     def record(self, name, value, *, full=False, row_axis=-2, module=None, operand=None):
         if self.current is None or not isinstance(value, torch.Tensor):
@@ -133,6 +316,10 @@ class PassiveTrace:
     def __enter__(self):
         try:
             self.stack.enter_context(torch.inference_mode())
+            if self.mlp_components_requested and len(self.model.model.layers) > 24:
+                self.mlp_components = self.stack.enter_context(MLPComponents(
+                    self.model.model.layers[24].mlp.up_proj,
+                    enabled=lambda: self.current is not None and len(self.steps) == 2))
             h = self.model.model.register_forward_pre_hook(self.decoder_pre, with_kwargs=True)
             self.stack.callback(h.remove)
             def after_decoder(_m, _a, output):
@@ -391,7 +578,11 @@ def main(argv=None):
     parser.add_argument('--numerical-policy', choices=NUMERICAL_POLICIES, default='historical')
     parser.add_argument('--source-index', type=int, choices=(0, 3, 12), default=12)
     parser.add_argument('--fresh-controls', action='store_true')
+    parser.add_argument('--mlp-components', action='store_true')
     args = parser.parse_args(argv)
+    if args.mlp_components and (not args.fresh_controls or args.source_index != 12
+                                or args.numerical_policy != 'full_accumulation'):
+        parser.error('--mlp-components requires --fresh-controls --source-index 12 --numerical-policy full_accumulation')
     if not args.fresh_controls and (not args.frozen_off or not args.frozen_on):
         parser.error('provide both frozen controls or --fresh-controls')
     if args.numerical_policy != 'historical' and not args.fresh_controls:
@@ -421,15 +612,19 @@ def main(argv=None):
                         evaluation_protocol='continuous', numerical_policy=args.numerical_policy))
             references = controls if args.fresh_controls else frozen
             for cached, reference in zip((False, True), references):
-                with PassiveTrace(qwen, max_steps=steps) as trace:
+                with PassiveTrace(qwen, max_steps=steps, mlp_components=args.mlp_components) as trace:
                     result = evaluation.run_one_example(model, processor, sample, PROFILE,
                         disable_latent_generation=True, use_kv_cache=cached,
                         evaluation_protocol='continuous', numerical_policy=args.numerical_policy)
                 results.append(result)
-                require_fidelity(result, reference, expected_steps=None if args.fresh_controls else 32)
+                require_fidelity(result, reference,
+                    expected_steps=32 if args.mlp_components or not args.fresh_controls else None)
                 fidelity.append(True)
                 traces.append(trace)
             report = compare_traces(*traces, numerical_policy=args.numerical_policy)
+            if args.mlp_components:
+                report['mlp_components'] = compare_mlp_components(
+                    *(trace.mlp_components for trace in traces), numerical_policy=args.numerical_policy)
             expected = 32 if args.source_index == 12 else max(
                 len(row['generated_suffix_token_ids']) for row in results)
             verdict = alignment_verdict(*traces, *results, expected_steps=expected)
