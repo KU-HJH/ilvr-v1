@@ -1689,7 +1689,8 @@ def build_dil_full_model_probe_commands(
 
 def build_stage1_v5_witness_commands(
     plan: "LaunchPlan", *, commit: str, data_path: Path, image_root: Path,
-    model: Path, audit_path: Path, log_root: str | Path = _LOG_ROOT,
+    model: Path, audit_path: Path | None, log_root: str | Path = _LOG_ROOT,
+    source_checkpoint: Path | None = None,
 ) -> OwnedTmuxCommands:
     """Fixed Stage1-v5 diagnostic under the existing owned node supervisor."""
     from src.multinode import validate_cluster_topology
@@ -1698,7 +1699,13 @@ def build_stage1_v5_witness_commands(
             'stage1', 'dora', 1, 4, 'initial'):
         raise ValueError('v5 witness requires fresh four-rank Stage1 DoRA ZeRO1')
     if not re.fullmatch(r'[a-f0-9]{40}', commit): raise ValueError('invalid witness commit')
-    for value in (data_path,image_root,model,audit_path): _trusted_absolute_path(value)
+    if (audit_path is None) == (source_checkpoint is None):
+        raise ValueError('exactly one witness audit or timing source is required')
+    for value in (data_path,image_root,model,audit_path or source_checkpoint): _trusted_absolute_path(value)
+    if source_checkpoint is not None:
+        # Keep the logical checkpoint spelling for unequal-root mapping.
+        try: source_checkpoint.relative_to(plan.cluster.local_repo_root/'checkpoints')
+        except ValueError as error: raise ValueError('timing source must be under local checkpoints/') from error
     commands=[]; digests=[]; specs=[]
     for machine_rank in (0,1):
         repository=node_repository(plan,machine_rank=machine_rank)
@@ -1709,21 +1716,35 @@ def build_stage1_v5_witness_commands(
             'NCCL_SOCKET_IFNAME':plan.cluster.socket_ifname,'PYTHONDONTWRITEBYTECODE':'1',
             'PYTHONPATH':f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}",
             'ILVR_REPOSITORY_COMMIT':commit}
+        diagnostic=(
+            str(repository/'scripts/profile_stage1_v5.py'),'--mode','replay',
+            '--run-id',plan.run_id,'--data-path',mapped(data_path),'--image-root',mapped(image_root),
+            '--model',mapped(model),'--source-checkpoint',mapped(source_checkpoint),
+            '--deepspeed',mapped(plan.deepspeed_config)) if source_checkpoint is not None else (
+            str(repository/'scripts/verify_stage1_v5.py'),'--mode','distributed-witness',
+            '--run-id',plan.run_id,'--data-path',mapped(data_path),'--image-root',mapped(image_root),
+            '--model',mapped(model),'--audit-json',mapped(audit_path),'--deepspeed',mapped(plan.deepspeed_config),
+            '--output-json',str(repository/'results'/plan.run_id/'stage1-v5-witness.json'))
         command=(str(repository/'venv/ilvr-venv/bin/accelerate'),'launch',
             '--num_machines','2','--num_processes','4','--machine_rank',str(machine_rank),
             '--main_process_ip',plan.cluster.master_addr,'--main_process_port',str(plan.main_process_port),
             '--mixed_precision','bf16','--use_deepspeed','--deepspeed_multinode_launcher','standard',
             '--deepspeed_config_file',mapped(plan.deepspeed_config),
-            str(repository/'scripts/verify_stage1_v5.py'),'--mode','distributed-witness',
-            '--run-id',plan.run_id,'--data-path',mapped(data_path),'--image-root',mapped(image_root),
-            '--model',mapped(model),'--audit-json',mapped(audit_path),'--deepspeed',mapped(plan.deepspeed_config),
-            '--output-json',str(repository/'results'/plan.run_id/'stage1-v5-witness.json'))
+            *diagnostic)
         supervisor,digest,spec=_node_shell_command(plan,machine_rank=machine_rank,commit=commit,
             stage_command=command,environment=environment,log_root=Path(log_root),require_bash_launcher=False)
         tmux=('/usr/bin/tmux','new-session','-d','-s',f'ilvr-{plan.run_id}-initial-rank{machine_rank}','--',*supervisor)
         commands.append(tuple(build_remote_exec(tmux,working_directory=repository,cluster=plan.cluster)) if machine_rank==0 else tmux)
         digests.append(digest); specs.append(spec)
     return OwnedTmuxCommands(remote=commands[0],local=commands[1],command_digests=tuple(digests),node_specs=tuple(specs),finite_loss_evidence_path=None)
+
+
+def build_stage1_v5_forward_timing_commands(
+    plan: "LaunchPlan", *, commit: str, data_path: Path, image_root: Path,
+    model: Path, source_checkpoint: Path, log_root: str | Path = _LOG_ROOT,
+) -> OwnedTmuxCommands:
+    return build_stage1_v5_witness_commands(plan,commit=commit,data_path=data_path,
+        image_root=image_root,model=model,audit_path=None,source_checkpoint=source_checkpoint,log_root=log_root)
 
 
 def build_owned_lifecycle_harness_commands(
@@ -2420,6 +2441,19 @@ class SubprocessCoordinatorRunner:
             '--rank',str(rank)),working_directory=repository,cluster=self.plan.cluster))
         raw=completed.stdout.encode()
         if not raw or len(raw)>16*1024*1024: raise ValueError('invalid v5 rank record size')
+        return raw
+
+    def read_stage1_v5_forward_timing_record(self, rank: int) -> bytes:
+        if self.plan.stage != 'stage1' or rank not in (0,1,2,3):
+            raise ValueError('invalid timing record rank/stage')
+        repository=node_repository(self.plan,machine_rank=0 if rank<2 else 1)
+        path=repository/'results'/self.plan.run_id/f'forward-timing-rank-{rank}.json'
+        if rank>=2: return _read_regular_file(path,maximum_size=16*1024*1024)
+        completed=self._run(build_remote_exec((str(repository/'venv/ilvr-venv/bin/python'),
+            str(repository/'scripts/profile_stage1_v5.py'),'--mode','record-show','--run-id',self.plan.run_id,
+            '--rank',str(rank)),working_directory=repository,cluster=self.plan.cluster))
+        raw=completed.stdout.encode()
+        if not raw or len(raw)>16*1024*1024: raise ValueError('invalid timing record size')
         return raw
 
     def read_dil_full_model_probe_record(self, rank: int) -> bytes:
