@@ -429,7 +429,7 @@ def replay_cli(args):
     return ['--stage','stage1','--stage1_variant','v5',
         '--resume_from_checkpoint_path',str(args.source_checkpoint),'--model',str(args.model),
         '--data_path',str(args.data_path),'--image_root',str(args.image_root),
-        '--save_model_path',str(REPOSITORY/'checkpoints'/args.run_id/'replay'),
+        '--save_model_path',str(REPOSITORY/'checkpoints'/args.run_id),
         '--log_file',str(REPOSITORY/'logs'/args.run_id/'replay.log'),
         '--cache_dir',str(REPOSITORY/'data/cache'),
         '--deepspeed_config',str(args.deepspeed),'--save_strategy','no',
@@ -473,7 +473,7 @@ def replay(args):
     validate_source_contract(saved)
     source_state=json.loads((source/'trainer_state.json').read_text())
     if source_state['global_step']!=2160: raise ValueError('source must be completed checkpoint-2160')
-    destination=require_canonical_artifact_path(REPOSITORY/'checkpoints'/args.run_id/'replay',kind='checkpoint')
+    destination=require_canonical_artifact_path(REPOSITORY/'checkpoints'/args.run_id,kind='checkpoint')
     # Exclusive coordinator preflight also rejects run ID reuse on either node.
     if destination.exists(): raise ValueError('timing replay destination already exists')
     dist.barrier()  # Every rank checks freshness before composition publishes its reference.

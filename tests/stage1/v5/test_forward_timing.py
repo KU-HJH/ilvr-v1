@@ -296,3 +296,22 @@ def test_prepared_engine_optimizer_step_is_nested_inside_accelerator_backward(tm
     backward,=[s for s in row['spans'] if s['name']=='backward']
     assert span['parent']==backward['id'] and engine.step==original
     assert any(not torch.equal(p,before[n]) for n,p in trainer.model.named_parameters() if n in before)
+
+
+def test_replay_output_passes_real_cross_experiment_peft_resume_guard(tmp_path, monkeypatch):
+    module=api()
+    from stage1 import checkpointing
+    repository=tmp_path/'repo'
+    canonical_root=repository/'checkpoints'
+    source=canonical_root/'completed-source'/'checkpoint-2160'
+    source.mkdir(parents=True)
+    monkeypatch.setattr(module,'REPOSITORY',repository)
+    monkeypatch.setattr(checkpointing,'CANONICAL_CHECKPOINT_ROOT',canonical_root)
+    args=SimpleNamespace(source_checkpoint=source,model=tmp_path/'base',
+        data_path=repository/'data/TRAIN.jsonl',image_root=repository/'data/images',
+        run_id='forward-timing-fresh',deepspeed=repository/'configs/deepspeed_zero1.json')
+    cli=module.replay_cli(args)
+    output=Path(cli[cli.index('--save_model_path')+1])
+    # Exercise the unchanged cross-experiment guard that real composition calls.
+    # The former <run-id>/replay destination is rejected by this real validator.
+    checkpointing._validate_peft_resume_location(output,args.source_checkpoint)
