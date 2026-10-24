@@ -1,0 +1,47 @@
+# Stage1-v5 cross-helper reverse-top-k — workflow evidence
+
+## Current phase and authorization boundary
+
+Project-sized / genuinely multi-step brainstorming, not implementation. The root user explicitly invoked superpowers:brainstorming. The existing current Stage1-v5 behavior is inspected at baseline `adbe45492adf2dce6f9fe8d6eee5b0531645c3b2` in `/root/.codex/worktrees/f187/ILVR`. This is an externally managed, detached linked worktree. No branch integration, cleanup, training, evaluation campaign or model-artifact mutation is authorized.
+
+User-confirmed requirements: same-sample other-step helper donors; exclude current block's corresponding helper; original-image fallback when no eligible other helper exists; implement both independent clean-prefix reset and cumulative rejected history; both select with the existing clean/teacher query. The latest user `ㅇㅋ` answers the explicitly presented choice of prefix-KV reuse versus full-sequence rejected forwards, selecting prefix reuse with affected-region recomputation. It is not final written-design approval. The new scope's implementation method is not selected.
+
+## Skills and actual execution evidence
+
+- `using-superpowers`: read and routed active phase; canonical and linked-worktree AGENTS read. This is not a new training task, so training preflight is not entered.
+- `readchk`: scope cross-checked during intake. Remaining substantive forks were asked and answered in preceding turns; no guessed design approval.
+- `brainstorming`: existing call/data/state paths investigated; donor scope, singleton fallback, current-helper exclusion and query source clarified; two genuine approaches presented in a standalone message and prefix reuse selected; project-sized written design authored and self-reviewed. Final design approval and writing-plans have not occurred.
+- `hate`: standing-user invocation at design commitment. Root captured exactly `{root, first_nail}` in the control log. First nail remains unexecuted; no implementation-like probe authorization inferred.
+- `macrothink`: applicable because a wrong intervention can waste long training runs; three bounded fresh same-model read-only sessions over one stripped frozen-problem input. Root classified every read and clustered divergences first. Convergence is reassurance only. This did not advance the lifecycle or authorize code.
+- `dispatching-parallel-agents`: read for independent fresh read dispatch; three isolated-context read-only agents, no shared writes. No implementation delegation yet.
+- Fresh builder check required by project-sized `brainstorming`: completed as listed below; no outstanding builder questions.
+- Planning, implementation/TDD, implementation method selection, independent code specification/quality review, final code verification and branch finishing are not entered. They remain future gates; no gate is represented as passed merely because a skill was read.
+
+## Frozen proposal, critique and commitment
+
+Frozen proposal: `docs/superpowers/specs/2026-10-24-stage1-v5-cross-helper-reverse-topk-proposal-v1.md`, SHA256 `f0defadb2e6239d551db947a64ba76d488546534e9d4b2a11802eda9123ecce9`.
+
+Control records: `logs/stage1-v5-cross-helper-reverse-topk-design-20261024-050727/`:
+`intake.json`, `requirements-2.json` through `requirements-6.json`, `donor-data-audit.json`, `hate-v1.json`, `macrothink-input-v1.md`, `critique-v1.json`.
+
+Raw input audit: TRAIN SHA256 `5bc1313a594f5713975b67388c745c6632275c37fd260055b27230c9cfedbed8`; 3450 raw samples, 924 single-helper rows, no repeated helper path within a row. This is read-only source-count evidence, not projected-feature sufficiency or correctness/negative-effect evidence. No model or GPU process was launched.
+
+Fresh reads (all isolated, no model override; inherit controller model):
+
+- `/root/cross_helper_fresh_a`: reviewed stripped input only; highlighted cache/gradient boundaries, 8-slot selection contract and fallback/negative usefulness uncertainty. Returned a full-sequence comparative discriminator. Classified divergent-compatible.
+- `/root/cross_helper_fresh_b`: highlighted hybrid cumulative-KV risk, substantial fallback population, and no guarantee that low similarity is adverse. Returned a full-sequence comparative discriminator. Classified divergent-compatible.
+- `/root/cross_helper_fresh_c`: highlighted earliest changed prefix and identical detached-teacher ownership of both donor sources. Returned a differentiable full-sequence comparison. Classified divergent-compatible.
+
+Root synthesis: no incompatible divergence surfaced, which does not establish correctness. Compatible divergence adds helper/fallback diagnostic counters and separate future-effect interpretation; explicit earliest-span cutoff includes empty-target blocks. Reassuring agreement on logits/gradient comparison is not an executed witness. The commitment preserves the requested low-cosine replacement rather than substituting a different objective.
+
+Design commitment: `docs/superpowers/specs/2026-10-24-stage1-v5-cross-helper-reverse-topk-design.md`. The builder-check input hash is `486f85c79dbb49b66887323243c1b549f4ff54d40daaa576d5c42a44c7e8a003`. It explicitly labels controller calls: all eligible helpers pooled globally; FP32 stable ascending cosine; full body-slot count K=8; fewer than K candidates fails; current helper excluded by source identity; original fallback uses authentic detached teacher vision features; both configured existing teacher query modes supported; cumulative OFF and clean Text-off use separate decoder invocations under one packed graph scope.
+
+Builder check: `/root/cross_helper_builder_check`, fresh read-only engineer, dispatched the skill's builder prompt. Result: “nothing important left”. Root triage: no answered-already/minor/theirs question pile to resolve. No product code was touched. Status text was updated after this result without changing the reviewed design semantics.
+
+## Completion and verification boundary
+
+No product code/configuration changes have been made in this phase. Future implementation still requires the exact commitment's final human approval and explicit acceptance of deferring currently unverified replay-equivalence evidence to the required implementation tests. No accuracy/performance/GPU/multinode claim is made. The feature is not complete. After design approval, the required next skill is writing-plans; obtain the user's implementation method choice under that workflow.
+
+## Claim-specific document verification
+
+`verification-before-completion` applies to recording this design artifact, not to claiming the feature complete. Branch finishing does not apply next: design approval is still pending and no requested feature has been implemented. Selected witnesses are staged-path allowlist inspection (exactly the proposal, commitment and this control record), `git diff --cached --check`, full staged diff inspection, proposal and commitment content hashes, and post-commit file identity. No test/build pass is claimed, and no training/GPU probe is run. Actual commands, results, final file hashes and commit identity are retained in the control log's `design-document-verification.json` after the checks.
