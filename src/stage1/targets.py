@@ -22,6 +22,7 @@ from stage1.types import (
     Stage1BatchMetadata,
     Stage1SampleMetadata,
     Stage1TeacherTargets,
+    Stage1RejectedLatentBlock,
 )
 
 
@@ -98,8 +99,13 @@ class Stage1TeacherTargetBuilder:
         teacher: nn.Module,
         batch: MutableMapping[str, object],
         metadata: Stage1BatchMetadata,
+        *, voff_mode: str = 'attention_mask',
     ) -> Stage1TeacherTargets:
         """Consume helper tensors and return row-major targets for the batch."""
+        from .v5_config import V5_VOFF_MODES
+        if voff_mode not in V5_VOFF_MODES:
+            raise ValueError('unsupported Stage1-v5 voff_mode')
+        rejected_blocks = []
         missing_helpers = [
             key
             for key in ("pixel_values_latent", "image_grid_thw_latent")
@@ -197,6 +203,8 @@ class Stage1TeacherTargetBuilder:
                         "helper grid",
                     ),
                     image_token_id=image_token_id,
+                    **({'rejected_blocks': rejected_blocks, 'batch_index': sample_index}
+                       if voff_mode != 'attention_mask' else {}),
                 )
             )
             packed.extend(sample_values)
@@ -217,13 +225,19 @@ class Stage1TeacherTargetBuilder:
             raise RuntimeError(
                 "row-major latent target count does not match latent mask"
             )
+        diagnostics = self._diagnostics(latent_values) if self.collect_diagnostics else {}
+        if rejected_blocks and self.collect_diagnostics:
+            for kind in ('helper', 'original'):
+                diagnostics[f'rejected_{kind}_blocks'] = latent_values.new_tensor(
+                    sum(b.donor_kind == kind for b in rejected_blocks), dtype=torch.long)
         return Stage1TeacherTargets(
             latent_values=latent_values,
             latent_mask=latent_mask,
             selected_counts=tuple(selected_counts),
-            diagnostics=self._diagnostics(latent_values) if self.collect_diagnostics else {},
+            diagnostics=diagnostics,
             selected_candidate_indices=tuple(selected_candidate_indices),
             selection_margins=tuple(selection_margins),
+            rejected_blocks=tuple(rejected_blocks),
         )
 
     def _build_sample(
@@ -238,6 +252,7 @@ class Stage1TeacherTargetBuilder:
         helper_pixels,
         helper_grid,
         image_token_id,
+        rejected_blocks=None, batch_index=0,
     ):
         build_sample = (self._build_sample_adaptive
                         if self.query_config.mode == "adaptive"
@@ -247,6 +262,8 @@ class Stage1TeacherTargetBuilder:
             sample_attention=sample_attention, original_pixels=original_pixels,
             original_grid=original_grid, helper_pixels=helper_pixels,
             helper_grid=helper_grid, image_token_id=image_token_id,
+            **({'rejected_blocks': rejected_blocks, 'batch_index': batch_index}
+               if rejected_blocks is not None else {}),
         )
 
     def _build_sample_legacy(
@@ -261,6 +278,7 @@ class Stage1TeacherTargetBuilder:
         helper_pixels,
         helper_grid,
         image_token_id,
+        rejected_blocks=None, batch_index=0,
     ):
         text_outputs = teacher(
             input_ids=sample_ids,
@@ -365,6 +383,11 @@ class Stage1TeacherTargetBuilder:
                 query,
                 max_count=len(span.latent_positions),
             )
+            if rejected_blocks is not None:
+                rejected_blocks.append(self._rejected_block(
+                    teacher, sample, helper_images, query, block_index, batch_index,
+                    getattr(text_outputs, 'inputs_embeds', None), sample_ids,
+                    original_grid, image_token_id))
             packed.append(selected)
             block_counts.append(int(selected.shape[0]))
             block_indices.append(indices)
@@ -399,6 +422,7 @@ class Stage1TeacherTargetBuilder:
         helper_pixels,
         helper_grid,
         image_token_id,
+        rejected_blocks=None, batch_index=0,
     ):
         qwen = resolve_qwen2_5_vl_model(teacher)
         owner = getattr(teacher, "module", teacher)
@@ -531,6 +555,10 @@ class Stage1TeacherTargetBuilder:
             query = compose_history_query(user_query, text_summary, latent_sum, mass).query
             selected, indices, margin = self._select(
                 candidates[index], query, max_count=len(span.latent_positions))
+            if rejected_blocks is not None:
+                rejected_blocks.append(self._rejected_block(
+                    teacher, sample, helper_images, query, index, batch_index,
+                    prompt.inputs_embeds, prompt.input_ids, original_grid, image_token_id))
             if (selected.ndim != 2 or not 0 < selected.shape[0] <= len(span.latent_positions)
                     or selected.shape[1] != hidden.shape[-1]
                     or not bool(torch.isfinite(selected).all())):
@@ -544,6 +572,49 @@ class Stage1TeacherTargetBuilder:
             block_margins.append(margin)
         return (packed, tuple(block_counts), tuple(block_indices), tuple(block_margins),
                 prompt_hidden[0, :0])
+
+    def _rejected_block(self, teacher, sample, helper_images, query, block_index,
+                        batch_index, original_embeddings, original_ids, original_grid,
+                        image_token_id):
+        from .v5_donors import select_reverse_topk_donors
+        prefix = f'source_index={sample.source_index} block={block_index}: '
+        span = sample.latent_spans[block_index]
+        if (not span.latent_positions
+                or span.latent_positions != tuple(range(span.start + 1, span.end))
+                or len(sample.helper_image_ids) != len(helper_images)):
+            raise ValueError(prefix + 'replacement requires complete body and helper image identities')
+        excluded = {identity for identity, owner in zip(sample.helper_image_ids, sample.helper_to_block)
+                    if owner == block_index}
+        original_candidates = ()
+        if not any(identity not in excluded for identity in sample.helper_image_ids):
+            # This must be the prepared teacher feature tensor, never the generic
+            # special-token embedding fallback used by the historical query path.
+            if (not isinstance(original_embeddings, torch.Tensor)
+                    or original_embeddings.ndim != 3
+                    or original_embeddings.shape[:2] != original_ids.shape
+                    or original_embeddings.shape[0] != 1):
+                raise ValueError(prefix + 'missing projected original image embeddings')
+            merge = int(teacher.visual.spatial_merge_size)
+            if (original_grid.dtype != torch.long or original_grid.ndim != 2
+                    or original_grid.shape[-1] != 3 or merge <= 0
+                    or bool((original_grid <= 0).any())
+                    or bool((original_grid[:, 1:] % merge != 0).any())):
+                raise ValueError(prefix + 'invalid projected original image grid')
+            counts = self._visual_token_counts(original_grid, teacher)
+            values = original_embeddings[0, original_ids[0] == image_token_id]
+            if (not counts or sum(counts) != values.shape[0]
+                    or len(sample.original_image_ids) != len(counts)
+                    or any(not isinstance(i, str) or not i for i in sample.original_image_ids)):
+                raise ValueError(prefix + 'projected original image feature ownership mismatch')
+            original_candidates = tuple(self._maybe_group_for_helper(v, self.helper_group_L)
+                                        for v in values.split(counts))
+        grouped = tuple(self._maybe_group_for_helper(v, self.helper_group_L) for v in helper_images)
+        selected = select_reverse_topk_donors(grouped, sample.helper_image_ids,
+            sample.helper_to_block, block_index, original_candidates, query,
+            count=len(span.latent_positions), source_index=sample.source_index)
+        return Stage1RejectedLatentBlock(batch_index, block_index, span.latent_positions,
+            selected.values, selected.donor_kind, selected.image_indices,
+            selected.candidate_indices, f'clean_teacher_{self.query_config.mode}')
 
     @staticmethod
     def _owned_slice(tensor, owned_range, sample, role):

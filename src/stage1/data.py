@@ -584,6 +584,16 @@ class Stage1DataCollator:
             helper_end = helper_offset + helper_grid_counts[row_index]
             original_pixel_end = original_pixel_offset + original_pixel_counts[row_index]
             helper_pixel_end = helper_pixel_offset + helper_pixel_counts[row_index]
+            memory_ids = {}
+            def source_id(image):
+                if isinstance(image, (str, Path)):
+                    return 'file:' + str(Path(image).resolve())
+                if not isinstance(image, Image.Image):
+                    raise TypeError('image identity requires a path or PIL image')
+                index = memory_ids.setdefault(id(image), len(memory_ids))
+                return f'memory:{index}'
+            original_ids = tuple(source_id(image) for image in example.original_image_paths)
+            helper_ids = tuple(source_id(image) for image in example.helper_image_paths)
             samples.append(
                 Stage1SampleMetadata(
                     source_index=example.source_index,
@@ -615,6 +625,8 @@ class Stage1DataCollator:
                     else example.occurrence.row_ordinal_within_microbatch,
                     original_pixel_range=(original_pixel_offset, original_pixel_end),
                     helper_pixel_range=(helper_pixel_offset, helper_pixel_end),
+                    original_image_ids=original_ids,
+                    helper_image_ids=helper_ids,
                 )
             )
             original_offset = original_end

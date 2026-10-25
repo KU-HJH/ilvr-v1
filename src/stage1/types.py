@@ -125,6 +125,8 @@ class Stage1SampleMetadata:
     row_ordinal_within_microbatch: int | None = None
     original_pixel_range: tuple[int, int] = (0, 0)
     helper_pixel_range: tuple[int, int] = (0, 0)
+    helper_image_ids: tuple[str, ...] = ()
+    original_image_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -137,6 +139,18 @@ class Stage1BatchMetadata:
 
 
 @dataclass(frozen=True)
+class Stage1RejectedLatentBlock:
+    batch_index: int
+    block_index: int
+    positions: tuple[int, ...]
+    values: torch.Tensor
+    donor_kind: str
+    donor_image_indices: tuple[int, ...]
+    donor_candidate_indices: tuple[int, ...]
+    query_provenance: str
+
+
+@dataclass(frozen=True)
 class Stage1TeacherTargets:
     """Packed, row-major EMA-teacher targets for one Stage 1 batch."""
 
@@ -146,6 +160,7 @@ class Stage1TeacherTargets:
     diagnostics: Mapping[str, torch.Tensor]
     selected_candidate_indices: tuple[tuple[tuple[int, ...], ...], ...] = ()
     selection_margins: tuple[tuple[float | str, ...], ...] = ()
+    rejected_blocks: tuple[Stage1RejectedLatentBlock, ...] = ()
 
 
 @dataclass(frozen=True)
