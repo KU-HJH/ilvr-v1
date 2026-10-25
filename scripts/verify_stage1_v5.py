@@ -165,8 +165,8 @@ def validate_contract_profile(contract, audited):
     """Bind actual resolved execution/objective to the approved selected profile."""
     from stage1.v5_config import Stage1V5Config
     from stage1.v5_resume import validate_v5_resume
-    validate_v5_resume(contract,{})
-    if contract['config']!=asdict(Stage1V5Config(lambda_topk_entropy=.1,preference_topk_k=50)):
+    resolved = validate_v5_resume(contract,{})
+    if resolved != Stage1V5Config(lambda_topk_entropy=.1,preference_topk_k=50):
         raise ValueError('different resolved v5 objective')
     if contract['coefficients']!=dict(ce_weight=.1,sim_weight=.1):
         raise ValueError('different resolved CE/alignment coefficients')
