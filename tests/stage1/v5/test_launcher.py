@@ -345,3 +345,39 @@ def test_actual_coordinator_adaptive_resume_omits_query_defaults_on_both_nodes(t
             assert args.image_root == str(root/'data/images')
     finally:
         shutil.rmtree(local/'checkpoints'/run_id, ignore_errors=True)
+
+
+@pytest.mark.parametrize('mode',['attention_mask','cross_helper_reverse_topk_independent','cross_helper_reverse_topk_cumulative'])
+def test_replacement_recipe_reaches_both_node_workers_over_stale_settings(tmp_path,mode):
+    from utils_deepseed import parse_args
+    settings=tmp_path/'stale.sh'
+    settings.write_text('voff_mode=invalid\nexport STAGE1_V5_VOFF_MODE=invalid STAGE1_CE_WEIGHT=1 CE_WEIGHT=1\n')
+    env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1','CUDA_VISIBLE_DEVICES':'','STAGE1_V5_VOFF_MODE':'invalid'}
+    recipe=subprocess.run(['bash',str(ROOT/'scripts/stage1_v5_train_eval.sh'),
+        '--run-id','v5-replacement-command','--main-process-port','29683','--max-steps','3',
+        '--remote-repo-root',str(REMOTE),'--remote-host-repo-root',str(HOST),
+        '--settings',str(settings),'--stage1-v5-voff-mode',mode,'--dry-run'],
+        cwd=ROOT,env=env,text=True,capture_output=True)
+    assert recipe.returncode==0,recipe.stderr
+    lines=recipe.stdout.splitlines()
+    assert len(lines)==3  # train -> existing prepare -> existing TEST400 evaluation
+    train=shlex.split(lines[0])
+    result=subprocess.run([*train,'--dry-run'],cwd=ROOT,env=env,text=True,capture_output=True)
+    assert result.returncode==0,result.stderr
+    commands=json.loads(result.stdout)
+    assert commands['plan']['world_size']==4
+    remote=shlex.split(shlex.split(commands['remote'][-1])[-1])
+    for rank,owned in ((0,remote),(1,commands['local'])):
+        cursor=owned.index('-i')+2;worker_env={}
+        while '=' in owned[cursor] and not owned[cursor].startswith('--'):
+            k,v=owned[cursor].split('=',1);worker_env[k]=v;cursor+=1
+        stage=owned[max(i for i,v in enumerate(owned) if v=='--')+1:]
+        worker=subprocess.run(['bash',str(ROOT/'run_stage1_training.sh'),*stage[2:],'--dry-run'],
+            cwd=ROOT,env={**env,**worker_env},text=True,capture_output=True)
+        assert worker.returncode==0,worker.stderr
+        argv=shlex.split(worker.stdout)
+        assert argv[argv.index('--machine_rank')+1]==str(rank)
+        args=parse_args(argv[argv.index('src/main.py')+1:])
+        assert args.stage1_v5_config.voff_mode==mode
+        assert args.stage1_v5_config.lambda_topk_entropy==.1 and args.stage1_v5_config.lambda_topk_mass==.05
+        assert args.ce_weight==.1 and args.gradient_accumulation_steps==4

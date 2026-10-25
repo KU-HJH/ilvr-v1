@@ -393,7 +393,7 @@ class CustomTrainerStage1(SFTTrainer):
         # Ordinary Stage1 retains strict diagnostics; v5 opts into its runtime flag.
         return getattr(self, "stage1_v5_debug", True)
 
-    def _prepare_stage1_loss_inputs(self, inputs) -> tuple[dict, Stage1BatchMetadata, Stage1TeacherTargets]:
+    def _prepare_stage1_loss_inputs(self, inputs, *, voff_mode='attention_mask') -> tuple[dict, Stage1BatchMetadata, Stage1TeacherTargets]:
         """Build helper targets once, preserving the original model tensors."""
         working_inputs = dict(inputs)
         metadata = working_inputs.pop("stage1_batch_metadata", None)
@@ -405,7 +405,8 @@ class CustomTrainerStage1(SFTTrainer):
         if self._stage1_checks_enabled():
             self._validate_ema_teacher_device(working_inputs)
         targets = self.target_builder.build(
-            self.ema_teacher.model, working_inputs, metadata
+            self.ema_teacher.model, working_inputs, metadata,
+            **({'voff_mode': voff_mode} if voff_mode != 'attention_mask' else {}),
         )
         if self._stage1_checks_enabled():
             self._validate_targets(targets, metadata, working_inputs)

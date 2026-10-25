@@ -188,6 +188,7 @@ while (( $# )); do
         --preference-entropy-top-percent) require_value "$@"; extra_worker_arguments+=(--preference_entropy_top_percent "$2"); shift 2 ;;
         --stage1-v5-selection) require_value "$@"; extra_worker_arguments+=(--stage1_v5_selection "$2"); shift 2 ;;
         --stage1-v5-text-kl-weight) require_value "$@"; extra_worker_arguments+=(--stage1_v5_text_kl_weight "$2"); shift 2 ;;
+        --stage1-v5-voff-mode) require_value "$@"; extra_worker_arguments+=(--stage1_v5_voff_mode "$2"); shift 2 ;;
         --loss-chunk-positions) require_value "$@"; extra_worker_arguments+=(--loss_chunk_positions "$2"); shift 2 ;;
         --vision-attention-implementation) require_value "$@"; extra_worker_arguments+=(--vision_attention_implementation "$2"); shift 2 ;;
         --warm-up-steps) require_value "$@"; extra_worker_arguments+=(--warm_up_steps "$2"); shift 2 ;;

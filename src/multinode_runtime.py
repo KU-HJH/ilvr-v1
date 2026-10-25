@@ -844,6 +844,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--preference-entropy-top-percent",
     "--stage1-v5-selection",
     "--stage1-v5-text-kl-weight",
+    "--stage1-v5-voff-mode",
     "--loss-chunk-positions",
     "--vision-attention-implementation",
     "--warm-up-steps",

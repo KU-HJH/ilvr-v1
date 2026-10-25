@@ -188,3 +188,50 @@ engine gradients/continuation, BF16 and maximum geometry memory. Independent
 review, final fresh project verification, compatible remote provisioning and
 runtime participation/progress remain required before claiming production
 training. No full-model training or evaluation result is claimed by this recipe.
+
+## Optional visual-latent replacement V-off
+
+The default remains `attention_mask`. To replace rejected visual latents, pass
+`--stage1-v5-voff-mode cross_helper_reverse_topk_independent` or
+`--stage1-v5-voff-mode cross_helper_reverse_topk_cumulative` through the existing
+Stage1 coordinator or `scripts/stage1_v5_train_eval.sh`. The Python worker uses
+`--stage1_v5_voff_mode` with the same values. Explicit recipe options override
+stale sourced values. The existing prepare/evaluate chain is retained.
+
+For each block, pool the same sample's other-step helper-image projected vision
+features after existing per-image helper grouping. Exclude the current helper
+image entirely, including repeated source identities, and deduplicate donor
+images. Select the lowest FP32 cosine similarity to the existing clean teacher
+query, with stable source/index ties. Both modes share that exact query in
+legacy and adaptive teacher paths. If no other helper remains, use already
+computed projected original-image teacher features; this adds no vision forward.
+Both sources are detached. Replace every body slot (currently 8), retaining
+START/END. An insufficient donor pool is an error; it never repeats candidates,
+uses the current helper, or silently leaves positive features in rejected slots.
+
+Independent reuses attached clean KV only before the current body and recomputes
+that body plus its target suffix. Cumulative reuses clean KV only before the
+first body and runs one causal suffix with all previous replacements retained,
+including blocks with empty immediate text. This is teacher-forced text, with
+original position IDs and normal visibility of replacement latents. Text-off
+always uses its original independent clean prefix. With both branches active,
+independent packs V-off/Text-off into one OFF decoder call; cumulative uses one
+rejected suffix call plus one Text-off-only call. Backward checkpoint recomputes
+are additional. Helpers, clean student and frozen-reference counts are unchanged
+for the configured query mode.
+
+Chosen/reference DIL, clean entropy top-percent selection, vocabulary top-k,
+entropy and mass KL formulas and coefficients are unchanged. Omitted mass weight
+still resolves to half the entropy weight on fresh runs; saved coefficients
+remain authoritative on resume. New replacement runs save schema-4 intervention
+identity. Historical contracts remain inspectable with their exact old key sets;
+new code does not weaken source/reference guards or reinterpret old training
+objectives. A changed V-off mode requires a fresh run.
+
+Optional debug target diagnostics report `rejected_helper_blocks` and
+`rejected_original_blocks`; per-block provenance includes source/image/candidate
+indices and replaced positions. Original-image fallback is a distinct population
+(924/3450 raw TRAIN samples have only one helper). Low similarity does not prove
+a useful negative. Tiny actual-Qwen CPU comparisons and coordinator dry-runs
+can establish implementation fidelity and flag propagation; they do not establish
+GPU memory/throughput, real multi-node execution or benchmark improvement.

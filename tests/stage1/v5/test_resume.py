@@ -176,7 +176,7 @@ def test_runtime_contract_records_effective_topology_and_independent_query_seman
     assert query['formula_id'] != saved['formula_id']
     assert set(saved['execution']['source_sha256']) == {
         'v5_trainer', 'stage1_trainer', 'transformers_trainer',
-        'query', 'targets', 'history_attention', 'history_teacher'}
+        'query', 'targets', 'history_attention', 'history_teacher', 'v5_donors', 'v5_replay'}
     if mode == 'adaptive':
         assert query['text_gamma'] == .55 and query['attention_layers'] == 'all'
         assert query['resolved_layer_indices'] == [0, 1]
