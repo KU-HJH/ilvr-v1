@@ -41,6 +41,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--loss_chunk_positions", type=int)
     parser.add_argument("--stage1_v5_selection", choices=("all", "clean", "voff", "gap", "intersection"))
     parser.add_argument("--stage1_v5_text_kl_weight", type=float)
+    from stage1.v5_config import V5_VOFF_MODES
+    parser.add_argument("--stage1_v5_voff_mode", choices=V5_VOFF_MODES)
     parser.add_argument("--stage1_v5_debug", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
@@ -378,7 +380,7 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
         'lambda_entropy', 'preference_topk_k', 'preference_topk_mode',
         'topk_include_gt', 'lambda_topk_mass', 'lambda_topk_chosen_mass',
         'preference_entropy_top_percent', 'loss_chunk_positions',
-        'stage1_v5_selection', 'stage1_v5_text_kl_weight',
+        'stage1_v5_selection', 'stage1_v5_text_kl_weight', 'stage1_v5_voff_mode',
     }
     # Resolve saved variant/objective BEFORE any eager fresh-option validation.
     # Omitted entropy support and execution options inherit their exact identity.
@@ -471,10 +473,12 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
     if is_v5:
         config = args.stage1_v5_config
         args.stage1_loss_type = config.loss_type
-        for name in public - {'stage1_loss_type', 'stage1_v5_selection', 'stage1_v5_text_kl_weight'}:
+        for name in public - {'stage1_loss_type', 'stage1_v5_selection', 'stage1_v5_text_kl_weight',
+                              'stage1_v5_voff_mode'}:
             setattr(args, name, getattr(config, name))
         args.stage1_v5_selection = config.selection
         args.stage1_v5_text_kl_weight = config.text_kl_weight
+        args.stage1_v5_voff_mode = config.voff_mode
         args.step_dpo_beta = args.step_preference_beta = config.beta
         args.step_preference_margin = config.margin
         args.step_preference_weight = config.lambda_preference

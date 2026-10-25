@@ -7,10 +7,13 @@ from typing import Mapping
 
 
 LOSS_ALIASES = {'dil-bce-orig': 'dil_bce_orig', 'dil_bce_orig': 'dil_bce_orig'}
+V5_VOFF_MODES = ('attention_mask', 'cross_helper_reverse_topk_independent',
+                 'cross_helper_reverse_topk_cumulative')
 V5_OPTION_ALIASES = {
     'stage1_loss_type': 'loss_type',
     'stage1_v5_selection': 'selection',
     'stage1_v5_text_kl_weight': 'text_kl_weight',
+    'stage1_v5_voff_mode': 'voff_mode',
     'step_preference_weight': 'lambda_preference',
     'step_preference_beta': 'beta', 'step_dpo_beta': 'beta',
     'step_preference_margin': 'margin',
@@ -41,6 +44,7 @@ class Stage1V5Config:
     lambda_topk_chosen_mass: float = 0.0
     lambda_entropy: float = 0.0
     selection: str = 'all'
+    voff_mode: str = 'attention_mask'
     preference_entropy_top_percent: float | None = None
     loss_chunk_positions: int = 128
     text_kl_weight: float = 0.01
@@ -52,6 +56,8 @@ class Stage1V5Config:
     low_attention_fraction: float = 0.1
 
     def __post_init__(self) -> None:
+        if self.voff_mode not in V5_VOFF_MODES:
+            raise ValueError('unsupported Stage1-v5 voff_mode')
         if self.loss_type not in LOSS_ALIASES:
             raise ValueError('Stage1-v5 supports only dil-bce-orig/dil_bce_orig')
         object.__setattr__(self, 'loss_type', LOSS_ALIASES[self.loss_type])

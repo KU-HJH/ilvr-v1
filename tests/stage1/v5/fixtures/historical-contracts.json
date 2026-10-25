@@ -1,0 +1,183 @@
+{
+  "1": {
+    "coefficients": {
+      "ce_weight": 0.1,
+      "sim_weight": 0.1
+    },
+    "config": {
+      "beta": 1.0,
+      "lambda_entropy": 0.0,
+      "lambda_preference": 1.0,
+      "lambda_topk_chosen_mass": 0.0,
+      "lambda_topk_entropy": 0.1,
+      "lambda_topk_mass": 0.05,
+      "loss_chunk_positions": 128,
+      "loss_type": "dil_bce_orig",
+      "low_attention_fraction": 0.1,
+      "low_attention_mass": 0.1,
+      "margin": 0.0,
+      "preference_entropy_top_percent": null,
+      "preference_topk_k": 50,
+      "preference_topk_mode": "independent",
+      "rho_max": 0.5,
+      "rho_min": 0.3,
+      "selection": "all",
+      "temperature": 2.0,
+      "text_cap": 0.3,
+      "text_kl_weight": 0.01,
+      "topk_include_gt": false
+    },
+    "execution": {
+      "ema_tau": 1.0,
+      "tuning_method": "dora",
+      "zero_stage": 1
+    },
+    "formula_id": "dil_bce_orig_token_ref_full_vocab_topk_entropy_v1",
+    "reference": {
+      "base_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "effective_state_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "formula_domain": "teacher_forced_token",
+      "processor_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "schema_version": 1,
+      "selected_parameter_names": [
+        "lora_A"
+      ]
+    },
+    "schedule": {
+      "dil_denominator": "actual_window_eligible_dil_tokens"
+    },
+    "schema_version": 1,
+    "semantics": {
+      "auxiliary_targets": "immediate_original_text_exclude_crossing_special_padding_v1",
+      "ce_alignment_text_reduction": "configured_stage1_accumulation_v1",
+      "interventions": "independent_clean_prefix_voff_body_textoff_previous_text_v1",
+      "reduction": "global_actual_window_original_blocks_empty_included_v1",
+      "reference": "immutable_initial_effective_teacher_v1",
+      "text_schedule": "from_first_update_no_kl_warmup_v1",
+      "text_target": "detached_clean_full_vocab_temperature_squared_kl_v1"
+    },
+    "variant": "v5"
+  },
+  "2": {
+    "coefficients": {
+      "ce_weight": 0.1,
+      "sim_weight": 0.1
+    },
+    "config": {
+      "beta": 1.0,
+      "lambda_entropy": 0.0,
+      "lambda_preference": 1.0,
+      "lambda_topk_chosen_mass": 0.0,
+      "lambda_topk_entropy": 0.1,
+      "lambda_topk_mass": 0.05,
+      "loss_chunk_positions": 128,
+      "loss_type": "dil_bce_orig",
+      "low_attention_fraction": 0.1,
+      "low_attention_mass": 0.1,
+      "margin": 0.0,
+      "preference_entropy_top_percent": null,
+      "preference_topk_k": 50,
+      "preference_topk_mode": "independent",
+      "rho_max": 0.5,
+      "rho_min": 0.3,
+      "selection": "all",
+      "temperature": 2.0,
+      "text_cap": 0.3,
+      "text_kl_weight": 0.01,
+      "topk_include_gt": false
+    },
+    "execution": {
+      "ema_tau": 1.0,
+      "tuning_method": "dora",
+      "zero_stage": 1
+    },
+    "formula_id": "dil_bce_orig_token_ref_full_vocab_topk_entropy_v1",
+    "reference": {
+      "base_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "effective_state_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "formula_domain": "teacher_forced_token",
+      "processor_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "schema_version": 1,
+      "selected_parameter_names": [
+        "lora_A"
+      ]
+    },
+    "schedule": {
+      "dil_denominator": "actual_window_eligible_dil_tokens"
+    },
+    "schema_version": 2,
+    "semantics": {
+      "auxiliary_sum_units": "original_block_token_mean_sum",
+      "auxiliary_targets": "immediate_original_text_exclude_crossing_special_padding_v1",
+      "ce_alignment_text_reduction": "configured_stage1_accumulation_v1",
+      "dil_sum_units": "eligible_token_loss_sum",
+      "interventions": "independent_clean_prefix_voff_body_textoff_previous_text_v1",
+      "reduction": "global_actual_window_dil_tokens_aux_original_blocks_v2",
+      "reference": "immutable_initial_effective_teacher_v1",
+      "text_schedule": "from_first_update_no_kl_warmup_v1",
+      "text_target": "detached_clean_full_vocab_temperature_squared_kl_v1"
+    },
+    "variant": "v5"
+  },
+  "3": {
+    "coefficients": {
+      "ce_weight": 0.1,
+      "sim_weight": 0.1
+    },
+    "config": {
+      "beta": 1.0,
+      "lambda_entropy": 0.0,
+      "lambda_preference": 1.0,
+      "lambda_topk_chosen_mass": 0.0,
+      "lambda_topk_entropy": 0.1,
+      "lambda_topk_mass": 0.05,
+      "loss_chunk_positions": 128,
+      "loss_type": "dil_bce_orig",
+      "low_attention_fraction": 0.1,
+      "low_attention_mass": 0.1,
+      "margin": 0.0,
+      "preference_entropy_top_percent": 20,
+      "preference_topk_k": 50,
+      "preference_topk_mode": "independent",
+      "rho_max": 0.5,
+      "rho_min": 0.3,
+      "selection": "clean",
+      "temperature": 2.0,
+      "text_cap": 0.3,
+      "text_kl_weight": 0.01,
+      "topk_include_gt": false
+    },
+    "execution": {
+      "ema_tau": 1.0,
+      "tuning_method": "dora",
+      "zero_stage": 1
+    },
+    "formula_id": "dil_bce_orig_token_ref_full_vocab_topk_entropy_v1",
+    "reference": {
+      "base_content_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "effective_state_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "formula_domain": "teacher_forced_token",
+      "processor_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "schema_version": 1,
+      "selected_parameter_names": [
+        "lora_A"
+      ]
+    },
+    "schedule": {
+      "dil_denominator": "actual_window_selected_dil_tokens"
+    },
+    "schema_version": 3,
+    "semantics": {
+      "auxiliary_sum_units": "original_block_token_mean_sum",
+      "auxiliary_targets": "immediate_original_text_exclude_crossing_special_padding_v1",
+      "ce_alignment_text_reduction": "configured_stage1_accumulation_v1",
+      "dil_sum_units": "selected_token_loss_sum",
+      "interventions": "independent_clean_prefix_voff_body_textoff_previous_text_v1",
+      "reduction": "global_actual_window_selected_dil_tokens_aux_original_blocks_v3",
+      "reference": "immutable_initial_effective_teacher_v1",
+      "text_schedule": "from_first_update_no_kl_warmup_v1",
+      "text_target": "detached_clean_full_vocab_temperature_squared_kl_v1"
+    },
+    "variant": "v5"
+  }
+}

@@ -191,3 +191,19 @@ def test_legacy_selector_and_prefix_remain_valid_on_existing_paths(stage):
     assert args.step_preference_config.preference_entropy_source == 'clean'
     assert args.step_preference_config.prefix_mode == 'clean_prefix'
     assert args.stage1_v5_config is None
+
+
+@pytest.mark.parametrize('mode', ['attention_mask', 'cross_helper_reverse_topk_independent',
+                                  'cross_helper_reverse_topk_cumulative'])
+def test_voff_mode_reaches_python_config_without_changing_vocabulary_topk(mode):
+    config = api().resolve_v5_config({'stage1_v5_voff_mode': mode})
+    assert config.voff_mode == mode
+    args = parse_args(['--stage1_variant', 'v5', '--stage1_v5_voff_mode', mode])
+    assert args.stage1_v5_config == config
+    assert args.stage1_v5_voff_mode == mode
+    assert config.preference_topk_mode == 'independent'
+    assert api().resolve_v5_config({}).voff_mode == 'attention_mask'
+    with pytest.raises(ValueError):
+        api().resolve_v5_config({'voff_mode': 'unknown'})
+    with pytest.raises(ValueError):
+        parse_args(['--stage1_v5_voff_mode', mode])
