@@ -31,6 +31,9 @@ def validate_matched_standard_execution(args, tuning, profile):
 
 def enable_matched_standard_execution(trainer):
     trainer.stage1_match_v5_execution = True
+    # The recorded V5 profile disables extra target scans and norm reductions.
+    # Set this before the native constructor builds its teacher target builder.
+    trainer.stage1_v5_debug = False
     # Reuse the existing parent-loop fix without changing legacy standard runs.
     trainer.stage1_v5_actual_window_schedule = True
 

@@ -113,16 +113,41 @@ def test_actual_standard_parent_backward_has_context_and_only_native_loss(tmp_pa
 
 
 def test_matched_standard_uses_verified_native_deepspeed_lifecycle(
-        native_deepspeed_lifecycle):
+        native_deepspeed_lifecycle, monkeypatch):
     """Catches retaining the isinstance(V5) gate for the explicit standard mode."""
     trainer, engine, wrapper = native_deepspeed_lifecycle
     trainer.__class__ = CustomTrainerStage1
-    trainer.stage1_match_v5_execution = True
+    del trainer.stage1_v5_debug  # Production standard has no inherited V5 state.
+    from stage1.matched_execution import enable_matched_standard_execution
+    enable_matched_standard_execution(trainer)
+    monkeypatch.setattr(trainer, '_validate_deepspeed_gradient_norm',
+        lambda engine: pytest.fail('reference profile disables the extra norm reduction'))
     trainer._install_deepspeed_step_adapter()
     wrapper.backward(engine.module(torch.ones(1, 1)).sum(),
                      sync_gradients=True, scale_wrt_gas=False)
     assert trainer._successful_optimizer_steps == 1
     assert engine.was_step_applied() is True
+
+
+@pytest.mark.parametrize('matched', [False, True])
+def test_production_constructor_scopes_target_checks_to_execution_profile(monkeypatch, matched):
+    """Construct the native trainer without inherited V5 fixture attributes."""
+    from trl import SFTTrainer
+    from deepspeed_runtime import DeepSpeedRuntimeProfile
+    class Tokenizer:
+        def __call__(self, text, **kwargs):
+            return {'input_ids': torch.tensor([[1]])}
+    def parent_init(self, **kwargs):
+        self.model = torch.nn.Linear(1, 1)
+        self.processing_class = Tokenizer()
+    monkeypatch.setattr(SFTTrainer, '__init__', parent_init)
+    monkeypatch.setattr(CustomTrainerStage1, 'add_callback', lambda *args: None)
+    trainer = CustomTrainerStage1(
+        deepspeed_runtime_profile=DeepSpeedRuntimeProfile(True, 1, None, None, 4),
+        ema_teacher=object(), match_v5_execution=matched)
+    assert trainer._stage1_checks_enabled() is (not matched)
+    assert trainer.target_builder.validate is (not matched)
+    assert trainer.target_builder.collect_diagnostics is (not matched)
 
 
 from tests.stage1.v5.test_trainer import native_deepspeed_lifecycle
