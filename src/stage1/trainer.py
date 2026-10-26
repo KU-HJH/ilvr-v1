@@ -32,6 +32,14 @@ from .ema import (
 from .targets import Stage1TeacherTargetBuilder
 from .query import Stage1QueryConfig
 from .types import Stage1BatchMetadata, Stage1TeacherTargets
+from .equivalence import (
+    SampleStableStage1Dropout, Stage1StochasticContext,
+    activate_stage1_stochastic_context,
+)
+from .matched_execution import (
+    enable_matched_standard_execution, reject_matched_execution_resume,
+    write_matched_execution_identity,
+)
 
 
 _HELPER_INPUTS = frozenset(
@@ -235,6 +243,7 @@ class CustomTrainerStage1(SFTTrainer):
         ema_teacher: Stage1EmaTeacher | None = None,
         stage1_peft_metadata=None,
         collect_stage1_diagnostics: bool = False,
+        match_v5_execution: bool = False,
         **kwargs,
     ) -> None:
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
@@ -246,6 +255,9 @@ class CustomTrainerStage1(SFTTrainer):
         if "tokenizer" in kwargs and "processing_class" not in kwargs:
             kwargs["processing_class"] = kwargs.pop("tokenizer")
         super().__init__(*args, **kwargs)
+        self.stage1_match_v5_execution = bool(match_v5_execution)
+        if self.stage1_match_v5_execution:
+            enable_matched_standard_execution(self)
 
         self.sim_weight = self._finite_weight(sim_weight, "sim_weight")
         self.ce_weight = self._finite_weight(ce_weight, "ce_weight")
@@ -312,6 +324,8 @@ class CustomTrainerStage1(SFTTrainer):
                 write_deepspeed_runtime_sidecar(
                     directory, self.deepspeed_runtime_profile
                 )
+                if getattr(self, 'stage1_match_v5_execution', False):
+                    write_matched_execution_identity(directory)
             except Exception as error:
                 local_error = error
         local_failure = torch.tensor(
@@ -350,6 +364,22 @@ class CustomTrainerStage1(SFTTrainer):
             if any(bool(getattr(item, "use_dora", False)) for item in configs)
             else "lora"
         )
+
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        if not getattr(self, 'stage1_match_v5_execution', False):
+            return super().training_step(model, inputs, num_items_in_batch)
+        metadata = inputs.get('stage1_batch_metadata')
+        if not isinstance(metadata, Stage1BatchMetadata):
+            raise TypeError('matched standard execution requires Stage1 batch metadata')
+        sites = tuple(module.site_name for module in model.modules()
+                      if isinstance(module, SampleStableStage1Dropout))
+        context = Stage1StochasticContext(
+            base_seed=self.args.seed, optimizer_global_step=self.state.global_step,
+            rows=tuple((sample.source_index if sample.canonical_slot_id is None
+                        else sample.canonical_slot_id, sample.unpadded_length)
+                       for sample in metadata.samples), expected_sites=sites)
+        with activate_stage1_stochastic_context(context):
+            return super().training_step(model, inputs, num_items_in_batch)
 
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
@@ -772,7 +802,12 @@ class CustomTrainerStage1(SFTTrainer):
         accelerate_version = importlib_metadata.version("accelerate")
         deepspeed_version = importlib_metadata.version("deepspeed")
         supported_deepspeed = deepspeed_version == _SUPPORTED_DEEPSPEED_VERSION
-        if deepspeed_version == "0.18.7":
+        if getattr(self, 'stage1_match_v5_execution', False):
+            supported_deepspeed = (deepspeed_version == '0.18.7'
+                and self.deepspeed_runtime_profile.enabled
+                and self.deepspeed_runtime_profile.zero_stage == 1
+                and self.deepspeed_runtime_profile.world_size == 4)
+        elif deepspeed_version == "0.18.7":
             from .v5_trainer import CustomTrainerStage1V5
 
             supported_deepspeed = (
@@ -787,7 +822,7 @@ class CustomTrainerStage1(SFTTrainer):
             raise RuntimeError(
                 "unsupported DeepSpeed Stage 1 lifecycle: expected "
                 f"accelerate {_SUPPORTED_ACCELERATE_VERSION} and deepspeed "
-                f"{_SUPPORTED_DEEPSPEED_VERSION} (or 0.18.7 for v5 ZeRO-1), found accelerate "
+                f"{_SUPPORTED_DEEPSPEED_VERSION} (or 0.18.7 for v5/matched standard ZeRO-1), found accelerate "
                 f"{accelerate_version} and deepspeed {deepspeed_version}"
             )
 
@@ -1018,6 +1053,8 @@ class CustomTrainerStage1(SFTTrainer):
                     write_deepspeed_runtime_sidecar(
                         checkpoint_dir, self.deepspeed_runtime_profile
                     )
+                    if getattr(self, 'stage1_match_v5_execution', False):
+                        write_matched_execution_identity(checkpoint_dir)
                 except Exception as error:
                     ema_save_error = error
             local_failure = torch.tensor(
@@ -1060,6 +1097,13 @@ class CustomTrainerStage1(SFTTrainer):
         **kwargs,
     ):
         """Require and defer compatible EMA state for Stage 1 resume."""
+
+        requested = kwargs.get('model_path', resume_from_checkpoint)
+        if requested is True:
+            requested = get_last_checkpoint(self.args.output_dir)
+        if requested is not False:
+            reject_matched_execution_resume(requested,
+                enabled=getattr(self, 'stage1_match_v5_execution', False))
 
         self._publish_deepspeed_runtime_identity(
             Path(self.args.output_dir), label="Stage 1 runtime identity publication"
@@ -1174,6 +1218,8 @@ class CustomTrainerStage1(SFTTrainer):
             _save_stage1_peft_supplements(self.model, target, metadata)
         if self.args.should_save:
             classify_stage1_artifact(target)
+            if getattr(self, 'stage1_match_v5_execution', False):
+                write_matched_execution_identity(target)
 
 
 __all__ = [

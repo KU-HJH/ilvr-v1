@@ -87,6 +87,7 @@ def _prepared_inference_relative_path(
     _validate_run_id(relative.parts[0])
     return relative
 _V5_TRAINING_FILES = frozenset({Path("stage1_v5.json"), Path("stage1_v5_reference.pt")})
+_MATCHED_STANDARD_TRAINING_FILES = frozenset({Path('stage1_matched_execution.json')})
 
 _INFERENCE_STATIC_NAMES = frozenset(
     {
@@ -1157,7 +1158,7 @@ def select_common_metadata_entries(
     """Select only explicitly approved metadata for this stage/method contract."""
     allowed = _required_common_paths(_validate_identity(manifest.runtime_identity))
     if manifest.runtime_identity["stage"] == "stage1":
-        allowed = allowed | _V5_TRAINING_FILES
+        allowed = allowed | _V5_TRAINING_FILES | _MATCHED_STANDARD_TRAINING_FILES
     return tuple(entry for entry in manifest.entries if entry.relative_path in allowed)
 
 
@@ -1403,6 +1404,7 @@ def validate_transfer_destination(
                 "stage1_peft_metadata.json",
                 "stage1_v5.json",
                 "stage1_v5_reference.pt",
+                "stage1_matched_execution.json",
                 "stage2_peft_metadata.json",
                 "stage2-sampler.json",
             }

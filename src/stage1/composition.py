@@ -445,7 +445,8 @@ def _load_stage1_model(source, config, args, dependencies):
     """Reuse the authenticated mixed-backend construction for opt-in v5."""
     model_kwargs = dict(torch_dtype=torch.bfloat16, cache_dir=args.cache_dir,
                         trust_remote_code=True)
-    if getattr(args, 'stage1_variant', 'standard') == 'v5':
+    if (getattr(args, 'stage1_variant', 'standard') == 'v5'
+            or getattr(args, 'stage1_match_v5_execution', False)):
         from stage2.attention_backend import load_qwen2_5_vl_with_attention
         return load_qwen2_5_vl_with_attention(source,
             attention_implementation=args.attention_implementation,
@@ -484,6 +485,14 @@ def build_stage1_training_components(
     data_path, image_root, output_dir = _require_stage1_inputs(args)
     tuning = resolve_stage1_tuning_config(args)
     is_v5 = getattr(args, 'stage1_variant', 'standard') == 'v5'
+    matched_standard = bool(getattr(args, 'stage1_match_v5_execution', False))
+    if matched_standard:
+        from stage1.matched_execution import validate_matched_standard_execution
+        if is_v5:
+            raise ValueError('matched execution requires standard Stage1')
+        validate_matched_standard_execution(args, tuning, profile)
+        from transformers import set_seed
+        set_seed(args.seed)
     from stage1.query import Stage1QueryConfig
     query_config = getattr(args, 'stage1_query_config', Stage1QueryConfig())
     if query_config.mode == 'adaptive' and not is_v5:
@@ -507,6 +516,8 @@ def build_stage1_training_components(
         output_dir, args.resume_from_checkpoint_path
     )
     checkpoint = decision.checkpoint_path
+    from stage1.matched_execution import reject_matched_execution_resume
+    reject_matched_execution_resume(checkpoint, enabled=matched_standard)
     metadata = None
     metadata_snapshot = decision.peft_metadata_snapshot
     if decision.artifact_kind is Stage1ArtifactKind.PEFT:
@@ -654,6 +665,12 @@ def build_stage1_training_components(
             )
 
     model.visual.requires_grad_(False)
+    if matched_standard:
+        from stage2.attention_backend import validate_qwen2_5_vl_attention_backends
+        from peft_common import resolve_qwen2_5_vl_model
+        validate_qwen2_5_vl_attention_backends(resolve_qwen2_5_vl_model(model),
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=args.vision_attention_implementation)
     parameter_report = dependencies.validate_boundary(
         model, tuning, latent_ids, zero_stage=profile.zero_stage
     )
@@ -741,6 +758,7 @@ def build_stage1_training_components(
         stage1_peft_metadata=metadata,
         collect_stage1_diagnostics=(bool(getattr(args, "stage1_v5_debug", False)) if is_v5
                                    else bool(getattr(args, "benchmark_evidence_path", None))),
+        **({'match_v5_execution': True} if matched_standard else {}),
         **v5_kwargs,
     )
     if tuning.method != "full" and args.gradient_checkpointing:
