@@ -46,9 +46,19 @@ def reject_matched_execution_resume(checkpoint, *, enabled):
         raise ValueError('matched standard Stage1 execution supports fresh runs only')
 
 
-def write_matched_execution_identity(directory):
+def write_matched_execution_identity(directory, *, ce_entropy_top_percent=None):
     marker = Path(directory) / MATCHED_EXECUTION_FILENAME
-    payload = json.dumps(_IDENTITY, sort_keys=True, indent=2) + '\n'
+    identity = dict(_IDENTITY)
+    if ce_entropy_top_percent is not None:
+        from .entropy_ce import validate_ce_entropy_percent
+        identity['ce_entropy_selection'] = {
+            'percent': validate_ce_entropy_percent(ce_entropy_top_percent),
+            'source': 'clean_student_logits', 'temperature': 1,
+            'candidate_pool': 'supervised_non_special_text',
+            'quota': 'sample_local_ceil', 'ties': 'original_position',
+            'special_targets': 'preserve', 'reduction': 'retained_label_sample_mean',
+        }
+    payload = json.dumps(identity, sort_keys=True, indent=2) + '\n'
     if marker.is_symlink():
         raise ValueError('matched execution identity must not be a symlink')
     if marker.exists():

@@ -828,6 +828,7 @@ def receive_launch_plan(
 
 
 _STAGE1_VALUE_OPTIONS = {
+    "--stage1-ce-entropy-top-percent",
     "--query_mode",
     "--history_text_gamma",
     "--history_attention_layers",

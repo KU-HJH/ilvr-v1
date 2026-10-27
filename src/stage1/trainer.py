@@ -244,6 +244,7 @@ class CustomTrainerStage1(SFTTrainer):
         stage1_peft_metadata=None,
         collect_stage1_diagnostics: bool = False,
         match_v5_execution: bool = False,
+        ce_entropy_top_percent: float | None = None,
         **kwargs,
     ) -> None:
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
@@ -258,6 +259,19 @@ class CustomTrainerStage1(SFTTrainer):
         self.stage1_match_v5_execution = bool(match_v5_execution)
         if self.stage1_match_v5_execution:
             enable_matched_standard_execution(self)
+        self.ce_entropy_top_percent = ce_entropy_top_percent
+        self.ce_entropy_special_token_ids = ()
+        if ce_entropy_top_percent is not None:
+            from .entropy_ce import validate_ce_entropy_percent
+            self.ce_entropy_top_percent = validate_ce_entropy_percent(ce_entropy_top_percent)
+            if not self.stage1_match_v5_execution:
+                raise ValueError('CE entropy selection requires matched standard Stage1')
+            processor = self.processing_class
+            tokenizer = getattr(processor, 'tokenizer', processor)
+            special_ids = getattr(tokenizer, 'all_special_ids', None)
+            if not special_ids:
+                raise ValueError('CE entropy selection requires tokenizer special IDs')
+            self.ce_entropy_special_token_ids = tuple(special_ids)
 
         self.sim_weight = self._finite_weight(sim_weight, "sim_weight")
         self.ce_weight = self._finite_weight(ce_weight, "ce_weight")
@@ -325,7 +339,7 @@ class CustomTrainerStage1(SFTTrainer):
                     directory, self.deepspeed_runtime_profile
                 )
                 if getattr(self, 'stage1_match_v5_execution', False):
-                    write_matched_execution_identity(directory)
+                    write_matched_execution_identity(directory, ce_entropy_top_percent=getattr(self, 'ce_entropy_top_percent', None))
             except Exception as error:
                 local_error = error
         local_failure = torch.tensor(
@@ -392,7 +406,7 @@ class CustomTrainerStage1(SFTTrainer):
         if not isinstance(labels, torch.Tensor) or labels.ndim != 2:
             raise TypeError("Stage 1 labels must be a rank-2 tensor")
         forward_inputs = model_inputs
-        if labels.shape[0] > 1:
+        if labels.shape[0] > 1 or getattr(self, 'ce_entropy_top_percent', None) is not None:
             forward_inputs = dict(model_inputs)
             forward_inputs.pop("labels")
 
@@ -453,21 +467,26 @@ class CustomTrainerStage1(SFTTrainer):
     def _stage1_native_losses(self, outputs, labels: torch.Tensor, targets: Stage1TeacherTargets) -> tuple[torch.Tensor, torch.Tensor]:
         """Unchanged native per-sample CE and latent alignment reductions."""
         model_ce_loss = getattr(outputs, "loss", None)
-        if labels.shape[0] == 1 and (
+        percent = getattr(self, 'ce_entropy_top_percent', None)
+        if percent is not None:
+            from .entropy_ce import select_entropy_ce_labels
+            labels = select_entropy_ce_labels(outputs.logits, labels, percent=percent,
+                special_token_ids=self.ce_entropy_special_token_ids)
+        if percent is None and labels.shape[0] == 1 and (
             not isinstance(model_ce_loss, torch.Tensor)
             or model_ce_loss.numel() != 1
         ):
             raise RuntimeError("Stage 1 student forward must return a scalar loss")
-        ce_loss = self._equal_sample_ce_loss(outputs, labels, model_ce_loss)
+        ce_loss = self._equal_sample_ce_loss(outputs, labels, model_ce_loss, recompute=percent is not None)
         outputs.loss = ce_loss
         alignment_loss = self._alignment_loss(outputs, targets)
         return ce_loss, alignment_loss
 
     @staticmethod
-    def _equal_sample_ce_loss(outputs, labels, model_ce_loss) -> torch.Tensor:
+    def _equal_sample_ce_loss(outputs, labels, model_ce_loss, *, recompute=False) -> torch.Tensor:
         if not isinstance(labels, torch.Tensor) or labels.ndim != 2:
             raise TypeError("Stage 1 labels must be a rank-2 tensor")
-        if labels.shape[0] == 1:
+        if labels.shape[0] == 1 and not recompute:
             return model_ce_loss
 
         logits = getattr(outputs, "logits", None)
@@ -1054,7 +1073,7 @@ class CustomTrainerStage1(SFTTrainer):
                         checkpoint_dir, self.deepspeed_runtime_profile
                     )
                     if getattr(self, 'stage1_match_v5_execution', False):
-                        write_matched_execution_identity(checkpoint_dir)
+                        write_matched_execution_identity(checkpoint_dir, ce_entropy_top_percent=getattr(self, 'ce_entropy_top_percent', None))
                 except Exception as error:
                     ema_save_error = error
             local_failure = torch.tensor(
@@ -1219,7 +1238,7 @@ class CustomTrainerStage1(SFTTrainer):
         if self.args.should_save:
             classify_stage1_artifact(target)
             if getattr(self, 'stage1_match_v5_execution', False):
-                write_matched_execution_identity(target)
+                write_matched_execution_identity(target, ce_entropy_top_percent=getattr(self, 'ce_entropy_top_percent', None))
 
 
 __all__ = [

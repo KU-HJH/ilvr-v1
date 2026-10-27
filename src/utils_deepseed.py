@@ -29,6 +29,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--history_attention_layers", choices=("last", "last4", "all"), default="last")
     parser.add_argument("--stage1_variant", choices=("standard", "v5"), default="standard")
     parser.add_argument("--stage1_match_v5_execution", action="store_true")
+    parser.add_argument("--stage1_ce_entropy_top_percent", type=float, default=None)
     parser.add_argument("--stage1_loss_type", choices=("dil-bce-orig", "dil_bce_orig"))
     parser.add_argument("--lambda_preference", type=float)
     parser.add_argument("--lambda_topk_entropy", type=float)
@@ -239,6 +240,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
     _resolve_stage1_v5_args(parser, args, raw_argv)
+    if args.stage1_ce_entropy_top_percent is not None:
+        from stage1.entropy_ce import validate_ce_entropy_percent
+        args.stage1_ce_entropy_top_percent = validate_ce_entropy_percent(args.stage1_ce_entropy_top_percent)
+        if args.stage != 'stage1' or args.stage1_variant != 'standard' or not args.stage1_match_v5_execution:
+            raise ValueError('CE entropy selection requires matched standard Stage1')
     if args.stage1_match_v5_execution and (args.stage != 'stage1' or args.stage1_variant != 'standard'):
         raise ValueError('matched execution requires standard Stage1')
     if args.vision_attention_implementation is None:

@@ -759,6 +759,8 @@ def build_stage1_training_components(
         collect_stage1_diagnostics=(bool(getattr(args, "stage1_v5_debug", False)) if is_v5
                                    else bool(getattr(args, "benchmark_evidence_path", None))),
         **({'match_v5_execution': True} if matched_standard else {}),
+        **({'ce_entropy_top_percent': args.stage1_ce_entropy_top_percent}
+           if getattr(args, 'stage1_ce_entropy_top_percent', None) is not None else {}),
         **v5_kwargs,
     )
     if tuning.method != "full" and args.gradient_checkpointing:
