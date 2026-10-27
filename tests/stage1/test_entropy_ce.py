@@ -120,7 +120,22 @@ def test_constructor_uses_processor_special_ids_and_enforces_matched_mode(monkey
     assert trainer.ce_entropy_special_token_ids == (10, 11)
 
 
-def test_real_standard_parent_backward_reuses_one_student_forward(tmp_path):
+@pytest.fixture
+def owned_accelerate_state():
+    """Release the state created by this test without masking earlier leaks."""
+    from accelerate.state import AcceleratorState, GradientState, PartialState
+    assert not AcceleratorState._shared_state
+    assert not PartialState._shared_state
+    assert not GradientState._shared_state
+    try:
+        yield
+    finally:
+        AcceleratorState._reset_state(reset_partial_state=True)
+        PartialState._reset_state()
+        GradientState._reset_state()
+
+
+def test_real_standard_parent_backward_reuses_one_student_forward(tmp_path, owned_accelerate_state):
     """Catches selector bypass, extra forwards, changed alignment/context or no backward."""
     from accelerate import Accelerator
     from stage1.equivalence import stage1_checkpoint_context_fn
