@@ -1,0 +1,11 @@
+# Matched Stage1 periodic checkpoint resume design v2
+
+Authority: approved human design text and scope in `logs/stage1-ten-percent-resume-development/design-commitment-v2.json`; latest user directive `재게 가능하도록 수정해 놓아라.` records go-ahead after presented v2. Native execution remains selected.
+
+Keep the original clean20 run and automatic evaluation unchanged. Support actual continuation from its retained checkpoint-216,432,...2160 in a distinct canonical output experiment. Preserve the original model, optimizer, scheduler, four-rank RNG, EMA, objective, full2160-update budget and saved execution (workers0); fresh training separately uses workers4. Do not overwrite source artifacts or immutable v1 markers. Terminal2160 restores completed state with no additional update.
+
+Use existing artifact manifest/classification/collection/redistribution primitives and two-node/four-rank coordinator. Collect split periodic shards only after genuine successful supervisors have completed. Already assembled final checkpoints are reused as complete sources. Copy only the selected complete checkpoint to a fresh output and record source identity separately from destination/reader revision. Authenticate legacy missing profile fields from the original launch/resolved evidence; reject incomplete, mismatched or unsafe inputs. The public prepare operation must not launch training.
+
+Reuse native Trainer/DeepSpeed and EMA restoration after replacing the matched-mode blanket guard with strict validation at composition and Trainer entrypoints. Causal CPU comparisons cover clean20 loss, the three-microbatch epoch tail, next epoch sample order, RNG, parameters, optimizer, scheduler and EMA. Add the smallest separate stop control needed for a real fixed2160-budget bounded continuation witness. One independent final review and fresh full suite are required. After original training/evaluation releases GPUs, use an isolated copied source for one actual two-node/four-rank continuation witness; report its limits rather than claim GPU bitwise equivalence.
+
+No automatic restarter, generalized recovery service or alternate launcher. Existing historical and unrelated Stage1/V5/Stage2 semantics remain preserved.

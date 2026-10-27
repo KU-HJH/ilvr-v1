@@ -42,8 +42,14 @@ def reject_matched_execution_resume(checkpoint, *, enabled):
     if checkpoint is None:
         return
     marker = Path(checkpoint) / MATCHED_EXECUTION_FILENAME
-    if enabled or marker.exists() or marker.is_symlink():
-        raise ValueError('matched standard Stage1 execution supports fresh runs only')
+    contract = Path(checkpoint) / 'stage1_matched_resume.json'
+    if enabled or marker.exists() or marker.is_symlink() or contract.exists() or contract.is_symlink():
+        if not enabled:
+            raise ValueError('matched standard Stage1 resume requires its execution flag; fresh mode differs')
+        from .matched_resume import MATCHED_RESUME_FILENAME, load_matched_resume_contract
+        if not (Path(checkpoint) / MATCHED_RESUME_FILENAME).exists():
+            raise ValueError('matched standard Stage1 fresh-only checkpoint requires a validated resume contract')
+        return load_matched_resume_contract(checkpoint)
 
 
 def write_matched_execution_identity(directory, *, ce_entropy_top_percent=None):

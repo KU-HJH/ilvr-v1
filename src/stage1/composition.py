@@ -517,7 +517,15 @@ def build_stage1_training_components(
     )
     checkpoint = decision.checkpoint_path
     from stage1.matched_execution import reject_matched_execution_resume
-    reject_matched_execution_resume(checkpoint, enabled=matched_standard)
+    matched_contract = reject_matched_execution_resume(checkpoint, enabled=matched_standard)
+    matched_resume_profile = None
+    matched_training_args = None
+    if matched_standard:
+        from stage1.matched_resume import capture_matched_resume_profile, validate_matched_resume_profile
+        matched_training_args = build_stage1_training_arguments(args)
+        matched_resume_profile = capture_matched_resume_profile(args, matched_training_args)
+        if matched_contract is not None:
+            validate_matched_resume_profile(matched_contract['profile'], matched_resume_profile)
     metadata = None
     metadata_snapshot = decision.peft_metadata_snapshot
     if decision.artifact_kind is Stage1ArtifactKind.PEFT:
@@ -680,7 +688,7 @@ def build_stage1_training_components(
     token_ids = LatentTokenIds(*latent_ids)
     collator = dependencies.collator_factory(processor, token_ids, args.latent_size,
         **({'stage1_variant': 'v5'} if is_v5 else {}))
-    training_args = build_stage1_training_arguments(args)
+    training_args = matched_training_args or build_stage1_training_arguments(args)
     factory = dependencies.trainer_factory
     v5_kwargs = {}
     if is_v5:
@@ -758,7 +766,8 @@ def build_stage1_training_components(
         stage1_peft_metadata=metadata,
         collect_stage1_diagnostics=(bool(getattr(args, "stage1_v5_debug", False)) if is_v5
                                    else bool(getattr(args, "benchmark_evidence_path", None))),
-        **({'match_v5_execution': True} if matched_standard else {}),
+        **({'match_v5_execution': True, 'matched_resume_profile': matched_resume_profile}
+           if matched_standard else {}),
         **({'ce_entropy_top_percent': args.stage1_ce_entropy_top_percent}
            if getattr(args, 'stage1_ce_entropy_top_percent', None) is not None else {}),
         **v5_kwargs,

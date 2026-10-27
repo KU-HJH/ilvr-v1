@@ -245,6 +245,7 @@ class CustomTrainerStage1(SFTTrainer):
         collect_stage1_diagnostics: bool = False,
         match_v5_execution: bool = False,
         ce_entropy_top_percent: float | None = None,
+        matched_resume_profile=None,
         **kwargs,
     ) -> None:
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
@@ -257,6 +258,7 @@ class CustomTrainerStage1(SFTTrainer):
             kwargs["processing_class"] = kwargs.pop("tokenizer")
         super().__init__(*args, **kwargs)
         self.stage1_match_v5_execution = bool(match_v5_execution)
+        self.matched_resume_profile = matched_resume_profile
         if self.stage1_match_v5_execution:
             enable_matched_standard_execution(self)
         self.ce_entropy_top_percent = ce_entropy_top_percent
@@ -1074,6 +1076,11 @@ class CustomTrainerStage1(SFTTrainer):
                     )
                     if getattr(self, 'stage1_match_v5_execution', False):
                         write_matched_execution_identity(checkpoint_dir, ce_entropy_top_percent=getattr(self, 'ce_entropy_top_percent', None))
+                        resume_profile = getattr(self, 'matched_resume_profile', None)
+                        if resume_profile is not None:
+                            from .matched_resume import write_matched_resume_contract, checkpoint_source
+                            write_matched_resume_contract(checkpoint_dir, resume_profile,
+                                source=checkpoint_source(checkpoint_dir))
                 except Exception as error:
                     ema_save_error = error
             local_failure = torch.tensor(
@@ -1121,8 +1128,11 @@ class CustomTrainerStage1(SFTTrainer):
         if requested is True:
             requested = get_last_checkpoint(self.args.output_dir)
         if requested is not False:
-            reject_matched_execution_resume(requested,
+            contract = reject_matched_execution_resume(requested,
                 enabled=getattr(self, 'stage1_match_v5_execution', False))
+            if contract is not None:
+                from .matched_resume import validate_matched_trainer_resume
+                validate_matched_trainer_resume(self, contract)
 
         self._publish_deepspeed_runtime_identity(
             Path(self.args.output_dir), label="Stage 1 runtime identity publication"
@@ -1158,6 +1168,13 @@ class CustomTrainerStage1(SFTTrainer):
                 pending_checkpoint, self.deepspeed_runtime_profile
             )
             self._stage1_ema_checkpoint_path(pending_checkpoint)
+            if getattr(self, 'stage1_match_v5_execution', False):
+                # Native PEFT Trainer restores adapters, but not ILVR's separate
+                # sparse output-token rows. Composition already restores these;
+                # the direct Trainer entrypoint must restore them too.
+                from .token_rows import load_sparse_token_rows
+                load_sparse_token_rows(self.model, pending_checkpoint,
+                                       self.stage1_peft_metadata.latent_token_ids)
         self._stage1_pending_ema_checkpoint = pending_checkpoint
         resolved_resume = (
             None if pending_checkpoint is None else str(pending_checkpoint)
