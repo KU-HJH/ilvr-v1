@@ -1193,12 +1193,19 @@ class CustomTrainerStage1(SFTTrainer):
         )
         if "model_path" in kwargs:
             kwargs["model_path"] = resolved_resume
-        return super().train(
+        result = super().train(
             resume_from_checkpoint=resolved_resume,
             trial=trial,
             ignore_keys_for_eval=ignore_keys_for_eval,
             **kwargs,
         )
+        # Native RNG restoration lives inside its epoch loop. A completed
+        # matched checkpoint runs no epochs, but still restores full state.
+        if (pending_checkpoint is not None
+                and getattr(self, 'stage1_match_v5_execution', False)
+                and contract['source']['checkpoint_step'] == self.args.max_steps):
+            self._load_rng_state(str(pending_checkpoint))
+        return result
 
     def _save(self, output_dir=None, state_dict=None):
         """Keep Trainer's gathered state while writing canonical PEFT weights."""

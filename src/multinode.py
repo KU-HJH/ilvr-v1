@@ -2261,12 +2261,13 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             commit=commit,
             global_step=final_step,
         )
-        collected_entries = collect_checkpoint_artifacts(
+        collected_entries = _collect_training_checkpoint(
             runner,
             checkpoint_path=checkpoint_path,
             runtime_identity=artifact_identity,
             exit_codes=exit_codes,
             world_size=plan.world_size,
+            terminal=(stage == 'stage1' and resume_requested and resume_step == final_step),
         )
         if (stage == 'stage1' and not resume_requested
                 and _argument_value(forwarded, '--stage1-variant') == 'v5'):
@@ -2576,6 +2577,19 @@ def _evaluate_main(argv: list[str]) -> int:
     return 0
 
 
+def _collect_training_checkpoint(runner, *, checkpoint_path, runtime_identity, exit_codes,
+                                 world_size, terminal=False):
+    if not terminal:
+        return collect_checkpoint_artifacts(runner, checkpoint_path=checkpoint_path,
+            runtime_identity=runtime_identity, exit_codes=exit_codes, world_size=world_size)
+    if dict(exit_codes) != {0: 0, 1: 0}:
+        raise ValueError('terminal checkpoint requires successful supervisors on both nodes')
+    from src.multinode_artifacts import validate_canonical_checkpoint_manifest
+    manifest = runner.read_canonical_artifact_manifest(checkpoint_path, runtime_identity)
+    validate_canonical_checkpoint_manifest(manifest, expected_identity=runtime_identity)
+    return manifest.entries
+
+
 def _prepare_stage1_resume_directory(argv):
     """Reserve a fresh remote run under the existing checkpoint storage link."""
     parser = argparse.ArgumentParser(prog='prepare-stage1-resume-directory')
@@ -2599,6 +2613,10 @@ def _prepare_stage1_resume_directory(argv):
 def _main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == 'prepare-stage1-resume':
+        # Training modules use src/ as their import root. Establish the same
+        # repository-owned paths for this public module CLI without requiring
+        # an outer PYTHONPATH (and use this checkout's patched Transformers).
+        sys.path[:0] = [str(_REPOSITORY_ROOT/'src'), str(_REPOSITORY_ROOT/'transformers/src')]
         from src.stage1.resume_preparation import preparation_main
         return preparation_main(argv[1:])
     if argv and argv[0] == 'prepare-stage1-resume-directory':

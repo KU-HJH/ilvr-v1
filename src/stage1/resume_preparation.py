@@ -201,7 +201,8 @@ def preparation_main(argv):
             checkpoint_root=source_root/'checkpoints', log_root=source_root/'logs/multinode',
             stage_log_root=source_root/'logs/zero-stage-compatibility')
         reader = SubprocessCoordinatorRunner(source_plan, commands=commands, commit=source_commit,
-            checkpoint_root=source_root/'checkpoints', log_root=source_root/'logs/multinode')
+            checkpoint_root=source_root/'checkpoints',
+            log_root=_REPOSITORY_ROOT/'logs/stage1-resume-preparation'/plan.run_id/'source')
         source_path = source_root/'checkpoints'/config['run_id']/f'checkpoint-{args.checkpoint_step}'
         identity = _checkpoint_artifact_identity(source_plan, commit=source_commit, global_step=args.checkpoint_step)
         assemble_source_checkpoint(reader, source_path, identity)
@@ -225,7 +226,8 @@ def preparation_main(argv):
         copy_resume_checkpoint(source_path, destination, profile=profile, source=origin,
                                checkpoint_root=_REPOSITORY_ROOT/'checkpoints')
         commit = subprocess.check_output(['git','rev-parse','HEAD'],cwd=_REPOSITORY_ROOT,text=True).strip()
-        writer = SubprocessCoordinatorRunner(plan, commands=None, commit=commit)
+        writer = SubprocessCoordinatorRunner(plan, commands=None, commit=commit,
+            log_root=_REPOSITORY_ROOT/'logs/stage1-resume-preparation'/plan.run_id/'destination')
         writer.publish_resume_copy(destination, _checkpoint_artifact_identity(plan, commit=commit,
                                                                              global_step=args.checkpoint_step))
         output = _REPOSITORY_ROOT/'logs'/plan.run_id

@@ -94,10 +94,12 @@ def test_both_coordinator_worker_commands_keep_stop_and_budget():
 
 
 def test_prepare_resume_cli_is_available_without_starting_workers():
+    import os
     import subprocess
     from tests.stage1.v5.test_launcher import ROOT
     run = subprocess.run([str(ROOT/'venv/ilvr-venv/bin/python'), '-m','src.multinode',
-        'prepare-stage1-resume','--help'], cwd=ROOT, capture_output=True, text=True)
+        'prepare-stage1-resume','--help'], cwd=ROOT, capture_output=True, text=True,
+        env={key:value for key,value in os.environ.items() if key != 'PYTHONPATH'})
     assert run.returncode == 0, run.stderr
     assert '--source-log-dir' in run.stdout
     assert '--checkpoint-step' in run.stdout
@@ -151,3 +153,68 @@ def test_transfer_reader_accepts_source_worktree_alias_of_same_checkpoint_storag
     reader = multinode_runtime.SubprocessCoordinatorRunner(plan, commands=None,
         commit='8'*40, checkpoint_root=old/'checkpoints')
     assert reader.checkpoint_root == old/'checkpoints'
+
+
+def test_terminal_coordinator_reuses_complete_checkpoint_after_zero_exits(tmp_path):
+    from src import multinode
+    from tests.multinode.test_artifacts import FakeProductionTransferRunner, identity
+    assert hasattr(multinode, '_collect_training_checkpoint'), 'terminal-aware collection is missing'
+    runner = FakeProductionTransferRunner()
+    entries = multinode._collect_training_checkpoint(runner, checkpoint_path=tmp_path/'checkpoint-2',
+        runtime_identity=identity(), exit_codes={0:0,1:0}, world_size=4, terminal=True)
+    assert entries == runner.canonical.entries
+    assert runner.events == ['remote-canonical-manifest']
+
+
+@pytest.mark.parametrize('occupied_source', [True, False])
+def test_preparation_transfer_logs_do_not_touch_source_or_training_attempt(tmp_path, monkeypatch, occupied_source):
+    """Run the preparer controller with real files and exclusive list publication."""
+    import subprocess
+    from src import multinode, multinode_runtime
+    from src.stage1 import resume_preparation as module
+    from tests.stage1.test_matched_resume import checkpoint_with_resume_contract
+    from tests.stage1.test_resume_preparation import state_files
+    source_root = tmp_path/'old'; (source_root/'checkpoints').mkdir(parents=True)
+    checkpoint, _ = checkpoint_with_resume_contract(source_root/'checkpoints')
+    state_files(checkpoint)
+    current = tmp_path/'current'; current.mkdir()
+    (current/'checkpoints').symlink_to(source_root/'checkpoints', target_is_directory=True)
+    logs = source_root/'logs/source'; logs.mkdir(parents=True)
+    (logs/'launch-config.json').write_text(json.dumps({'local_runtime':str(source_root),
+        'run_id':'source','head':'8'*40,'command':[str(source_root/'run_multinode_stage1_training.sh'),
+            '--method','dora','--max-steps','2160']}))
+    source_plan_path = source_root/'logs/multinode/source/initial/launch-plan.json'
+    source_plan_path.parent.mkdir(parents=True)
+    source_plan_path.write_text('{}')
+    old_list = source_plan_path.parent/'artifact-push-rank1.files'
+    if occupied_source: old_list.write_bytes(b'original transfer list')
+    source_plan = SimpleNamespace(stage='stage1', tuning_method='dora',zero_stage=1,
+        run_id='source', attempt_id='initial',cluster=SimpleNamespace(local_repo_root=source_root))
+    cluster = SimpleNamespace(local_repo_root=current,remote_repo_root=Path('/remote'),
+                              remote_host_repo_root=Path('/host'))
+    plan = SimpleNamespace(run_id='new-resume',attempt_id='resume1',zero_stage=1,
+                           main_process_port=29931,cluster=cluster)
+    monkeypatch.setattr(multinode,'_REPOSITORY_ROOT',current)
+    monkeypatch.setattr(multinode,'decode_launch_plan',lambda *_: source_plan)
+    monkeypatch.setattr(multinode,'build_launch_plan',lambda **_: plan)
+    monkeypatch.setattr(multinode,'_checkpoint_artifact_identity',lambda *a,**kw: {})
+    monkeypatch.setattr(multinode_runtime,'build_owned_tmux_commands',lambda *a,**kw: object())
+    monkeypatch.setattr(subprocess,'run',lambda *a,**kw: SimpleNamespace(returncode=0))
+    monkeypatch.setattr(subprocess,'check_output',lambda *a,**kw: '8'*40)
+    monkeypatch.setattr(multinode_runtime,'redistribute_resume_checkpoint',lambda *a,**kw: None)
+    def transfer(runner):
+        path = runner.log_root/runner.plan.run_id/runner.plan.attempt_id/'artifact-push-rank1.files'
+        multinode_runtime_path = path
+        from src.multinode_artifacts import publish_files_list
+        publish_files_list(multinode_runtime_path, ())
+    class Runner:
+        def __init__(self, plan, *, log_root=None, **kwargs):
+            self.plan = plan
+            self.log_root = log_root if log_root is not None else current/'logs/multinode'
+        def publish_resume_copy(self, *args): transfer(self)
+    monkeypatch.setattr(multinode_runtime,'SubprocessCoordinatorRunner',Runner)
+    monkeypatch.setattr(module,'assemble_source_checkpoint',lambda runner,*_: transfer(runner))
+    assert module.preparation_main(['--source-log-dir',str(logs),'--checkpoint-step','216',
+        '--run-id','new-resume','--remote-repo-root','/remote','--remote-host-repo-root','/host']) == 0
+    if occupied_source: assert old_list.read_bytes() == b'original transfer list'
+    assert not (current/'logs/multinode/new-resume/resume1').exists()

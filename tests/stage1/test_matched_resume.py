@@ -235,6 +235,7 @@ def test_native_clean20_resume_matches_epoch_tail_and_all_state(tmp_path):
         _assert_nested_state_equal(terminal.optimizer.state_dict(), expected_optimizer)
         _assert_nested_state_equal(terminal.lr_scheduler.state_dict(), expected_scheduler)
         _assert_nested_state_equal(terminal.ema_teacher.state_dict(), expected_teacher)
+        _assert_rng_state_equal(_capture_rng_state(), expected_rng)
     finally:
         reset()
 
