@@ -1975,14 +1975,14 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 benchmark_evidence_path=str(producer_evidence),
             )
             resume_requested = "RESUME_CHECKPOINT" in stage_environment
-        planned_stop = _argument_value(forwarded, "--stage2_stop_after_checkpoint") if stage == "stage2" else None
+        planned_stop = _argument_value(forwarded, "--stage2_stop_after_checkpoint" if stage == "stage2" else '--stop-after-checkpoint')
         planned_stop_max_steps = None
         if planned_stop is not None:
-            budget = _argument_value(forwarded, "--max_steps")
+            budget = _argument_value(forwarded, "--max_steps" if stage == 'stage2' else '--max-steps')
             if not (planned_stop.isdecimal() and budget is not None and budget.isdecimal()
                     and 0 < int(planned_stop) < int(budget)):
                 raise ValueError("stage2_stop_after_checkpoint requires 0 < stop < explicit max_steps")
-            if resume_requested:
+            if stage == 'stage2' and resume_requested:
                 raise ValueError("stage2_stop_after_checkpoint is fresh-run only")
             planned_stop_max_steps = int(budget)
         if resume_requested and args.attempt_id == "initial":
@@ -2220,7 +2220,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                     "--max-steps must identify the final checkpoint step"
                 )
             else:
-                final_step = int(step_value)
+                final_step = int(planned_stop) if planned_stop is not None else int(step_value)
             decode_stage1_training_evidence(
                 raw_evidence,
                 expected_run_id=plan.run_id,
@@ -2576,8 +2576,33 @@ def _evaluate_main(argv: list[str]) -> int:
     return 0
 
 
+def _prepare_stage1_resume_directory(argv):
+    """Reserve a fresh remote run under the existing checkpoint storage link."""
+    parser = argparse.ArgumentParser(prog='prepare-stage1-resume-directory')
+    parser.add_argument('--run-id', required=True)
+    parser.add_argument('--checkpoint-step', required=True, type=int)
+    args = parser.parse_args(argv)
+    if not _RUN_ID_PATTERN.fullmatch(args.run_id) or args.checkpoint_step <= 0:
+        raise ValueError('invalid matched resume destination')
+    root = _open_trusted_directory((_REPOSITORY_ROOT/'checkpoints').resolve(strict=True))
+    run = None
+    try:
+        os.mkdir(args.run_id, dir_fd=root)
+        run = os.open(args.run_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+        os.mkdir(f'checkpoint-{args.checkpoint_step}', dir_fd=run)
+    finally:
+        if run is not None: os.close(run)
+        os.close(root)
+    return 0
+
+
 def _main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == 'prepare-stage1-resume':
+        from src.stage1.resume_preparation import preparation_main
+        return preparation_main(argv[1:])
+    if argv and argv[0] == 'prepare-stage1-resume-directory':
+        return _prepare_stage1_resume_directory(argv[1:])
     if argv and argv[0] == "lifecycle-matrix":
         return _lifecycle_matrix_main(argv[1:])
     if argv and argv[0] == "validate-results":

@@ -161,10 +161,6 @@ def test_native_clean20_resume_matches_epoch_tail_and_all_state(tmp_path):
     from stage1.matched_execution import enable_matched_standard_execution
     from stage1.matched_resume import _values, TRAINING_FIELDS
 
-    class Stop(TrainerCallback):
-        def on_save(self, args, state, control, **kwargs):
-            if state.global_step == 2:
-                control.should_training_stop = True
     class Before(TrainerCallback):
         def __init__(self, trainer):
             self.trainer = trainer
@@ -212,7 +208,8 @@ def test_native_clean20_resume_matches_epoch_tail_and_all_state(tmp_path):
         expected_teacher = deepcopy(full.ema_teacher.state_dict())
         expected_rng = _capture_rng_state()
         interrupted, first_order = make('split')
-        interrupted.add_callback(Stop())
+        from stage1.matched_resume import MatchedCheckpointStop
+        interrupted.add_callback(MatchedCheckpointStop(2))
         interrupted.train()
         checkpoint = tmp_path/'split/checkpoint-2'
         assert (checkpoint/'stage1_matched_resume.json').is_file()

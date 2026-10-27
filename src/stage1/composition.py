@@ -770,6 +770,8 @@ def build_stage1_training_components(
            if matched_standard else {}),
         **({'ce_entropy_top_percent': args.stage1_ce_entropy_top_percent}
            if getattr(args, 'stage1_ce_entropy_top_percent', None) is not None else {}),
+        **({'stop_after_checkpoint': args.stage1_stop_after_checkpoint}
+           if getattr(args, 'stage1_stop_after_checkpoint', None) is not None else {}),
         **v5_kwargs,
     )
     if tuning.method != "full" and args.gradient_checkpointing:

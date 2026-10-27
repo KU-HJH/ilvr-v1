@@ -110,3 +110,130 @@ def copy_resume_checkpoint(checkpoint, destination, *, profile, source, checkpoi
     write_matched_resume_contract(destination, profile, source=source)
     _validate_complete_trainer_state(destination)
     return destination
+
+
+_COORDINATOR_PAIRS = {'--run-id', '--attempt-id', '--zero-stage', '--main-process-port',
+                      '--local-repo-root', '--remote-repo-root', '--remote-host-repo-root',
+                      '--result-root'}
+
+
+def _stage_arguments(command):
+    result, index = [], 1
+    while index < len(command):
+        item = command[index]
+        if item in _COORDINATOR_PAIRS or item in ('--resume', '--stop-after-checkpoint'):
+            index += 2
+        elif item == '--dry-run':
+            index += 1
+        else:
+            result.append(item)
+            index += 1
+    return result
+
+
+def resume_command(command, *, source_root, plan, checkpoint, stop=None):
+    """Keep original training flags, remapping only execution/output locations."""
+    cluster = plan.cluster
+    result = [str(cluster.local_repo_root/'run_multinode_stage1_training.sh'),
+        '--run-id', plan.run_id, '--attempt-id', plan.attempt_id,
+        '--zero-stage', str(plan.zero_stage), '--main-process-port', str(plan.main_process_port),
+        '--local-repo-root', str(cluster.local_repo_root),
+        '--remote-repo-root', str(cluster.remote_repo_root),
+        '--remote-host-repo-root', str(cluster.remote_host_repo_root)]
+    prefix = str(source_root) + '/'
+    result.extend(str(cluster.local_repo_root/item[len(prefix):]) if item.startswith(prefix)
+                  else item for item in _stage_arguments(command))
+    result.extend(('--resume', str(checkpoint)))
+    if stop is not None: result.extend(('--stop-after-checkpoint', str(stop)))
+    return result
+
+
+def preparation_main(argv):
+    """Assemble/copy one checkpoint; emit an existing-coordinator resume command."""
+    import argparse
+    import subprocess
+    from src.multinode import (
+        _REPOSITORY_ROOT, _checkpoint_artifact_identity, build_launch_plan, decode_launch_plan,
+    )
+    from src.multinode_runtime import (
+        SubprocessCoordinatorRunner, build_owned_tmux_commands, redistribute_resume_checkpoint,
+        publish_small_file,
+    )
+    from .matched_resume import _read_json, WORKER_FIELDS, _values
+    from utils_deepseed import parse_args
+    parser = argparse.ArgumentParser(prog='python -m src.multinode prepare-stage1-resume')
+    parser.add_argument('--source-log-dir', type=Path, required=True)
+    parser.add_argument('--source-attempt', default='initial')
+    parser.add_argument('--checkpoint-step', type=int, required=True)
+    parser.add_argument('--run-id', required=True)
+    parser.add_argument('--main-process-port', type=int, default=29931)
+    parser.add_argument('--remote-repo-root', type=Path, required=True)
+    parser.add_argument('--remote-host-repo-root', type=Path, required=True)
+    parser.add_argument('--stop-after-checkpoint', type=int)
+    parser.add_argument('--dry-run', action='store_true')
+    args = parser.parse_args(argv)
+    try:
+        config = _read_json(args.source_log_dir/'launch-config.json')
+        source_root = Path(config['local_runtime'])
+        source_commit = config['head']
+        if (len(source_commit) != 40 or any(c not in '0123456789abcdef' for c in source_commit)
+                or subprocess.run(['git','merge-base','--is-ancestor',source_commit,'HEAD'],
+                                  cwd=_REPOSITORY_ROOT, check=False).returncode != 0):
+            raise ValueError('source code must be a compatible reviewed ancestor of this checkout')
+        source_plan = decode_launch_plan((source_root/'logs/multinode'/config['run_id'] /
+            args.source_attempt/'launch-plan.json').read_bytes())
+        if (source_plan.stage, source_plan.tuning_method, source_plan.zero_stage) != ('stage1','dora',1):
+            raise ValueError('source is outside matched Stage1 DoRA ZeRO1 scope')
+        if source_plan.run_id != config['run_id'] or source_plan.cluster.local_repo_root != source_root:
+            raise ValueError('source launch records disagree')
+        plan = build_launch_plan(stage='stage1', tuning_method='dora', zero_stage=1,
+            run_id=args.run_id, attempt_id='resume1', main_process_port=args.main_process_port,
+            local_repo_root=_REPOSITORY_ROOT, remote_repo_root=args.remote_repo_root,
+            remote_host_repo_root=args.remote_host_repo_root)
+        destination = _REPOSITORY_ROOT/'checkpoints'/args.run_id/f'checkpoint-{args.checkpoint_step}'
+        ready = resume_command(config['command'], source_root=source_root, plan=plan,
+                               checkpoint=destination, stop=args.stop_after_checkpoint)
+        if args.dry_run:
+            print(json.dumps({'command': ready, 'preparation_performed': False}))
+            return 0
+        commands = build_owned_tmux_commands(source_plan, commit=source_commit,
+            stage_arguments=_stage_arguments(config['command']), result_root=source_root/'results',
+            checkpoint_root=source_root/'checkpoints', log_root=source_root/'logs/multinode',
+            stage_log_root=source_root/'logs/zero-stage-compatibility')
+        reader = SubprocessCoordinatorRunner(source_plan, commands=commands, commit=source_commit,
+            checkpoint_root=source_root/'checkpoints', log_root=source_root/'logs/multinode')
+        source_path = source_root/'checkpoints'/config['run_id']/f'checkpoint-{args.checkpoint_step}'
+        identity = _checkpoint_artifact_identity(source_plan, commit=source_commit, global_step=args.checkpoint_step)
+        assemble_source_checkpoint(reader, source_path, identity)
+        redistribute_resume_checkpoint(reader, checkpoint_path=source_path, checkpoint_identity=identity,
+                                       requested_identity=identity, destination=source_path)
+        if (source_path/MATCHED_RESUME_FILENAME).exists():
+            binding = load_matched_resume_contract(source_path)
+            profile, origin = binding['profile'], binding['source']
+        else:
+            workers = [parse_args(_read_json(args.source_log_dir/f'worker-rank{rank}-argv.json'))
+                       for rank in (0,1)]
+            if _values(workers[0], WORKER_FIELDS) != _values(workers[1], WORKER_FIELDS):
+                raise ValueError('source node worker profiles disagree')
+            records = [_read_json(args.source_log_dir/f'node-rank{rank}-resolved-final.json')
+                       for rank in (0,1)]
+            profile = import_legacy_profile(source_path, workers[1], records, source_commit=source_commit)
+            origin = {'run_id': config['run_id'], 'checkpoint_step': args.checkpoint_step,
+                      'commit': source_commit}
+        if args.stop_after_checkpoint is not None and not args.checkpoint_step < args.stop_after_checkpoint < profile['training']['max_steps']:
+            raise ValueError('planned resume stop must follow the selected step and precede full budget')
+        copy_resume_checkpoint(source_path, destination, profile=profile, source=origin,
+                               checkpoint_root=_REPOSITORY_ROOT/'checkpoints')
+        commit = subprocess.check_output(['git','rev-parse','HEAD'],cwd=_REPOSITORY_ROOT,text=True).strip()
+        writer = SubprocessCoordinatorRunner(plan, commands=None, commit=commit)
+        writer.publish_resume_copy(destination, _checkpoint_artifact_identity(plan, commit=commit,
+                                                                             global_step=args.checkpoint_step))
+        output = _REPOSITORY_ROOT/'logs'/plan.run_id
+        publish_small_file(output/'resume-command.json', (json.dumps(ready,indent=2)+'\n').encode())
+        launch = {'run_id': plan.run_id, 'head': commit, 'local_runtime': str(_REPOSITORY_ROOT),
+                  'command': ready, 'source': origin}
+        publish_small_file(output/'launch-config.json', (json.dumps(launch,indent=2)+'\n').encode())
+        print(json.dumps({'checkpoint': str(destination), 'command': ready, 'source': origin}))
+        return 0
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError) as error:
+        parser.error(str(error))

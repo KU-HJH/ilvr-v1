@@ -874,6 +874,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--save-total-limit",
     "--resume",
     "--max-steps",
+    "--stop-after-checkpoint",
     "--benchmark-run-config",
 }
 _STAGE1_BOOLEAN_OPTIONS = {"--stage1-match-v5-execution", "--stage1-v5-debug", "--no-stage1-v5-debug","--topk-include-gt", "--no-topk-include-gt","--final-save", "--no-final-save", "--use_lora"}
@@ -2080,7 +2081,8 @@ class SubprocessCoordinatorRunner:
         if self.checkpoint_root not in (
             _CHECKPOINT_ROOT,
             _CHECKPOINT_ROOT / "zero-stage-compatibility",
-        ):
+        ) and not (self.checkpoint_root == plan.cluster.local_repo_root / 'checkpoints'
+                   and self.checkpoint_root.resolve(strict=True) == _CHECKPOINT_ROOT.resolve(strict=True)):
             raise ValueError("coordinator checkpoint root is not approved")
         self.command_runner = command_runner
         self.serialized_plan: SerializedLaunchPlan | None = None
@@ -2755,6 +2757,20 @@ class SubprocessCoordinatorRunner:
             ),
             input_bytes=encoded,
         )
+
+    def publish_resume_copy(self, checkpoint, identity):
+        """Publish a complete fresh local copy through the existing exact-list push."""
+        from src.multinode_artifacts import validate_canonical_destination
+        local = self.read_artifact_manifest(1, checkpoint, identity, canonical_owner=True)
+        self._run(self._internal_command(0, 'prepare-stage1-resume-directory', (
+            '--run-id', self.plan.run_id, '--checkpoint-step', str(identity['global_step']))))
+        self._artifact_checkpoint_paths[0] = checkpoint
+        self.validate_push_destination(local, local.entries)
+        self.push_artifacts(local, local.entries)
+        remote = self.read_canonical_artifact_manifest(checkpoint, identity)
+        validate_canonical_destination(local.entries, remote, expected_identity=identity,
+                                       expected_run_id=self.plan.run_id)
+        return remote
 
     def push_artifacts(
         self, manifest: object, entries: Sequence[object]

@@ -183,3 +183,22 @@ def load_matched_resume_contract(checkpoint):
     if marker != expected:
         raise ValueError('matched resume objective marker mismatch')
     return contract
+
+
+from transformers import TrainerCallback
+
+
+class MatchedCheckpointStop(TrainerCallback):
+    """Keep the original schedule; stop only after a complete forced save."""
+    def __init__(self, step):
+        self.step = step
+
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step == self.step:
+            control.should_save = True
+        return control
+
+    def on_save(self, args, state, control, **kwargs):
+        if state.global_step == self.step:
+            control.should_training_stop = True
+        return control

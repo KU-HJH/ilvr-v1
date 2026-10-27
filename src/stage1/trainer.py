@@ -246,6 +246,7 @@ class CustomTrainerStage1(SFTTrainer):
         match_v5_execution: bool = False,
         ce_entropy_top_percent: float | None = None,
         matched_resume_profile=None,
+        stop_after_checkpoint=None,
         **kwargs,
     ) -> None:
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
@@ -259,6 +260,14 @@ class CustomTrainerStage1(SFTTrainer):
         super().__init__(*args, **kwargs)
         self.stage1_match_v5_execution = bool(match_v5_execution)
         self.matched_resume_profile = matched_resume_profile
+        self.stage1_stop_after_checkpoint = stop_after_checkpoint
+        if stop_after_checkpoint is not None:
+            from .matched_resume import MatchedCheckpointStop
+            if (not self.stage1_match_v5_execution or type(stop_after_checkpoint) is not int
+                    or not 0 < stop_after_checkpoint < self.args.max_steps
+                    or self.args.save_only_model):
+                raise ValueError('matched checkpoint stop requires full state and 0 < stop < full budget')
+            self.add_callback(MatchedCheckpointStop(stop_after_checkpoint))
         if self.stage1_match_v5_execution:
             enable_matched_standard_execution(self)
         self.ce_entropy_top_percent = ce_entropy_top_percent
@@ -1133,6 +1142,9 @@ class CustomTrainerStage1(SFTTrainer):
             if contract is not None:
                 from .matched_resume import validate_matched_trainer_resume
                 validate_matched_trainer_resume(self, contract)
+                stop = getattr(self, 'stage1_stop_after_checkpoint', None)
+                if stop is not None and stop <= contract['source']['checkpoint_step']:
+                    raise ValueError('checkpoint stop must follow the resumed step')
 
         self._publish_deepspeed_runtime_identity(
             Path(self.args.output_dir), label="Stage 1 runtime identity publication"
