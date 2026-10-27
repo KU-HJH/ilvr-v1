@@ -87,7 +87,8 @@ def _prepared_inference_relative_path(
     _validate_run_id(relative.parts[0])
     return relative
 _V5_TRAINING_FILES = frozenset({Path("stage1_v5.json"), Path("stage1_v5_reference.pt")})
-_MATCHED_STANDARD_TRAINING_FILES = frozenset({Path('stage1_matched_execution.json')})
+_MATCHED_STANDARD_TRAINING_FILES = frozenset({Path('stage1_matched_execution.json'),
+                                            Path('stage1_matched_resume.json')})
 
 _INFERENCE_STATIC_NAMES = frozenset(
     {
@@ -1405,6 +1406,7 @@ def validate_transfer_destination(
                 "stage1_v5.json",
                 "stage1_v5_reference.pt",
                 "stage1_matched_execution.json",
+                "stage1_matched_resume.json",
                 "stage2_peft_metadata.json",
                 "stage2-sampler.json",
             }

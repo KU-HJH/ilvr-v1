@@ -3491,7 +3491,8 @@ def redistribute_resume_checkpoint(
         manifest, expected_identity=checkpoint_identity
     )
     local = getattr(runner, "read_artifact_manifest")(
-        1, checkpoint, checkpoint_identity
+        1, checkpoint, checkpoint_identity,
+        **({"canonical_owner": True} if (checkpoint / 'rng_state_0.pth').is_file() else {}),
     )
     required, missing = resume_entry_delta(manifest, local)
     if missing:
