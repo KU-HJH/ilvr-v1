@@ -167,7 +167,8 @@ def test_terminal_coordinator_reuses_complete_checkpoint_after_zero_exits(tmp_pa
 
 
 @pytest.mark.parametrize('occupied_source', [True, False])
-def test_preparation_transfer_logs_do_not_touch_source_or_training_attempt(tmp_path, monkeypatch, occupied_source):
+@pytest.mark.parametrize('source_was_resume', [False, True])
+def test_preparation_transfer_logs_do_not_touch_source_or_training_attempt(tmp_path, monkeypatch, occupied_source, source_was_resume):
     """Run the preparer controller with real files and exclusive list publication."""
     import subprocess
     from src import multinode, multinode_runtime
@@ -180,10 +181,14 @@ def test_preparation_transfer_logs_do_not_touch_source_or_training_attempt(tmp_p
     current = tmp_path/'current'; current.mkdir()
     (current/'checkpoints').symlink_to(source_root/'checkpoints', target_is_directory=True)
     logs = source_root/'logs/source'; logs.mkdir(parents=True)
+    source_command = [str(source_root/'run_multinode_stage1_training.sh'),
+                      '--method','dora','--max-steps','2160']
+    if source_was_resume:
+        source_command.extend(('--resume',str(checkpoint),'--stop-after-checkpoint','432'))
+    source_attempt = 'resume1' if source_was_resume else 'initial'
     (logs/'launch-config.json').write_text(json.dumps({'local_runtime':str(source_root),
-        'run_id':'source','head':'8'*40,'command':[str(source_root/'run_multinode_stage1_training.sh'),
-            '--method','dora','--max-steps','2160']}))
-    source_plan_path = source_root/'logs/multinode/source/initial/launch-plan.json'
+        'run_id':'source','head':'8'*40,'command':source_command}))
+    source_plan_path = source_root/'logs/multinode/source'/source_attempt/'launch-plan.json'
     source_plan_path.parent.mkdir(parents=True)
     source_plan_path.write_text('{}')
     old_list = source_plan_path.parent/'artifact-push-rank1.files'
@@ -194,7 +199,7 @@ def test_preparation_transfer_logs_do_not_touch_source_or_training_attempt(tmp_p
         remote_repo_root=Path('/root/workspace/ILVR/.worktrees/source-test'),
         remote_host_repo_root=Path('/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/source-test'))
     source_plan = replace(source_plan, cluster=replace(source_plan.cluster, local_repo_root=source_root),
-                          deepspeed_config=source_root/'configs/deepspeed_zero1.json')
+                          deepspeed_config=source_root/'configs/deepspeed_zero1.json',attempt_id=source_attempt)
     cluster = SimpleNamespace(local_repo_root=current,remote_repo_root=Path('/remote'),
                               remote_host_repo_root=Path('/host'))
     plan = SimpleNamespace(run_id='new-resume',attempt_id='resume1',zero_stage=1,
@@ -203,7 +208,10 @@ def test_preparation_transfer_logs_do_not_touch_source_or_training_attempt(tmp_p
     monkeypatch.setattr(multinode,'decode_launch_plan',lambda *_: source_plan)
     monkeypatch.setattr(multinode,'build_launch_plan',lambda **_: plan)
     monkeypatch.setattr(multinode,'_checkpoint_artifact_identity',lambda *a,**kw: {})
-    monkeypatch.setattr(multinode_runtime,'build_owned_tmux_commands',lambda *a,**kw: object())
+    def authenticate_source_commands(*args, **kwargs):
+        assert list(kwargs['stage_arguments']) == source_command[1:], 'source supervisor options must remain intact'
+        return object()
+    monkeypatch.setattr(multinode_runtime,'build_owned_tmux_commands',authenticate_source_commands)
     monkeypatch.setattr(subprocess,'run',lambda *a,**kw: SimpleNamespace(returncode=0))
     monkeypatch.setattr(subprocess,'check_output',lambda *a,**kw: '8'*40)
     monkeypatch.setattr(multinode_runtime,'redistribute_resume_checkpoint',lambda *a,**kw: None)
@@ -223,6 +231,6 @@ def test_preparation_transfer_logs_do_not_touch_source_or_training_attempt(tmp_p
     monkeypatch.setattr(multinode_runtime,'SubprocessCoordinatorRunner',Runner)
     monkeypatch.setattr(module,'assemble_source_checkpoint',lambda runner,*_: transfer(runner))
     assert module.preparation_main(['--source-log-dir',str(logs),'--checkpoint-step','216',
-        '--run-id','new-resume','--remote-repo-root','/remote','--remote-host-repo-root','/host']) == 0
+        '--source-attempt',source_attempt,'--run-id','new-resume','--remote-repo-root','/remote','--remote-host-repo-root','/host']) == 0
     if occupied_source: assert old_list.read_bytes() == b'original transfer list'
     assert not (current/'logs/multinode/new-resume/resume1').exists()

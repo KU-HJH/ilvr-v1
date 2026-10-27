@@ -117,11 +117,11 @@ _COORDINATOR_PAIRS = {'--run-id', '--attempt-id', '--zero-stage', '--main-proces
                       '--result-root'}
 
 
-def _stage_arguments(command):
+def _stage_arguments(command, *, preserve_runtime=False):
     result, index = [], 1
     while index < len(command):
         item = command[index]
-        if item in _COORDINATOR_PAIRS or item in ('--resume', '--stop-after-checkpoint'):
+        if item in _COORDINATOR_PAIRS or (not preserve_runtime and item in ('--resume', '--stop-after-checkpoint')):
             index += 2
         elif item == '--dry-run':
             index += 1
@@ -197,7 +197,7 @@ def preparation_main(argv):
             print(json.dumps({'command': ready, 'preparation_performed': False}))
             return 0
         commands = build_owned_tmux_commands(source_plan, commit=source_commit,
-            stage_arguments=_stage_arguments(config['command']), result_root=source_root/'results',
+            stage_arguments=_stage_arguments(config['command'], preserve_runtime=True), result_root=source_root/'results',
             checkpoint_root=source_root/'checkpoints', log_root=source_root/'logs/multinode',
             stage_log_root=source_root/'logs/zero-stage-compatibility')
         from dataclasses import replace
