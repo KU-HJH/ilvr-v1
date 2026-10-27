@@ -188,8 +188,13 @@ def test_preparation_transfer_logs_do_not_touch_source_or_training_attempt(tmp_p
     source_plan_path.write_text('{}')
     old_list = source_plan_path.parent/'artifact-push-rank1.files'
     if occupied_source: old_list.write_bytes(b'original transfer list')
-    source_plan = SimpleNamespace(stage='stage1', tuning_method='dora',zero_stage=1,
-        run_id='source', attempt_id='initial',cluster=SimpleNamespace(local_repo_root=source_root))
+    from dataclasses import replace
+    source_plan = multinode.build_launch_plan(stage='stage1', tuning_method='dora',
+        zero_stage=1, run_id='source', main_process_port=29931,
+        remote_repo_root=Path('/root/workspace/ILVR/.worktrees/source-test'),
+        remote_host_repo_root=Path('/home/korea/Workspace/hjh/workspace/ILVR/.worktrees/source-test'))
+    source_plan = replace(source_plan, cluster=replace(source_plan.cluster, local_repo_root=source_root),
+                          deepspeed_config=source_root/'configs/deepspeed_zero1.json')
     cluster = SimpleNamespace(local_repo_root=current,remote_repo_root=Path('/remote'),
                               remote_host_repo_root=Path('/host'))
     plan = SimpleNamespace(run_id='new-resume',attempt_id='resume1',zero_stage=1,
@@ -209,6 +214,9 @@ def test_preparation_transfer_logs_do_not_touch_source_or_training_attempt(tmp_p
         publish_files_list(multinode_runtime_path, ())
     class Runner:
         def __init__(self, plan, *, log_root=None, **kwargs):
+            if plan.run_id == 'source':
+                assert plan.cluster.local_repo_root == current, 'source artifact view must use current canonical logical root'
+                assert kwargs['checkpoint_root'] == current/'checkpoints'
             self.plan = plan
             self.log_root = log_root if log_root is not None else current/'logs/multinode'
         def publish_resume_copy(self, *args): transfer(self)

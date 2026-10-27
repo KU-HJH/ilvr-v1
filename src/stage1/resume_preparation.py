@@ -200,10 +200,19 @@ def preparation_main(argv):
             stage_arguments=_stage_arguments(config['command']), result_root=source_root/'results',
             checkpoint_root=source_root/'checkpoints', log_root=source_root/'logs/multinode',
             stage_log_root=source_root/'logs/zero-stage-compatibility')
-        reader = SubprocessCoordinatorRunner(source_plan, commands=commands, commit=source_commit,
-            checkpoint_root=source_root/'checkpoints',
+        from dataclasses import replace
+        current_checkpoints = _REPOSITORY_ROOT/'checkpoints'
+        if (source_root/'checkpoints').resolve(strict=True) != current_checkpoints.resolve(strict=True):
+            raise ValueError('source and reader must share canonical checkpoint storage')
+        # Supervisor commands stay bound to the original source. Artifact reads
+        # use the reader's logical root, required by existing pull reservations.
+        reader_plan = replace(source_plan,
+            cluster=replace(source_plan.cluster, local_repo_root=_REPOSITORY_ROOT),
+            deepspeed_config=_REPOSITORY_ROOT/'configs'/source_plan.deepspeed_config.name)
+        reader = SubprocessCoordinatorRunner(reader_plan, commands=commands, commit=source_commit,
+            checkpoint_root=current_checkpoints,
             log_root=_REPOSITORY_ROOT/'logs/stage1-resume-preparation'/plan.run_id/'source')
-        source_path = source_root/'checkpoints'/config['run_id']/f'checkpoint-{args.checkpoint_step}'
+        source_path = current_checkpoints/config['run_id']/f'checkpoint-{args.checkpoint_step}'
         identity = _checkpoint_artifact_identity(source_plan, commit=source_commit, global_step=args.checkpoint_step)
         assemble_source_checkpoint(reader, source_path, identity)
         redistribute_resume_checkpoint(reader, checkpoint_path=source_path, checkpoint_identity=identity,
