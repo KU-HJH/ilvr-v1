@@ -175,6 +175,7 @@ while (( $# )); do
         --history_text_gamma|--history_attention_layers) require_value "$@"; extra_worker_arguments+=("$1" "$2"); shift 2 ;;
         --sim-weight) require_value "$@"; extra_worker_arguments+=(--sim_weight "$2"); shift 2 ;;
         --stage1-match-v5-execution) extra_worker_arguments+=(--stage1_match_v5_execution); shift ;;
+        --stage1-cache-aa-probe) extra_worker_arguments+=(--stage1_cache_aa_probe); shift ;;
         --stop-after-checkpoint) require_value "$@"; extra_worker_arguments+=(--stage1_stop_after_checkpoint "$2"); shift 2 ;;
         --stage1-ce-entropy-top-percent) extra_worker_arguments+=(--stage1_ce_entropy_top_percent "$2"); shift 2 ;;
         --stage1-v5-debug) extra_worker_arguments+=(--stage1_v5_debug); shift ;;

@@ -206,6 +206,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--stage2_stop_after_checkpoint", type=int)
     parser.add_argument("--stage1_stop_after_checkpoint", type=int)
+    parser.add_argument("--stage1_cache_aa_probe", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--benchmark_run_config")
     parser.add_argument("--benchmark_evidence_path")
     parser.add_argument("--benchmark_source_data_path")
@@ -380,7 +381,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     elif args.tuning_method_explicit:
         raise ValueError("--tuning_method is only valid for Stage 1 or Stage 2")
     stop = args.stage1_stop_after_checkpoint
-    if stop is not None and (args.stage != 'stage1'
+    if args.stage1_cache_aa_probe:
+        if (args.stage != 'stage1' or args.stage1_variant not in ('standard', 'v5')
+                or args.stage1_match_v5_execution or args.resume_from_checkpoint_path
+                or stop != 1 or args.max_steps != 2160 or args.epochs != 10):
+            raise ValueError('A/A probe requires fresh native standard or V5, stop1 and full 2160/10 schedule')
+    elif stop is not None and (args.stage != 'stage1'
             or not args.stage1_match_v5_execution or args.stage1_variant != 'standard'
             or not 0 < stop < args.max_steps):
         raise ValueError('Stage1 checkpoint stop requires matched standard scope and 0 < stop < full budget')
