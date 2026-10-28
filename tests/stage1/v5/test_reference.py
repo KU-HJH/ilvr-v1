@@ -20,6 +20,32 @@ def api():
     return importlib.import_module('stage1.v5_reference')
 
 
+def test_processor_identity_survives_added_token_reload_without_hiding_changes(tmp_path):
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast, AddedToken
+    class Processor:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+        def save_pretrained(self, directory):
+            self.tokenizer.save_pretrained(directory)
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=Tokenizer(models.WordLevel(
+        {'[UNK]': 0, 'x': 1}, unk_token='[UNK]')),
+        unk_token=AddedToken('[UNK]', normalized=False, special=True))
+    tokenizer.add_special_tokens({'additional_special_tokens': [AddedToken('<|latent_pad|>',
+        normalized=False, special=True)]})
+    fresh = Processor(tokenizer)
+    fresh.save_pretrained(tmp_path / 'saved')
+    restored = Processor(PreTrainedTokenizerFast.from_pretrained(tmp_path / 'saved'))
+    assert fresh.tokenizer('<|latent_pad|>x').input_ids == restored.tokenizer('<|latent_pad|>x').input_ids
+    assert fresh.tokenizer.get_vocab() == restored.tokenizer.get_vocab()
+    expected = api()._processor_identity(fresh)
+    assert api()._processor_identity(restored) == expected
+    # The added-token matching flags remain part of the authenticated contents.
+    restored.tokenizer.add_special_tokens({'additional_special_tokens': [AddedToken('<|latent_pad|>',
+        normalized=False, special=True, lstrip=True)]})
+    assert api()._processor_identity(restored) != expected
+
+
 @pytest.fixture
 def bundle(tmp_path, monkeypatch, request):
     import artifact_paths
