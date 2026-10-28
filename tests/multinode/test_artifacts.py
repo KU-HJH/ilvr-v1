@@ -1209,6 +1209,31 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
     )
 
 
+def test_resume_transfer_does_not_precreate_the_launch_attempt(tmp_path, monkeypatch):
+    import src.multinode_artifacts as artifacts
+    from src.multinode_runtime import prepare_attempt_directory
+    plan = launch_plan()
+    runner = SubprocessCoordinatorRunner(plan,
+        commands=build_owned_tmux_commands(plan, commit='b' * 40),
+        commit='b' * 40, log_root=tmp_path / 'logs')
+    destination = tmp_path / 'checkpoint'
+    destination.mkdir()
+    runner._reserved_transfer_destinations[destination] = destination
+    monkeypatch.setattr(artifacts, 'resolve_local_checkpoint_destination', lambda path: path)
+    monkeypatch.setattr(artifacts, 'validate_transferred_entry_subset', lambda *args: None)
+    monkeypatch.setattr(artifacts, 'build_pull_command', lambda *args, **kwargs: ('transfer',))
+    transfers = []
+    runner._run_artifact_transfer = lambda command: transfers.append(command)
+    manifest = strict_manifest(0)
+    runner.pull_resume_artifacts(manifest, manifest.entries[:1], destination)
+    # This is the actual next launch operation; transfer metadata must not
+    # claim its exclusive directory first.
+    attempt = prepare_attempt_directory(log_root=runner.log_root,
+        run_id=plan.run_id, attempt_id=plan.attempt_id)
+    assert attempt.is_dir() and transfers == [('transfer',)]
+    assert len(list((runner.log_root / plan.run_id).glob('**/*resume*.files'))) == 1
+
+
 def test_checkpoint_transfer_has_long_bounded_timeout_and_propagates_timeout(
     tmp_path,
 ):
