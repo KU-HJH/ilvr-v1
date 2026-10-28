@@ -125,3 +125,13 @@ human written-design approval are outstanding. No product code was changed.
 Do not invoke writing-plans or an implementation skill until the applicable
 design gate is satisfied. GPU experiments require separate authorization under
 `/root/.codex/AGENTS.md` lines 142–147.
+
+## 2026-10-28 premise evidence update
+
+The subsequently authorized V5 A/A probe found matching observed forward
+payloads/loss/RNG but different optimizer gradients and Adam moments. See
+[the probe readout](2026-10-28-stage1-cache-aa-probe-results.md) for evidence,
+limitations and the pending acceptance-criterion clarification. The strict
+whole-step bitwise premise did not pass. The EMA pair and cache implementation
+have not run. This update supersedes the historical “proposed only” probe status
+above without rewriting the frozen proposal or granting final design approval.
