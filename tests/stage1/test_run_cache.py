@@ -80,3 +80,24 @@ def test_cache_off_has_no_cache_io(tmp_path, monkeypatch):
     args = parse_args(['--stage', 'stage1'])
     assert args.stage1_cache == 'off'
     assert not list(tmp_path.iterdir())
+
+
+def test_existing_unowned_directory_is_never_adopted(tmp_path):
+    root = tmp_path / 'trial'
+    root.mkdir()
+    foreign = root / 'preexisting-unowned.txt'
+    foreign.write_text('keep me')
+    with pytest.raises(ValueError, match='unowned'):
+        make_cache(tmp_path)
+    assert foreign.read_text() == 'keep me'
+    assert list(root.iterdir()) == [foreign]
+
+
+def test_concurrent_rank_creation_and_owned_resume(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as ranks:
+        caches = list(ranks.map(lambda _: make_cache(tmp_path), range(2)))
+    caches[0].publish('targets', 0, {'value': torch.tensor([3.])})
+    resumed = make_cache(tmp_path)
+    assert resumed._load('targets', 0)['value'].item() == 3.
+    assert caches[0].identity_json == caches[1].identity_json == resumed.identity_json

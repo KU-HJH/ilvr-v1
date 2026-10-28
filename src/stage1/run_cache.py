@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import fcntl
 import hashlib
 import json
 import os
@@ -100,22 +101,25 @@ class Stage1RunCache:
                     'reference_hidden': plan.reference_hidden, 'identity': plan.identity}
         self.identity_json = json.dumps(identity, sort_keys=True, allow_nan=False)
         self.identity_sha256 = hashlib.sha256(self.identity_json.encode()).hexdigest()
-        plan.root.mkdir(parents=True, exist_ok=True)
-        marker = plan.root / 'identity.json'
-        if marker.is_symlink():
-            raise ValueError('cache identity must not be a symlink')
-        with tempfile.NamedTemporaryFile(dir=plan.root, prefix='.identity-', delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(self.identity_json.encode())
+        plan.root.parent.mkdir(parents=True, exist_ok=True)
+        # Both local ranks may initialize together. Lock the existing parent
+        # directory briefly; no lock file or unowned run directory is adopted.
+        parent_fd = os.open(plan.root.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
-            try:
-                os.link(temporary, marker)
-            except FileExistsError:
-                pass
+            fcntl.flock(parent_fd, fcntl.LOCK_EX)
+            marker = plan.root / 'identity.json'
+            if plan.root.is_symlink() or marker.is_symlink():
+                raise ValueError('cache run/identity must not be a symlink')
+            if plan.root.exists():
+                if not marker.is_file():
+                    raise ValueError('existing cache directory is unowned')
+                if marker.read_text() != self.identity_json:
+                    raise ValueError('cache identity conflicts with existing run')
+            else:
+                plan.root.mkdir()
+                marker.write_text(self.identity_json)
         finally:
-            temporary.unlink()
-        if marker.read_text() != self.identity_json:
-            raise ValueError('cache identity conflicts with existing run')
+            os.close(parent_fd)
         for layer in self.layers:
             directory = plan.root / layer
             if directory.is_symlink():

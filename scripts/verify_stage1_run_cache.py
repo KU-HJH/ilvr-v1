@@ -119,6 +119,7 @@ print(path.name)
 
 def merged_resume(first, second):
     combined = dict(second)
+    combined['initial_step'] = first['initial_step']
     combined['before'] = first['before']
     combined['microbatches'] = first['microbatches'] + second['microbatches']
     combined['optimizer_steps'] = first['optimizer_steps'] + second['optimizer_steps']

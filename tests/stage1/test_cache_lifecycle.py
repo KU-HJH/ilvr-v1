@@ -15,7 +15,7 @@ def test_incomplete_epoch_never_enters_replay(tmp_path):
     cache = make_cache(tmp_path)
     callback = Stage1CacheEpochCallback(cache, expected={'preprocess': (0,)}, control_dir=tmp_path / 'attempt')
     callback.on_epoch_end(SimpleNamespace(process_index=0, local_process_index=0),
-                          SimpleNamespace(epoch=0.5), None)
+                          SimpleNamespace(epoch=0.5), SimpleNamespace(should_training_stop=True))
     assert cache.phase.value == 0
     assert not (tmp_path / 'attempt/ready.json').exists()
 
@@ -40,6 +40,28 @@ class TinyModel(torch.nn.Module):
     def forward(self, x, phase):
         self.observed.append(int(phase))
         return {'loss': ((self.weight * (x + 1)) ** 2).mean()}
+
+
+def test_native_fractional_epoch_tail_rejects_before_second_iterator(tmp_path):
+    from stage1.cache_lifecycle import Stage1CacheEpochCallback
+    cache = make_cache(tmp_path)
+    callback = Stage1CacheEpochCallback(cache, expected={'preprocess': tuple(range(7))},
+                                       control_dir=tmp_path / 'attempt')
+    model = TinyModel()
+    args = TrainingArguments(output_dir=str(tmp_path / 'trainer'), use_cpu=True, report_to=[],
+        max_steps=2, gradient_accumulation_steps=4, per_device_train_batch_size=1,
+        save_strategy='no', dataloader_num_workers=4, remove_unused_columns=False,
+        disable_tqdm=True)
+    trainer = Trainer(model=model, args=args, train_dataset=[{'id': i} for i in range(7)],
+                      data_collator=CacheCollator(cache), callbacks=[callback])
+    # Represent the existing four-rank sharded-count geometry, retaining the
+    # real Trainer/Accelerate iterator, accumulation and callback dispatch.
+    trainer.num_examples = lambda loader: 26
+    with pytest.raises(RuntimeError, match='incomplete first epoch'):
+        trainer.train()
+    assert model.observed == [0] * 6
+    assert trainer.state.global_step == 1
+    assert not (tmp_path / 'attempt/ready.json').exists()
 
 
 @pytest.mark.parametrize('persistent', [False, True])

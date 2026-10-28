@@ -469,6 +469,10 @@ class CustomTrainerStage1(SFTTrainer):
             getattr(self, 'stage1_v5_debug', True) if value == 'legacy'
             else value == 'validation'
         )
+        if value != 'legacy' and hasattr(self, 'stage1_v5_debug'):
+            self.stage1_v5_debug = self._stage1_optional_checks
+        if value == 'production' and hasattr(self, 'collect_stage1_diagnostics'):
+            self.collect_stage1_diagnostics = False
 
     def _prepare_stage1_loss_inputs(self, inputs, *, voff_mode='attention_mask') -> tuple[dict, Stage1BatchMetadata, Stage1TeacherTargets]:
         """Build helper targets once, preserving the original model tensors."""

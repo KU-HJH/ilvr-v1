@@ -68,3 +68,28 @@ def test_adaptive_production_omits_whole_hidden_finite_scans(monkeypatch):
     case = make_history_case()
     observe_build(case, builder(case, validate=False, collect_diagnostics=False))
     assert calls == []
+
+
+def test_v5_production_policy_overrides_debug_at_actual_loss_dispatch(tmp_path, monkeypatch):
+    from tests.stage1.v5.test_trainer import integrated_fixture
+    import stage1.v5_trainer as module
+    trainer, batch, *_ = integrated_fixture(tmp_path, debug=True)
+    trainer.stage1_check_policy = 'production'
+    observed = []
+    original = module.compute_v5_loss_sums
+    def objective(*args, **kwargs):
+        observed.append((kwargs['validate'], kwargs['collect_diagnostics']))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, 'compute_v5_loss_sums', objective)
+    batches, _ = trainer.get_batch_samples(iter([batch]), 4)
+    trainer.training_step(trainer.model, batches[0])
+    assert observed == [(False, False)]
+    assert trainer.stage1_v5_debug is False
+    assert trainer._latest_stage1_diagnostics is None
+
+
+def test_v5_legacy_policy_preserves_saved_debug_flag(tmp_path):
+    from tests.stage1.v5.test_trainer import integrated_fixture
+    trainer, *_ = integrated_fixture(tmp_path, debug=True)
+    trainer.stage1_check_policy = 'legacy'
+    assert trainer.stage1_v5_debug is True and trainer._stage1_checks_enabled()

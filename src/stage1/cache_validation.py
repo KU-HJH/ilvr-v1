@@ -46,9 +46,52 @@ def assert_frozen_replay(live, replay):
 
 
 def _comparison_fields(record):
-    required = ('before', 'microbatches', 'optimizer_steps', 'after', 'workers', 'world_size')
-    if any(name not in record for name in required) or record['workers'] != 4 or record['world_size'] != 4:
-        raise ValueError('incomplete actual four-rank/workers4 acceptance evidence')
+    required = ('before', 'microbatches', 'optimizer_steps', 'after', 'workers', 'world_size',
+                'profile', 'deterministic', 'kind', 'initial_step', 'final_step')
+    def require(condition, label):
+        if not condition:
+            raise ValueError('incomplete acceptance evidence: ' + label)
+    def tensor(value):
+        if isinstance(value, dict):
+            digest = value.get('sha256')
+            if isinstance(digest, str) and len(digest) == 64 and isinstance(value.get('shape'), list) and isinstance(value.get('dtype'), str):
+                return True
+            return any(tensor(item) for item in value.values())
+        return isinstance(value, list) and any(tensor(item) for item in value)
+    def quantities(value, names, label):
+        require(isinstance(value, dict), label)
+        for name in names:
+            require(tensor(value.get(name)), label + '.' + name)
+    require(all(name in record for name in required), 'required fields')
+    require(record['workers'] == record['world_size'] == 4, 'topology/workers')
+    require(record['kind'] == 'correctness' and record['deterministic'] is True, 'deterministic execution')
+    require(record['profile'] in ('v5', 'native-ema'), 'profile')
+    require(record['initial_step'] == 0 and record['final_step'] == 2, 'complete two-update arm')
+    quantities(record['before'], ('student', 'teacher', 'rng'), 'before')
+    quantities(record['after'], ('student', 'teacher', 'rng', 'scheduler'), 'after')
+    require(record['after'].get('successful_updates') == 2, 'successful updates')
+    rows, steps = record['microbatches'], record['optimizer_steps']
+    require(isinstance(rows, list) and len(rows) == 8, 'eight actual microbatches')
+    require(isinstance(steps, list) and len(steps) == 2, 'two actual optimizer calls')
+    for row in rows:
+        quantities(row, ('inputs', 'targets', 'loss', 'rng_before', 'rng_after'), 'microbatch')
+        require(type(row.get('query_count')) is int and row['query_count'] >= 0, 'query count')
+        require(isinstance(row.get('projection'), list), 'projection observations')
+        if record['profile'] == 'v5' and row['query_count']:
+            quantities(row, ('reference',), 'microbatch')
+            require(bool(row['projection']), 'reference projection chunks')
+            for chunk in row['projection']:
+                quantities(chunk, ('hidden',), 'projection')
+                require(type(chunk.get('autocast')) is bool and bool(chunk.get('owner')), 'projection context')
+            selection = row.get('selection')
+            quantities(selection, ('orig_positions', 'entropy_support'), 'semantic selection')
+            require(isinstance(selection.get('text_keys'), dict) and bool(selection['text_keys']), 'Text-off selection')
+        else:
+            require(not row['projection'], 'inapplicable reference projection')
+    for step in steps:
+        quantities(step, ('gradients', 'master_parameters_after', 'group_state_after', 'rng_before', 'rng_after'), 'optimizer')
+        require(isinstance(step.get('learning_rates'), list) and bool(step['learning_rates'])
+                and all(isinstance(rate, (int, float)) for rate in step['learning_rates']), 'learning rates')
     return {name: record[name] for name in required}
 
 
@@ -59,11 +102,18 @@ def compare_acceptance(a, repeated, cached):
                          + '; cache A/B is not interpretable')
     if not any(rate > 0 for step in a['optimizer_steps'] for rate in step['learning_rates']):
         raise ValueError('nonzero learning-rate update evidence is required')
+    if a['optimizer_steps'][0]['master_parameters_after'] == a['optimizer_steps'][1]['master_parameters_after']:
+        raise ValueError('nonzero parameter update evidence is required')
+    if a['profile'] == 'native-ema' and a['before']['teacher'] == a['after']['teacher']:
+        raise ValueError('moving EMA update evidence is required')
     if original != _comparison_fields(cached):
         raise ValueError('deterministic cache A/B differs at ' + first_difference(original, _comparison_fields(cached)))
     if any(record.get('production_checks', {}).get('optional_calls') != 0 for record in (a, repeated, cached)):
         raise ValueError('production optional-check witness is absent or nonzero')
-    return dict(payload=True, projection=True, rng_state=True, semantic_selection=True,
+    projection = ('not_applicable:native_has_no_reference' if a['profile'] == 'native-ema'
+                  else True if any(row['query_count'] for row in a['microbatches'])
+                  else 'not_applicable:no_reference_queries')
+    return dict(payload=True, projection=projection, rng_state=True, semantic_selection=True,
                 loss=True, gradient=True, nonzero_update=True, ema=True, production_checks=True)
 
 
@@ -221,6 +271,7 @@ class Stage1CacheValidationObserver(TrainerCallback):
         self.workers = None
         self.optional_calls = 0
         self.in_reference = False
+        self.restorations = []
         self.performance = manifest['mode'] == 'performance'
 
     def snapshot(self):
@@ -231,6 +282,9 @@ class Stage1CacheValidationObserver(TrainerCallback):
 
     def install(self, trainer):
         self.trainer = trainer
+        self.profile = 'v5' if hasattr(trainer, 'v5_config') else 'native-ema'
+        if self.profile == 'v5' and not self.performance:
+            self.observe_v5_semantics()
         original_loader = trainer.get_train_dataloader
         def loader(*args, **kwargs):
             result = original_loader(*args, **kwargs)
@@ -256,7 +310,8 @@ class Stage1CacheValidationObserver(TrainerCallback):
                                      self.optimizer.register_step_post_hook(self.after_optimizer)))
             self.current = {} if self.performance else {'inputs': fingerprint({key: value for key, value in inputs.items()
                 if key not in ('pixel_values_latent', 'stage1_cache_sources')}),
-                'rng_before': rng_state(), 'projection': []}
+                'rng_before': rng_state(), 'projection': [], 'selection': {},
+                'query_count': len(inputs['stage1_v5_metadata'].query_keys) if self.profile == 'v5' else 0}
             torch.cuda.synchronize()
             started = time.monotonic()
             try:
@@ -300,6 +355,37 @@ class Stage1CacheValidationObserver(TrainerCallback):
             self.handles.append(owner.lm_head.register_forward_pre_hook(head))
         trainer.add_callback(self)
 
+    def observe_v5_semantics(self):
+        from . import v5_trainer, v5_objective
+        for module, name, field, multiple in (
+            (v5_trainer, 'select_v5_text_keys', 'text_keys', False),
+            (v5_objective, 'select_v5_orig_positions', 'orig_positions', False),
+            (v5_objective, 'build_entropy_support', 'entropy_support', True),
+            (v5_trainer, 'compute_v5_loss_sums', None, False),
+        ):
+            original = getattr(module, name)
+            def observed(*args, _original=original, _field=field, _multiple=multiple, **kwargs):
+                if self.current is not None:
+                    self.optional_calls += int(kwargs.get('validate', True) or kwargs.get('collect_diagnostics', False))
+                result = _original(*args, **kwargs)
+                if self.current is not None and _field is not None:
+                    value = fingerprint(result)
+                    if _multiple:
+                        self.current['selection'].setdefault(_field, []).append(value)
+                    else:
+                        self.current['selection'][_field] = value
+                return result
+            self.restorations.append((module, name, original))
+            setattr(module, name, observed)
+
+    def restore_observers(self):
+        for module, name, original in reversed(self.restorations):
+            setattr(module, name, original)
+        self.restorations.clear()
+        for handle in self.handles:
+            handle.remove()
+        self.handles.clear()
+
     def before_optimizer(self, optimizer, args, kwargs):
         rates = [group['lr'] for group in optimizer.param_groups]
         record = {'learning_rates': rates}
@@ -335,9 +421,10 @@ class Stage1CacheValidationObserver(TrainerCallback):
     def on_train_end(self, args, state, control, **kwargs):
         if state.global_step != self.manifest['stop'] or not self.rows:
             raise ValueError('incomplete bounded optimizer witness')
-        record = {'kind': self.manifest['mode'], 'before': self.before,
+        record = {'kind': self.manifest['mode'], 'profile': self.profile, 'before': self.before,
             'microbatches': self.rows, 'optimizer_steps': self.optimizer_steps, 'after': self.after,
             'workers': self.workers, 'initial_step': self.initial_step, 'final_step': state.global_step,
             'seconds': time.monotonic() - self.started,
             'production_checks': {'optional_calls': self.optional_calls}}
         _write_rank_record(self.output_dir, record)
+        self.restore_observers()

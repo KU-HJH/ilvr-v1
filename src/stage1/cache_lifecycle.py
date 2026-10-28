@@ -41,8 +41,12 @@ class Stage1CacheEpochCallback(TrainerCallback):
             raise RuntimeError('later-epoch cache requires completed resume preparation')
 
     def on_epoch_end(self, args, state, control, **kwargs):
-        if self.cache.phase.value == 1 or not math.isclose(state.epoch or 0, 1., abs_tol=1e-8):
+        if self.cache.phase.value == 1:
             return
+        if not math.isclose(state.epoch or 0, 1., abs_tol=1e-8):
+            if control is not None and control.should_training_stop:
+                return  # Interrupted first-epoch resume continues population.
+            raise RuntimeError('incomplete first epoch cannot enter a second population iterator')
         # All publications finish before leaders hash. Never hold a GPU
         # collective open across the potentially large disk/network exchange.
         if dist.is_initialized():
