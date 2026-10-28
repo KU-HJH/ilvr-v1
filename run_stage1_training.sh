@@ -188,6 +188,8 @@ while (( $# )); do
         --stage1-cache) require_value "$@"; extra_worker_arguments+=(--stage1_cache "$2"); shift 2 ;;
         --stage1-cache-completion) require_value "$@"; extra_worker_arguments+=(--stage1_cache_completion "$2"); shift 2 ;;
         --stage1-runtime-profile) require_value "$@"; extra_worker_arguments+=(--stage1_runtime_profile "$2"); shift 2 ;;
+        --stage1-cache-validation) require_value "$@"; extra_worker_arguments+=(--stage1_cache_validation "$2"); shift 2 ;;
+        --stage1-cache-validation-stop) require_value "$@"; extra_worker_arguments+=(--stage1_cache_validation_stop "$2"); shift 2 ;;
         --stage1-check-policy) require_value "$@"; extra_worker_arguments+=(--stage1_check_policy "$2"); shift 2 ;;
         --stage1-loss-type) require_value "$@"; extra_worker_arguments+=(--stage1_loss_type "$2"); shift 2 ;;
         --lambda-preference) require_value "$@"; extra_worker_arguments+=(--lambda_preference "$2"); shift 2 ;;

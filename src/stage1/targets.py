@@ -577,7 +577,7 @@ class Stage1TeacherTargetBuilder:
         prompt = adapter.prepare(assistant_end, ())
         prompt_hidden = adapter.forward(prompt).last_hidden_state
         self._hidden_states(SimpleNamespace(hidden_states=prompt_hidden),
-                            (1, assistant_end), validate=True)
+                            (1, assistant_end), validate=self.validate)
         user_query = self._user_query(
             teacher=teacher, sample=sample, sample_ids=prompt.input_ids[0],
             hidden_pre=prompt_hidden[0], hidden_last=prompt_hidden[0],
@@ -597,7 +597,7 @@ class Stage1TeacherTargetBuilder:
             ) as observer:
                 hidden = adapter.forward(prefix).last_hidden_state
             if (hidden.shape != prefix.inputs_embeds.shape
-                    or not bool(torch.isfinite(hidden).all())):
+                    or (self.validate and not bool(torch.isfinite(hidden).all()))):
                 raise ValueError("adaptive prefix hidden states must be finite [1,S,H]")
             current_mean = (hidden[0, list(text_spans[index])].float().mean(0, keepdim=True)
                             if text_spans[index] else None)
@@ -614,7 +614,7 @@ class Stage1TeacherTargetBuilder:
                     prompt.inputs_embeds, prompt.input_ids, original_grid, image_token_id))
             if (selected.ndim != 2 or not 0 < selected.shape[0] <= len(span.latent_positions)
                     or selected.shape[1] != hidden.shape[-1]
-                    or not bool(torch.isfinite(selected).all())):
+                    or (self.validate and not bool(torch.isfinite(selected).all()))):
                 raise ValueError("adaptive selection must contain finite raw first-Kstar targets")
             count = int(selected.shape[0])
             ledger.append(HistorySelection(index, span.latent_positions[:count],

@@ -831,6 +831,7 @@ def receive_launch_plan(
 _STAGE1_VALUE_OPTIONS = {
     "--stage1-cache", "--stage1-check-policy", "--stage1-cache-completion",
     "--stage1-runtime-profile",
+    "--stage1-cache-validation", "--stage1-cache-validation-stop",
     "--stage1-ce-entropy-top-percent",
     "--query_mode",
     "--history_text_gamma",
@@ -1917,6 +1918,10 @@ def build_owned_tmux_commands(
                 raise ValueError('native EMA runtime requires native standard Stage1')
         base_environment['ILVR_STAGE1_RUNTIME_PROFILE'] = profile_value
         base_environment['ILVR_STAGE1_CACHE_ATTEMPT'] = plan.attempt_id
+        validation_mode = _argument_value(forwarded, '--stage1-cache-validation')
+        if validation_mode == 'correctness':
+            base_environment['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+            base_environment['FLASH_ATTENTION_DETERMINISTIC'] = '1'
         stage_owned_arguments: tuple[str, ...] = ()
         finite_loss_evidence_path = (
             Path(result_root)

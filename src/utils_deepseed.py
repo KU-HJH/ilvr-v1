@@ -49,6 +49,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument('--stage1_cache', choices=('off', 'run'), default='off')
     parser.add_argument('--stage1_cache_completion', choices=('train', 'train-eval'), default='train')
     parser.add_argument('--stage1_runtime_profile', choices=('default', 'native-ema-0180'), default='default')
+    parser.add_argument('--stage1_cache_validation', choices=('payload', 'correctness', 'performance'))
+    parser.add_argument('--stage1_cache_validation_stop', type=int, choices=(1, 2), default=2)
     parser.add_argument('--stage1_check_policy', choices=('production', 'validation', 'legacy'))
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
@@ -384,7 +386,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     elif args.tuning_method_explicit:
         raise ValueError("--tuning_method is only valid for Stage 1 or Stage 2")
     if args.stage != 'stage1' and (args.stage1_cache != 'off' or args.stage1_check_policy is not None
-            or args.stage1_runtime_profile != 'default' or args.stage1_cache_completion != 'train'):
+            or args.stage1_runtime_profile != 'default' or args.stage1_cache_completion != 'train'
+            or args.stage1_cache_validation is not None):
         raise ValueError('Stage1 cache/check policy requires Stage1')
     stop = args.stage1_stop_after_checkpoint
     if stop is not None and (args.stage != 'stage1'

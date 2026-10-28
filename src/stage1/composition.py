@@ -808,7 +808,10 @@ def run_stage1(
     rank_config_digest_provider: Callable | None = None,
 ) -> None:
     """Train once and, when requested, perform one separately timed final save."""
-
+    validation_mode = getattr(args, 'stage1_cache_validation', None)
+    if validation_mode is not None:
+        from stage1.cache_validation import configure_validation
+        configure_validation(args)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if deepspeed_runtime_profile is None:
         profile = bind_deepspeed_runtime_profile(args, world_size=world_size)
@@ -909,6 +912,21 @@ def run_stage1(
             assert smoke_resume_snapshot is not None
     total_start = monotonic() if producing else None
     components = component_builder(args)
+    if validation_mode is not None:
+        from stage1.cache_validation import payload_witness, Stage1CacheValidationObserver
+        validation_output = Path(__file__).resolve().parents[2] / 'results' / Path(args.save_model_path).name
+        if len(components.dataset) != 16:
+            raise ValueError('cache validation requires its explicit complete 16-row dataset')
+        if validation_mode == 'payload':
+            payload_witness(components.trainer, args, validation_output)
+            from stage1.cache_setup import close_stage1_cache_readers
+            close_stage1_cache_readers(components.trainer)
+            return
+        if validation_mode == 'performance' and components.trainer.run_cache is not None:
+            payload_witness(components.trainer, args, validation_output, prepare_only=True)
+        observer = Stage1CacheValidationObserver({'mode': validation_mode,
+            'stop': args.stage1_cache_validation_stop}, validation_output)
+        observer.install(components.trainer)
     model_load_seconds = monotonic() - total_start if producing else 0.0
     resume = components.resume_decision.checkpoint_path
     trainer_start = monotonic()

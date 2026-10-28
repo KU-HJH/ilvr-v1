@@ -51,3 +51,20 @@ def test_production_keeps_alignment_noise_and_omits_target_audits(monkeypatch):
     loss.backward()
     assert trainer.model.language_scale.grad is not None
     assert trainer._latest_stage1_diagnostics is None
+
+
+def test_adaptive_production_omits_whole_hidden_finite_scans(monkeypatch):
+    import inspect
+    from tests.stage1.history_fixtures import make_history_case
+    from tests.stage1.test_history_targets import builder, observe_build
+    calls = []
+    original = torch.isfinite
+    def observe(value):
+        caller = inspect.currentframe().f_back
+        if caller.f_code.co_filename.endswith('/stage1/targets.py'):
+            calls.append(tuple(value.shape))
+        return original(value)
+    monkeypatch.setattr(torch, 'isfinite', observe)
+    case = make_history_case()
+    observe_build(case, builder(case, validate=False, collect_diagnostics=False))
+    assert calls == []

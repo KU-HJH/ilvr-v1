@@ -1933,6 +1933,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         forwarded = tuple(stage_arguments)
         stage1_runtime_profile = 'default'
         cache_enabled = False
+        cache_validation_mode = None
         if stage == "stage1":
             forwarded = validate_stage1_arguments(forwarded)
             tuning_method = _argument_value(forwarded, "--method")
@@ -1941,6 +1942,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             stage_environment: dict[str, str] = {}
             stage1_runtime_profile = _argument_value(forwarded, '--stage1-runtime-profile') or 'default'
             cache_enabled = _argument_value(forwarded, '--stage1-cache') == 'run'
+            cache_validation_mode = _argument_value(forwarded, '--stage1-cache-validation')
             resume_requested = _argument_value(forwarded, "--resume") is not None
         else:
             forwarded = validate_stage2_arguments(forwarded)
@@ -1980,6 +1982,8 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             )
             resume_requested = "RESUME_CHECKPOINT" in stage_environment
         planned_stop = _argument_value(forwarded, "--stage2_stop_after_checkpoint" if stage == "stage2" else '--stop-after-checkpoint')
+        if cache_validation_mode is not None:
+            planned_stop = _argument_value(forwarded, '--stage1-cache-validation-stop') or '2'
         planned_stop_max_steps = None
         if planned_stop is not None:
             budget = _argument_value(forwarded, "--max_steps" if stage == 'stage2' else '--max-steps')
@@ -2194,6 +2198,29 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         )
         if exit_codes != {0: 0, 1: 0}:
             raise RuntimeError(f"multi-node training failed: exit_codes={exit_codes}")
+        if cache_validation_mode is not None:
+            from src.multinode_runtime import build_remote_exec, node_path, publish_small_file
+            validation_records = {}
+            for rank in range(4):
+                path = _REPOSITORY_ROOT / 'results' / plan.run_id / f'{plan.attempt_id}-cache-rank-{rank}.json'
+                if rank < 2:
+                    remote_path = node_path(plan, path, machine_rank=0)
+                    result = runner._run(build_remote_exec(('cat', str(remote_path)),
+                        working_directory=plan.cluster.remote_repo_root, cluster=plan.cluster))
+                    publish_small_file(path, result.stdout.encode())
+                record = json.loads(path.read_text())
+                if record.get('rank') != rank or record.get('world_size') != 4 or record.get('workers') != 4:
+                    raise ValueError('cache verifier lacks actual four-rank/workers4 evidence')
+                validation_records[rank] = record
+            if (validation_records[0]['host'] != validation_records[1]['host']
+                    or validation_records[2]['host'] != validation_records[3]['host']
+                    or validation_records[0]['host'] == validation_records[2]['host']):
+                raise ValueError('cache verifier did not observe two distinct nodes')
+            if cache_validation_mode == 'payload':
+                if any(record.get('payload') is not True for record in validation_records.values()):
+                    raise ValueError('cache payload witness failed')
+                print(json.dumps({'cache_payload_witness': plan.run_id, 'optimizer_updates': 0}))
+                return 0
         ordinary_stage1 = (
             stage == "stage1"
             and _argument_value(forwarded, "--benchmark-run-config") is None
