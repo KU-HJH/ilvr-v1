@@ -244,6 +244,7 @@ class CustomTrainerStage1(SFTTrainer):
         stage1_peft_metadata=None,
         collect_stage1_diagnostics: bool = False,
         stage1_check_policy: str | None = None,
+        run_cache=None,
         match_v5_execution: bool = False,
         ce_entropy_top_percent: float | None = None,
         matched_resume_profile=None,
@@ -253,6 +254,7 @@ class CustomTrainerStage1(SFTTrainer):
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
             raise TypeError("Stage 1 trainer requires a DeepSpeed runtime profile")
         self.deepspeed_runtime_profile = deepspeed_runtime_profile
+        self.run_cache = run_cache
         self.stage1_peft_metadata = stage1_peft_metadata
         # Preserve the repository's legacy constructor spelling across the
         # tokenizer -> processing_class Trainer API migration.
@@ -332,6 +334,7 @@ class CustomTrainerStage1(SFTTrainer):
                 query_config=self.query_config,
                 validate=self._stage1_checks_enabled(),
                 collect_diagnostics=self._stage1_checks_enabled(),
+                run_cache=run_cache,
             )
         self.target_builder = target_builder
 
