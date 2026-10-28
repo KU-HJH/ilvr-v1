@@ -158,3 +158,16 @@ def test_observer_records_actual_v5_selections_without_enabling_diagnostics(tmp_
         assert observer.optional_calls == 0
     finally:
         observer.restore_observers()
+
+
+def test_verification_record_transfer_preserves_large_bounded_evidence(tmp_path):
+    import stage1.cache_validation as validation
+    assert hasattr(validation, 'publish_validation_record'), 'bounded verifier record publisher is missing'
+    payload = b'{"evidence":"' + b'a' * (1100 * 1024) + b'"}'
+    destination = tmp_path / 'rank-0.json'
+    validation.publish_validation_record(destination, payload)
+    assert destination.read_bytes() == payload
+    with pytest.raises(FileExistsError):
+        validation.publish_validation_record(destination, payload)
+    with pytest.raises(ValueError, match='size'):
+        validation.publish_validation_record(tmp_path / 'oversized.json', b'a' * (4 * 1024 * 1024 + 1))

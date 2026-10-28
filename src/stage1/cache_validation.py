@@ -186,6 +186,15 @@ def _write_rank_record(output_dir, record):
     print(f'STAGE1_CACHE_VALIDATION rank={rank} world_size={record["world_size"]} record={path}', flush=True)
 
 
+def publish_validation_record(path, payload):
+    """Detailed tensor digests have a separate bounded metadata allowance."""
+    from src.multinode_runtime import _publish_bytes_no_replace
+    if type(payload) is not bytes or not 0 < len(payload) <= 4 * 1024 * 1024:
+        raise ValueError('cache verification record exceeds its bounded size')
+    json.loads(payload)
+    return _publish_bytes_no_replace(path, payload)
+
+
 def payload_witness(trainer, args, output_dir, *, prepare_only=False):
     """Original fast frozen forwards, actual workers and coordinator boundary."""
     from .cache_lifecycle import Stage1CacheEpochCallback

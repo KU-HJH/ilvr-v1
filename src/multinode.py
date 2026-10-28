@@ -2199,7 +2199,8 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
         if exit_codes != {0: 0, 1: 0}:
             raise RuntimeError(f"multi-node training failed: exit_codes={exit_codes}")
         if cache_validation_mode is not None:
-            from src.multinode_runtime import build_remote_exec, node_path, publish_small_file
+            from src.multinode_runtime import build_remote_exec, node_path
+            from stage1.cache_validation import publish_validation_record
             validation_records = {}
             for rank in range(4):
                 path = _REPOSITORY_ROOT / 'results' / plan.run_id / f'{plan.attempt_id}-cache-rank-{rank}.json'
@@ -2207,7 +2208,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                     remote_path = node_path(plan, path, machine_rank=0)
                     result = runner._run(build_remote_exec(('cat', str(remote_path)),
                         working_directory=plan.cluster.remote_repo_root, cluster=plan.cluster))
-                    publish_small_file(path, result.stdout.encode())
+                    publish_validation_record(path, result.stdout.encode())
                 record = json.loads(path.read_text())
                 if record.get('rank') != rank or record.get('world_size') != 4 or record.get('workers') != 4:
                     raise ValueError('cache verifier lacks actual four-rank/workers4 evidence')
