@@ -400,13 +400,17 @@ class CustomTrainerStage1(SFTTrainer):
         )
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        if not getattr(self, 'stage1_match_v5_execution', False):
+        # V5 owns its graph/replay context. Native PEFT retains the historical
+        # sample-keyed context through both forward and checkpoint backward.
+        if hasattr(self, 'v5_config'):
+            return super().training_step(model, inputs, num_items_in_batch)
+        sites = tuple(module.site_name for module in model.modules()
+                      if isinstance(module, SampleStableStage1Dropout))
+        if not sites and not getattr(self, 'stage1_match_v5_execution', False):
             return super().training_step(model, inputs, num_items_in_batch)
         metadata = inputs.get('stage1_batch_metadata')
         if not isinstance(metadata, Stage1BatchMetadata):
-            raise TypeError('matched standard execution requires Stage1 batch metadata')
-        sites = tuple(module.site_name for module in model.modules()
-                      if isinstance(module, SampleStableStage1Dropout))
+            raise TypeError('Stage1 dropout execution requires Stage1 batch metadata')
         context = Stage1StochasticContext(
             base_seed=self.args.seed, optimizer_global_step=self.state.global_step,
             rows=tuple((sample.source_index if sample.canonical_slot_id is None
