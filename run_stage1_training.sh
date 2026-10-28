@@ -180,6 +180,8 @@ while (( $# )); do
         --stage1-v5-debug) extra_worker_arguments+=(--stage1_v5_debug); shift ;;
         --no-stage1-v5-debug) extra_worker_arguments+=(--no-stage1_v5_debug); shift ;;
         --stage1-variant) require_value "$@"; extra_worker_arguments+=(--stage1_variant "$2"); shift 2 ;;
+        --stage1-cache) require_value "$@"; extra_worker_arguments+=(--stage1_cache "$2"); shift 2 ;;
+        --stage1-check-policy) require_value "$@"; extra_worker_arguments+=(--stage1_check_policy "$2"); shift 2 ;;
         --stage1-loss-type) require_value "$@"; extra_worker_arguments+=(--stage1_loss_type "$2"); shift 2 ;;
         --lambda-preference) require_value "$@"; extra_worker_arguments+=(--lambda_preference "$2"); shift 2 ;;
         --lambda-topk-entropy) require_value "$@"; extra_worker_arguments+=(--lambda_topk_entropy "$2"); shift 2 ;;

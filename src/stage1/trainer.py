@@ -243,6 +243,7 @@ class CustomTrainerStage1(SFTTrainer):
         ema_teacher: Stage1EmaTeacher | None = None,
         stage1_peft_metadata=None,
         collect_stage1_diagnostics: bool = False,
+        stage1_check_policy: str | None = None,
         match_v5_execution: bool = False,
         ce_entropy_top_percent: float | None = None,
         matched_resume_profile=None,
@@ -270,6 +271,10 @@ class CustomTrainerStage1(SFTTrainer):
             self.add_callback(MatchedCheckpointStop(stop_after_checkpoint))
         if self.stage1_match_v5_execution:
             enable_matched_standard_execution(self)
+        self.stage1_check_policy = stage1_check_policy or (
+            'validation' if collect_stage1_diagnostics or getattr(self, 'stage1_v5_debug', False)
+            else 'production'
+        )
         self.ce_entropy_top_percent = ce_entropy_top_percent
         self.ce_entropy_special_token_ids = ()
         if ce_entropy_top_percent is not None:
@@ -293,7 +298,7 @@ class CustomTrainerStage1(SFTTrainer):
         if query_config is not None and not isinstance(query_config, Stage1QueryConfig):
             raise TypeError('query_config must be a Stage1QueryConfig')
         self.query_config = query_config or Stage1QueryConfig()
-        self.collect_stage1_diagnostics = bool(collect_stage1_diagnostics)
+        self.collect_stage1_diagnostics = bool(collect_stage1_diagnostics) and self._stage1_checks_enabled()
         self._latest_stage1_diagnostics = None
         self._representative_gradient_norm: float | None = None
         self._successful_optimizer_steps = 0
@@ -424,7 +429,7 @@ class CustomTrainerStage1(SFTTrainer):
         outputs = model(**forward_inputs)
         ce_loss, alignment_loss = self._stage1_native_losses(outputs, labels, targets)
         loss = self.ce_weight * ce_loss + self.sim_weight * alignment_loss
-        if not bool(torch.isfinite(loss.detach()).all().item()):
+        if self._stage1_checks_enabled() and not bool(torch.isfinite(loss.detach()).all().item()):
             raise FloatingPointError("Stage 1 loss is nonfinite")
 
         if self.collect_stage1_diagnostics:
@@ -445,8 +450,21 @@ class CustomTrainerStage1(SFTTrainer):
         return (loss, outputs) if return_outputs else loss
 
     def _stage1_checks_enabled(self) -> bool:
-        # Ordinary Stage1 retains strict diagnostics; v5 opts into its runtime flag.
-        return getattr(self, "stage1_v5_debug", True)
+        return getattr(self, '_stage1_optional_checks', getattr(self, 'stage1_v5_debug', True))
+
+    @property
+    def stage1_check_policy(self):
+        return getattr(self, '_stage1_check_policy', 'legacy')
+
+    @stage1_check_policy.setter
+    def stage1_check_policy(self, value):
+        if value not in ('production', 'validation', 'legacy'):
+            raise ValueError('unsupported Stage1 check policy')
+        self._stage1_check_policy = value
+        self._stage1_optional_checks = (
+            getattr(self, 'stage1_v5_debug', True) if value == 'legacy'
+            else value == 'validation'
+        )
 
     def _prepare_stage1_loss_inputs(self, inputs, *, voff_mode='attention_mask') -> tuple[dict, Stage1BatchMetadata, Stage1TeacherTargets]:
         """Build helper targets once, preserving the original model tensors."""
