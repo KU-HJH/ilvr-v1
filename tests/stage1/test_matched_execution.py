@@ -130,7 +130,8 @@ def test_matched_standard_uses_verified_native_deepspeed_lifecycle(
 
 
 @pytest.mark.parametrize('matched', [False, True])
-def test_production_constructor_scopes_target_checks_to_execution_profile(monkeypatch, matched):
+@pytest.mark.parametrize('policy', ['production', 'legacy'])
+def test_production_constructor_scopes_target_checks_to_execution_profile(monkeypatch, matched, policy):
     """Construct the native trainer without inherited V5 fixture attributes."""
     from trl import SFTTrainer
     from deepspeed_runtime import DeepSpeedRuntimeProfile
@@ -144,10 +145,11 @@ def test_production_constructor_scopes_target_checks_to_execution_profile(monkey
     monkeypatch.setattr(CustomTrainerStage1, 'add_callback', lambda *args: None)
     trainer = CustomTrainerStage1(
         deepspeed_runtime_profile=DeepSpeedRuntimeProfile(True, 1, None, None, 4),
-        ema_teacher=object(), match_v5_execution=matched)
-    assert trainer._stage1_checks_enabled() is (not matched)
-    assert trainer.target_builder.validate is (not matched)
-    assert trainer.target_builder.collect_diagnostics is (not matched)
+        ema_teacher=object(), match_v5_execution=matched, stage1_check_policy=policy)
+    expected = policy == 'legacy' and not matched
+    assert trainer._stage1_checks_enabled() is expected
+    assert trainer.target_builder.validate is expected
+    assert trainer.target_builder.collect_diagnostics is expected
 
 
 from tests.stage1.v5.test_trainer import native_deepspeed_lifecycle

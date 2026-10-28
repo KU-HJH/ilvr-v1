@@ -402,7 +402,7 @@ class CustomTrainerStage1(SFTTrainer):
     def training_step(self, model, inputs, num_items_in_batch=None):
         # V5 owns its graph/replay context. Native PEFT retains the historical
         # sample-keyed context through both forward and checkpoint backward.
-        if hasattr(self, 'v5_config'):
+        if not getattr(self, 'stage1_match_v5_execution', False) and hasattr(self, 'v5_config'):
             return super().training_step(model, inputs, num_items_in_batch)
         sites = tuple(module.site_name for module in model.modules()
                       if isinstance(module, SampleStableStage1Dropout))

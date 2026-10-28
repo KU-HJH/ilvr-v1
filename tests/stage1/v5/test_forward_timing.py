@@ -341,7 +341,8 @@ def test_replay_processor_roundtrip_restores_only_exact_original_identity(tmp_pa
     (checkpoint/'stage1_v5.json').write_text(json.dumps(saved))
     reloaded=AutoProcessor.from_pretrained(checkpoint,local_files_only=True)
     # Real HF save/reload loses the AddedToken representation in this map.
-    assert _processor_identity(reloaded)!=expected
+    assert _processor_identity(reloaded, normalize_added_tokens=False)!=expected
+    assert _processor_identity(reloaded)==expected
     sample='hello '+ ' '.join(LATENT_TOKEN_STRINGS)+' world'
     before_vocab=reloaded.tokenizer.get_vocab()
     before_ids=tuple(reloaded.tokenizer.convert_tokens_to_ids(t) for t in LATENT_TOKEN_STRINGS)
