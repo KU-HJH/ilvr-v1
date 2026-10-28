@@ -771,8 +771,7 @@ def build_stage1_training_components(
         **({'ce_entropy_top_percent': args.stage1_ce_entropy_top_percent}
            if getattr(args, 'stage1_ce_entropy_top_percent', None) is not None else {}),
         **({'stop_after_checkpoint': args.stage1_stop_after_checkpoint}
-           if (getattr(args, 'stage1_stop_after_checkpoint', None) is not None
-               and not getattr(args, 'stage1_cache_aa_probe', False)) else {}),
+           if getattr(args, 'stage1_stop_after_checkpoint', None) is not None else {}),
         **v5_kwargs,
     )
     if tuning.method != "full" and args.gradient_checkpointing:
@@ -899,9 +898,6 @@ def run_stage1(
             assert smoke_resume_snapshot is not None
     total_start = monotonic() if producing else None
     components = component_builder(args)
-    if getattr(args, 'stage1_cache_aa_probe', False):
-        from stage1.cache_aa_probe import attach
-        attach(components.trainer, args)
     model_load_seconds = monotonic() - total_start if producing else 0.0
     resume = components.resume_decision.checkpoint_path
     trainer_start = monotonic()
