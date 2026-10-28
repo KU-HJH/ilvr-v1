@@ -28,7 +28,8 @@ def witness(profile='v5'):
             'master_parameters_after': fp(i + 1), 'group_state_after': fp(i + 9),
             'rng_before': rng, 'rng_after': rng} for i, rate in enumerate((0., 5e-6))],
         'after': {'student': fp(2), 'teacher': fp(1 if profile == 'v5' else 2),
-                  'rng': rng, 'scheduler': fp(11), 'successful_updates': 2},
+                  'rng': rng, 'scheduler': {'last_epoch': 2, 'base_lrs': [5e-5],
+                      '_last_lr': [1e-5], '_step_count': 3}, 'successful_updates': 2},
         'workers': 4, 'world_size': 4, 'production_checks': {'optional_calls': 0}}
 
 

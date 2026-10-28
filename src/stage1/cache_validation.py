@@ -68,7 +68,12 @@ def _comparison_fields(record):
     require(record['profile'] in ('v5', 'native-ema'), 'profile')
     require(record['initial_step'] == 0 and record['final_step'] == 2, 'complete two-update arm')
     quantities(record['before'], ('student', 'teacher', 'rng'), 'before')
-    quantities(record['after'], ('student', 'teacher', 'rng', 'scheduler'), 'after')
+    quantities(record['after'], ('student', 'teacher', 'rng'), 'after')
+    scheduler = record['after'].get('scheduler')
+    require(isinstance(scheduler, dict) and scheduler.get('last_epoch') == 2
+            and isinstance(scheduler.get('_last_lr'), list) and bool(scheduler['_last_lr'])
+            and all(isinstance(rate, (int, float)) for rate in scheduler['_last_lr']),
+            'after.scheduler')
     require(record['after'].get('successful_updates') == 2, 'successful updates')
     rows, steps = record['microbatches'], record['optimizer_steps']
     require(isinstance(rows, list) and len(rows) == 8, 'eight actual microbatches')
