@@ -111,6 +111,9 @@ class Stage1TeacherTargetBuilder:
         cache = self.run_cache
         sources = batch.pop('stage1_cache_sources', None)
         if cache is not None:
+            # PyTorch's pinned-memory collator preserves values but converts
+            # ordinary tuples to lists; ownership is the ordered IDs, not type.
+            sources = tuple(sources) if isinstance(sources, (tuple, list)) else None
             if sources != tuple(sample.source_index for sample in metadata.samples):
                 raise ValueError('cache source descriptors must match current samples')
             if cache.phase.value == 1 and cache.plan.helper == 'targets':

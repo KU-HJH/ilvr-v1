@@ -92,6 +92,23 @@ def assert_targets_equal(left, right):
                 b.donor_image_indices, b.donor_candidate_indices, b.query_provenance)
 
 
+def test_pinned_memory_source_sequence_preserves_population_and_replay(tmp_path):
+    from torch.utils.data._utils.pin_memory import pin_memory
+    cache = make_cache(tmp_path)
+    producer = builder(cache)
+    teacher = StatefulTeacher()
+    case = make_case((ONE_BLOCK,))
+    batch = inputs(case)
+    batch['stage1_cache_sources'] = pin_memory(batch['stage1_cache_sources'])
+    assert type(batch['stage1_cache_sources']) is list
+    first = producer.build(teacher, batch, case.metadata)
+    cache.phase.value = 1
+    replay = inputs(case, replay=True)
+    replay['stage1_cache_sources'] = pin_memory(replay['stage1_cache_sources'])
+    second = producer.build(teacher, replay, case.metadata)
+    assert_targets_equal(first, second)
+
+
 @pytest.mark.parametrize('mode', ['attention_mask', 'cross_helper_reverse_topk_independent',
                                 'cross_helper_reverse_topk_cumulative'])
 def test_fixed_targets_and_reverse_donors_roundtrip(tmp_path, mode):
