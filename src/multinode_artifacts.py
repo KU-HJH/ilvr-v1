@@ -89,6 +89,7 @@ def _prepared_inference_relative_path(
 _V5_TRAINING_FILES = frozenset({Path("stage1_v5.json"), Path("stage1_v5_reference.pt")})
 _MATCHED_STANDARD_TRAINING_FILES = frozenset({Path('stage1_matched_execution.json'),
                                             Path('stage1_matched_resume.json')})
+_CACHE_TRAINING_FILES = frozenset({Path('stage1_run_cache.json'), Path('stage1_cache_initial_teacher.pt')})
 
 _INFERENCE_STATIC_NAMES = frozenset(
     {
@@ -632,7 +633,7 @@ def _require_peft_payload_names(names: set[str], *, stage: str) -> None:
         "training_args.bin",
     }
     if stage == "stage1":
-        allowed_weight_names.update({"stage1_ema_teacher.pt", "stage1_v5_reference.pt"})
+        allowed_weight_names.update({"stage1_ema_teacher.pt", "stage1_v5_reference.pt", "stage1_cache_initial_teacher.pt"})
     unsupported = {
         name
         for name in names
@@ -1159,7 +1160,7 @@ def select_common_metadata_entries(
     """Select only explicitly approved metadata for this stage/method contract."""
     allowed = _required_common_paths(_validate_identity(manifest.runtime_identity))
     if manifest.runtime_identity["stage"] == "stage1":
-        allowed = allowed | _V5_TRAINING_FILES | _MATCHED_STANDARD_TRAINING_FILES
+        allowed = allowed | _V5_TRAINING_FILES | _MATCHED_STANDARD_TRAINING_FILES | _CACHE_TRAINING_FILES
     return tuple(entry for entry in manifest.entries if entry.relative_path in allowed)
 
 
@@ -1233,6 +1234,10 @@ def validate_collection(
     if identity["stage"] == "stage1" and any(
             entry.relative_path in _V5_TRAINING_FILES for manifest in values for entry in manifest.entries):
         allowed_common = allowed_common | _V5_TRAINING_FILES
+    if identity['stage'] == 'stage1':
+        # Cache-off and V5 checkpoints need no separate standard initial state.
+        allowed_common = allowed_common | frozenset(entry.relative_path for manifest in values
+            for entry in manifest.entries if entry.relative_path in _CACHE_TRAINING_FILES)
     step_directory = f"global_step{identity['global_step']}"
     for manifest in sorted(values, key=lambda item: item.node_rank):
         for entry in manifest.entries:
@@ -1407,6 +1412,8 @@ def validate_transfer_destination(
                 "stage1_v5_reference.pt",
                 "stage1_matched_execution.json",
                 "stage1_matched_resume.json",
+                "stage1_run_cache.json",
+                "stage1_cache_initial_teacher.pt",
                 "stage2_peft_metadata.json",
                 "stage2-sampler.json",
             }

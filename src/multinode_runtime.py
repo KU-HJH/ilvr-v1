@@ -34,6 +34,7 @@ _EVALUATION_STAGING_ROOT = CANONICAL_EVALUATION_STAGING_ROOT
 _RESULT_ROOT = _REPOSITORY_ROOT / "results"
 _LOG_ROOT = _REPOSITORY_ROOT / "logs" / "multinode"
 _STAGE_LOG_ROOT = _REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
+_STAGE1_NATIVE_VENV = Path('/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/venv/ilvr-venv')
 _OWNERSHIP_SCHEMA_VERSION = 1
 _WITNESS_SCHEMA_VERSION = 1
 _INCOMPLETE_SCHEMA_VERSION = 1
@@ -828,6 +829,8 @@ def receive_launch_plan(
 
 
 _STAGE1_VALUE_OPTIONS = {
+    "--stage1-cache", "--stage1-check-policy", "--stage1-cache-completion",
+    "--stage1-runtime-profile",
     "--stage1-ce-entropy-top-percent",
     "--query_mode",
     "--history_text_gamma",
@@ -1888,7 +1891,7 @@ def build_owned_tmux_commands(
     stage_log_root: str | Path = _STAGE_LOG_ROOT,
 ) -> OwnedTmuxCommands:
     """Construct remote and local tmux launches without executing either."""
-    from src.multinode import LaunchPlan
+    from src.multinode import LaunchPlan, _argument_value
 
     if not isinstance(plan, LaunchPlan):
         raise TypeError("plan must be a LaunchPlan")
@@ -1905,6 +1908,15 @@ def build_owned_tmux_commands(
             raise ValueError("Stage 1 does not accept coordinator environment overrides")
         base_environment: dict[str, str] = {}
         forwarded = validate_stage1_arguments(stage_arguments)
+        profile_value = _argument_value(forwarded, '--stage1-runtime-profile') or 'default'
+        if profile_value not in ('default', 'native-ema-0180'):
+            raise ValueError('unsupported Stage1 runtime profile')
+        if profile_value == 'native-ema-0180':
+            if (_argument_value(forwarded, '--stage1-variant') == 'v5'
+                    or '--stage1-match-v5-execution' in forwarded):
+                raise ValueError('native EMA runtime requires native standard Stage1')
+        base_environment['ILVR_STAGE1_RUNTIME_PROFILE'] = profile_value
+        base_environment['ILVR_STAGE1_CACHE_ATTEMPT'] = plan.attempt_id
         stage_owned_arguments: tuple[str, ...] = ()
         finite_loss_evidence_path = (
             Path(result_root)
@@ -1992,6 +2004,8 @@ def build_owned_tmux_commands(
             "PYTHONPATH": f"{repository}:{repository / 'src'}",
             "ILVR_REPOSITORY_COMMIT": commit,
         }
+        if plan.stage == 'stage1' and base_environment.get('ILVR_STAGE1_RUNTIME_PROFILE') == 'native-ema-0180':
+            environment['PATH'] = str(_STAGE1_NATIVE_VENV / 'bin') + ':' + environment['PATH']
         supervisor, digest, node_spec = _node_shell_command(
             plan,
             machine_rank=machine_rank,
@@ -4199,7 +4213,7 @@ def _remote_repository_module_stdin_command(
     )
 
 
-def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot) -> PreflightReport:
+def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot, *, stage1_runtime_profile='default') -> PreflightReport:
     """Reject all launch blockers before either machine initializes CUDA."""
     if (remote.node, remote.machine_rank) != ("remote", 0):
         raise ValueError("remote snapshot must be machine rank 0")
@@ -4208,21 +4222,23 @@ def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot) -> PreflightRe
     if remote.commit != local.commit:
         raise ValueError("nodes must have the same tracked commit")
 
+    if stage1_runtime_profile not in ('default', 'native-ema-0180'):
+        raise ValueError('unsupported Stage1 runtime profile')
     for node in (remote, local):
-        _validate_snapshot(node)
+        _validate_snapshot(node, deepspeed_version='0.18.0' if stage1_runtime_profile == 'native-ema-0180' else '0.18.7')
     if remote.container_running is not True:
         raise ValueError("remote llm_kd container is not running")
     return PreflightReport(commit=remote.commit, world_size=4)
 
 
-def _validate_snapshot(node: NodeSnapshot) -> None:
+def _validate_snapshot(node: NodeSnapshot, *, deepspeed_version='0.18.7') -> None:
     if not node.tracked_clean:
         raise ValueError(f"{node.node}: tracked files are dirty")
     if (
         not _is_python_311(node.python_version)
         or node.torch_version != "2.7.1+cu128"
         or node.accelerate_version != "1.10.1"
-        or node.deepspeed_version != "0.18.7"
+        or node.deepspeed_version != deepspeed_version
         or not node.torchrun_ok
     ):
         raise ValueError(f"{node.node}: environment versions or torchrun mismatch")
@@ -4275,8 +4291,11 @@ def build_preflight_commands(
     local_run_paths: Sequence[str | Path],
     remote_tmux_sessions: Sequence[str],
     local_tmux_sessions: Sequence[str],
+    stage1_runtime_profile: str = 'default',
 ) -> PreflightCommands:
     """Build once the exact arrays shared by dry-run and live preflight."""
+    if stage1_runtime_profile not in ('default', 'native-ema-0180') or (plan.stage != 'stage1' and stage1_runtime_profile != 'default'):
+        raise ValueError('unsupported stage/runtime profile')
     repository = plan.cluster.remote_repo_root
     remote_argv = _node_info_command(
         plan,
@@ -4287,6 +4306,7 @@ def build_preflight_commands(
         artifact_roots=artifact_roots,
         run_paths=remote_run_paths,
         tmux_sessions=remote_tmux_sessions,
+        stage1_runtime_profile=stage1_runtime_profile,
     )
     local_argv = _node_info_command(
         plan,
@@ -4297,6 +4317,7 @@ def build_preflight_commands(
         artifact_roots=artifact_roots,
         run_paths=local_run_paths,
         tmux_sessions=local_tmux_sessions,
+        stage1_runtime_profile=stage1_runtime_profile,
     )
     return PreflightCommands(
         container_inspect=(
@@ -4378,11 +4399,12 @@ def _node_info_command(
     artifact_roots: Sequence[str | Path],
     run_paths: Sequence[str | Path],
     tmux_sessions: Sequence[str],
+    stage1_runtime_profile: str = 'default',
 ) -> list[str]:
     command = [
         "env",
         f"PYTHONPATH={repository}:{repository / 'src'}",
-        str(repository / "venv" / "ilvr-venv" / "bin" / "python"),
+        str((_STAGE1_NATIVE_VENV if stage1_runtime_profile == 'native-ema-0180' else repository / 'venv/ilvr-venv') / 'bin/python'),
         "-m",
         "src.multinode",
         "node-info",

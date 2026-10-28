@@ -120,7 +120,9 @@ class Stage1TeacherTargetBuilder:
                 batch.pop('image_grid_thw_latent')
                 targets = decode_target_batch(records, metadata,
                     device=self._teacher_device(teacher, batch['input_ids'].device))
-                restore_teacher_forward_state(teacher, records[-1]['forward_state'])
+                executed = [record['forward_state'] for record in records if record['forward_state'] is not None]
+                if executed:
+                    restore_teacher_forward_state(teacher, executed[-1])
                 if self.collect_diagnostics:
                     diagnostics = self._diagnostics(targets.latent_values)
                     if targets.rejected_blocks:
@@ -241,7 +243,8 @@ class Stage1TeacherTargetBuilder:
             selection_margins.append(block_margins)
             if cache is not None and cache.plan.helper == 'targets':
                 from .cache_payloads import capture_teacher_forward_state
-                forward_states.append(capture_teacher_forward_state(teacher))
+                forward_states.append(None if self.query_config.mode == 'adaptive' and not sample.latent_spans
+                                      else capture_teacher_forward_state(teacher))
             for span, selected_count in zip(sample.latent_spans, block_counts):
                 if selected_count:
                     latent_mask[

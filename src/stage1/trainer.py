@@ -357,6 +357,7 @@ class CustomTrainerStage1(SFTTrainer):
                 write_deepspeed_runtime_sidecar(
                     directory, self.deepspeed_runtime_profile
                 )
+                self._write_stage1_cache_contract(directory)
                 if getattr(self, 'stage1_match_v5_execution', False):
                     write_matched_execution_identity(directory, ce_entropy_top_percent=getattr(self, 'ce_entropy_top_percent', None))
             except Exception as error:
@@ -1104,6 +1105,7 @@ class CustomTrainerStage1(SFTTrainer):
                     write_deepspeed_runtime_sidecar(
                         checkpoint_dir, self.deepspeed_runtime_profile
                     )
+                    self._write_stage1_cache_contract(checkpoint_dir)
                     if getattr(self, 'stage1_match_v5_execution', False):
                         write_matched_execution_identity(checkpoint_dir, ce_entropy_top_percent=getattr(self, 'ce_entropy_top_percent', None))
                         resume_profile = getattr(self, 'matched_resume_profile', None)
@@ -1136,6 +1138,21 @@ class CustomTrainerStage1(SFTTrainer):
                 )
         finally:
             self._stage1_deferred_checkpoint_rotation = None
+
+    def _write_stage1_cache_contract(self, directory):
+        from .cache_setup import write_stage1_cache_contract, INITIAL_TEACHER
+        cache = getattr(self, 'run_cache', None)
+        write_stage1_cache_contract(directory, None if cache is None else cache.plan,
+            phase=0 if cache is None else cache.phase.value,
+            check_policy=self.stage1_check_policy,
+            completion=getattr(self, 'stage1_cache_completion', 'train'))
+        if cache is not None and cache.plan.helper == 'targets' and not hasattr(self, 'v5_config'):
+            source = Path(self.args.output_dir) / INITIAL_TEACHER
+            destination = Path(directory) / INITIAL_TEACHER
+            if source != destination and not destination.exists():
+                # Hard link the immutable initial state within the checkpoint
+                # filesystem; no additional whole-model copy per checkpoint.
+                os.link(source, destination)
 
     def _rotate_checkpoints(self, use_mtime=False, output_dir=None) -> None:
         if getattr(self, "_defer_stage1_checkpoint_rotation", False):

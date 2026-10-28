@@ -48,6 +48,31 @@ def with_donor_ids(case):
     return case
 
 
+def test_adaptive_empty_sample_does_not_restore_an_unexecuted_forward(tmp_path):
+    from tests.stage1.history_fixtures import make_history_case
+    from tests.stage1.test_history_targets import builder as adaptive_builder
+    from peft_common import resolve_qwen2_5_vl_model
+    case = make_history_case()
+    x = {key: value.clone() for key, value in case.inputs.items()}
+    for key in ('input_ids', 'attention_mask'):
+        x[key] = x[key][:, :13]
+    for key in ('pixel_values_latent', 'image_grid_thw_latent'):
+        x[key] = x[key][:0]
+    sample = replace(case.metadata.samples[0], latent_spans=(), helper_to_block=(),
+        helper_grid_range=(0, 0), helper_pixel_range=(0, 0), unpadded_length=13)
+    metadata = replace(case.metadata, samples=(sample,), sequence_length=13)
+    cache = make_cache(tmp_path)
+    target_builder = adaptive_builder(case, run_cache=cache)
+    x['stage1_cache_sources'] = (sample.source_index,)
+    owner = resolve_qwen2_5_vl_model(case.teacher)
+    owner.rope_deltas = torch.tensor([[3]])
+    target_builder.build(case.teacher, dict(x), metadata)
+    cache.phase.value = 1
+    owner.rope_deltas = torch.tensor([[9]])
+    target_builder.build(case.teacher, dict(x), metadata)
+    assert owner.rope_deltas.tolist() == [[9]]
+
+
 def assert_targets_equal(left, right):
     assert torch.equal(left.latent_values, right.latent_values)
     assert left.latent_values.dtype == right.latent_values.dtype

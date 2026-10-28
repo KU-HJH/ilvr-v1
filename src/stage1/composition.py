@@ -516,6 +516,11 @@ def build_stage1_training_components(
         output_dir, args.resume_from_checkpoint_path
     )
     checkpoint = decision.checkpoint_path
+    from stage1.cache_setup import load_stage1_cache_contract
+    from stage1.run_cache import resolve_stage1_check_policy
+    cache_saved = load_stage1_cache_contract(checkpoint, requested=getattr(args, 'stage1_cache', 'off'))
+    check_policy = resolve_stage1_check_policy(requested=getattr(args, 'stage1_check_policy', None),
+        saved=cache_saved, validation=bool(getattr(args, '_stage1_cache_validation', False)))
     from stage1.matched_execution import reject_matched_execution_resume
     matched_contract = reject_matched_execution_resume(checkpoint, enabled=matched_standard)
     matched_resume_profile = None
@@ -763,6 +768,7 @@ def build_stage1_training_components(
         ce_weight=args.ce_weight,
         deepspeed_runtime_profile=profile,
         ema_method=tuning.method,
+        stage1_check_policy=check_policy,
         stage1_peft_metadata=metadata,
         collect_stage1_diagnostics=(bool(getattr(args, "stage1_v5_debug", False)) if is_v5
                                    else bool(getattr(args, "benchmark_evidence_path", None))),
@@ -774,6 +780,11 @@ def build_stage1_training_components(
            if getattr(args, 'stage1_stop_after_checkpoint', None) is not None else {}),
         **v5_kwargs,
     )
+    trainer.stage1_cache_completion = getattr(args, 'stage1_cache_completion', 'train')
+    if getattr(args, 'stage1_cache', 'off') == 'run':
+        from stage1.cache_setup import configure_stage1_run_cache
+        configure_stage1_run_cache(args, trainer=trainer, examples=dataset, collator=collator,
+            processor=processor, data_path=data_path, checkpoint=checkpoint, saved=cache_saved)
     if tuning.method != "full" and args.gradient_checkpointing:
         validate_stage1_checkpoint_context(getattr(trainer, "model", model))
     return Stage1TrainingComponents(
@@ -951,6 +962,9 @@ def run_stage1(
         if components.trainer.is_world_process_zero():
             publish_stage1_training_evidence(training_evidence_path, **evidence)
 
+    if getattr(components.trainer, 'run_cache', None) is not None:
+        from stage1.cache_setup import close_stage1_cache_readers
+        close_stage1_cache_readers(components.trainer)
     if not producing:
         return
 

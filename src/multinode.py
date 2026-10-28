@@ -1931,12 +1931,16 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 f"result_root must be inside {_REPOSITORY_ROOT / 'results'}"
             ) from error
         forwarded = tuple(stage_arguments)
+        stage1_runtime_profile = 'default'
+        cache_enabled = False
         if stage == "stage1":
             forwarded = validate_stage1_arguments(forwarded)
             tuning_method = _argument_value(forwarded, "--method")
             if tuning_method not in ("full", "lora", "dora"):
                 raise ValueError("Stage 1 requires --method full, lora, or dora")
             stage_environment: dict[str, str] = {}
+            stage1_runtime_profile = _argument_value(forwarded, '--stage1-runtime-profile') or 'default'
+            cache_enabled = _argument_value(forwarded, '--stage1-cache') == 'run'
             resume_requested = _argument_value(forwarded, "--resume") is not None
         else:
             forwarded = validate_stage2_arguments(forwarded)
@@ -2089,6 +2093,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             local_run_paths=run_paths,
             remote_tmux_sessions=(sessions[0],),
             local_tmux_sessions=(sessions[1],),
+            **({'stage1_runtime_profile': stage1_runtime_profile} if stage1_runtime_profile != 'default' else {}),
         )
 
         def subprocess_runner(command: list[str] | tuple[str, ...]):
@@ -2122,7 +2127,8 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             tmux_sessions=(sessions[1],),
             repository=plan.cluster.local_repo_root,
         )
-        report = validate_preflight(remote_snapshot, local_snapshot)
+        report = validate_preflight(remote_snapshot, local_snapshot,
+            **({'stage1_runtime_profile': stage1_runtime_profile} if stage1_runtime_profile != 'default' else {}))
         if report.commit != commit:
             raise ValueError("validated preflight commit changed before launch")
         runner = SubprocessCoordinatorRunner(
@@ -2131,6 +2137,17 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             commit=commit,
             log_root=log_root,
         )
+        cache_exchange = None
+        if cache_enabled:
+            from stage1.cache_setup import SSD_ROOT
+            from stage1.cache_lifecycle import publish_json
+            from stage1.cache_transport import SubprocessCacheExchange
+            cache_exchange = SubprocessCacheExchange(plan, runner, cache_root=SSD_ROOT / plan.run_id,
+                control_dir=control_directory / 'cache')
+            cache_completion = _argument_value(forwarded, '--stage1-cache-completion') or 'train'
+            publish_json(log_root / plan.run_id / 'cache-run.json', {
+                'schema': 1, 'run_id': plan.run_id, 'attempt': plan.attempt_id,
+                'completion': cache_completion, 'training_complete': False})
         saved_stage1_resume = None
         if resume_requested:
             resume_source = (
@@ -2173,6 +2190,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 0: commands.command_digests[0],
                 1: commands.command_digests[1],
             },
+            **({'boundary_action': cache_exchange.boundary} if cache_exchange is not None else {}),
         )
         if exit_codes != {0: 0, 1: 0}:
             raise RuntimeError(f"multi-node training failed: exit_codes={exit_codes}")
@@ -2310,6 +2328,13 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             raise RuntimeError(
                 f"training attempt incomplete; record={incomplete}: {error}"
             ) from error
+        if cache_exchange is not None and planned_stop is None:
+            from stage1.cache_setup import finish_stage1_run_cache
+            publish_json(log_root / plan.run_id / 'cache-run.json', {
+                'schema': 1, 'run_id': plan.run_id, 'attempt': plan.attempt_id,
+                'completion': cache_completion, 'training_complete': True})
+            if cache_completion == 'train':
+                finish_stage1_run_cache(run_id=plan.run_id, completion='complete', runner=cache_exchange)
         print(json.dumps({"training_witness": str(witness)}, sort_keys=True))
         return 0
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
@@ -2486,6 +2511,7 @@ def _evaluate_main(argv: list[str]) -> int:
     )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", default="initial")
+    parser.add_argument('--stage1-cache-training-run-id')
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--test-data-path", required=True)
     parser.add_argument("--task-name", required=True)
@@ -2570,7 +2596,26 @@ def _evaluate_main(argv: list[str]) -> int:
             return 0
         commit = _repository_git_stdout(("rev-parse", "HEAD"))
         runner = EvaluationSubprocessRunner(plan, commit=commit)
+        cache_completion_record = None
+        if args.stage1_cache_training_run_id is not None:
+            training_id = args.stage1_cache_training_run_id
+            _validate_identifier('cache training run_id', training_id)
+            cache_completion_record = json.loads((_REPOSITORY_ROOT / 'logs/multinode' / training_id / 'cache-run.json').read_text())
+            if (cache_completion_record.get('run_id') != training_id
+                    or cache_completion_record.get('completion') != 'train-eval'
+                    or cache_completion_record.get('training_complete') is not True):
+                raise ValueError('cache cleanup requires the declared completed training/evaluation boundary')
         summary = run_evaluation(plan, runner)
+        if cache_completion_record is not None:
+            from types import SimpleNamespace
+            from stage1.cache_setup import SSD_ROOT, finish_stage1_run_cache
+            from stage1.cache_transport import SubprocessCacheExchange
+            cache_plan = SimpleNamespace(cluster=plan.cluster or ClusterSpec.default(),
+                run_id=training_id, attempt_id=cache_completion_record['attempt'])
+            exchange = SubprocessCacheExchange(cache_plan, runner,
+                cache_root=SSD_ROOT / training_id,
+                control_dir=_REPOSITORY_ROOT / 'logs/multinode' / training_id / cache_completion_record['attempt'] / 'cache')
+            finish_stage1_run_cache(run_id=training_id, completion='complete', runner=exchange)
     except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(_json_ready(summary), sort_keys=True))

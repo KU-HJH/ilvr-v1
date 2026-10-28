@@ -48,9 +48,11 @@ class Stage1CacheEpochCallback(TrainerCallback):
         if dist.is_initialized():
             dist.barrier()
         if args.local_process_index == 0:
-            manifest = local_manifest(self.cache, self.expected)
+            from .cache_setup import resolve_expected
+            resolved = resolve_expected(self.cache, self.expected)
+            manifest = local_manifest(self.cache, resolved)
             publish_json(self.control_dir / 'ready.json', {
-                'manifest': manifest, 'expected': self.expected,
+                'manifest': manifest, 'expected': resolved,
                 'run_id': self.cache.plan.run_id,
             })
         release = self.control_dir / 'release.json'
@@ -59,7 +61,8 @@ class Stage1CacheEpochCallback(TrainerCallback):
             time.sleep(.1)
         manifest = json.loads(release.read_text())
         validate_manifest(self.cache, manifest)
-        required = {f'{layer}/{index}.pt' for layer, indices in self.expected.items() for index in indices}
+        from .cache_setup import resolve_expected
+        required = {f'{layer}/{index}.pt' for layer, indices in resolve_expected(self.cache, self.expected).items() for index in indices}
         if set(manifest['records']) != required:
             raise ValueError('cache release lacks complete coverage')
         self.cache.phase.value = 1

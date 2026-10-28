@@ -169,11 +169,16 @@ class SubprocessCacheExchange:
         remote = self.request(0, 'ready')
         if remote is None:
             return
+        local_expected, remote_expected = dict(local['expected']), dict(remote['expected'])
+        local_reference, remote_reference = local_expected.pop('reference', []), remote_expected.pop('reference', [])
         if (local['run_id'] != self.plan.run_id or remote['run_id'] != self.plan.run_id
-                or local['expected'] != remote['expected']):
+                or local_expected != remote_expected):
             raise ValueError('node cache boundary contracts differ')
+        expected = local_expected
+        if 'reference' in local['expected']:
+            expected['reference'] = sorted(set(local_reference + remote_reference))
         self.ready = {0: remote, 1: local}
-        exchange_stage1_cache(self.plan, self, expected=local['expected'])
+        exchange_stage1_cache(self.plan, self, expected=expected)
         self.completed = True
 
     def manifest(self, rank, expected):
@@ -224,6 +229,11 @@ class SubprocessCacheExchange:
     def release(self, rank, manifest):
         self.request(rank, 'release', {'manifest': manifest})
 
+    def remove_cache(self, rank, run_id):
+        if run_id != self.plan.run_id:
+            raise ValueError('completion run ID differs from cache owner')
+        self.request(rank, 'remove', {'run_id': run_id, 'attempt': self.plan.attempt_id})
+
 
 def main():
     import argparse
@@ -231,7 +241,7 @@ def main():
     import sys
     from .run_cache import Stage1CachePlan
     parser = argparse.ArgumentParser()
-    parser.add_argument('operation', choices=('ready', 'export', 'import', 'validate', 'release'))
+    parser.add_argument('operation', choices=('ready', 'export', 'import', 'validate', 'release', 'remove'))
     parser.add_argument('root', type=Path)
     parser.add_argument('control', type=Path)
     args = parser.parse_args()
@@ -253,6 +263,15 @@ def main():
         from .cache_lifecycle import publish_release
         validate_manifest(cache, request['manifest'])
         publish_release(args.control, request['manifest'])
+        print('null')
+    elif args.operation == 'remove':
+        from .cache_setup import remove_owned_cache
+        closed = json.loads((args.root / 'closed.json').read_text())
+        if (closed['identity'] != cache.identity_sha256 or closed['run_id'] != request['run_id']
+                or request['run_id'] != cache.plan.run_id or closed['attempt'] != request['attempt']):
+            raise ValueError('cache deletion lacks matching closed readers')
+        cache.close()
+        remove_owned_cache(cache, logical_root=Path(__file__).resolve().parents[2] / 'data/cache')
         print('null')
 
 

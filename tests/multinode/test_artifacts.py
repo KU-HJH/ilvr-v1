@@ -2419,6 +2419,27 @@ def test_v5_completed_checkpoint_manifest_cli_retains_reference_for_resume(tmp_p
     assert (checkpoint / "stage1_v5_reference.pt").read_bytes() == b"initial selected reference"
 
 
+def test_cache_initial_teacher_retained_for_resume_excluded_from_inference(tmp_path, capsys):
+    from src.multinode import _main
+    from stage1.checkpointing import classify_stage1_artifact, Stage1ArtifactKind
+    values = identity(tuning_method='dora', zero_stage=1, model_state_layout='replicated')
+    root = tmp_path / 'checkpoints'
+    checkpoint = root / values['run_id'] / 'checkpoint-2'
+    write_observed_full_checkpoint(checkpoint, values=values)
+    (checkpoint / 'model.safetensors').unlink()
+    write_loader_artifact(checkpoint, stage='stage1', method='dora')
+    (checkpoint / 'stage1_run_cache.json').write_text('{"schema":1,"mode":"run"}')
+    (checkpoint / 'stage1_cache_initial_teacher.pt').write_bytes(b'original teacher state')
+    assert _main(['artifact-manifest', '--run-directory', str(checkpoint), '--run-id', values['run_id'],
+        '--checkpoint-root', str(root), '--node-rank', '0', '--process-rank', '0', '--process-rank', '1',
+        '--runtime-identity-json', json.dumps(values), '--completion-marker']) == 0
+    manifest = NodeArtifactManifest.from_json(json.loads(capsys.readouterr().out))
+    assert classify_stage1_artifact(checkpoint) is Stage1ArtifactKind.PEFT
+    saved = {Path('stage1_run_cache.json'), Path('stage1_cache_initial_teacher.pt')}
+    assert saved <= {entry.relative_path for entry in select_resume_entries(manifest)}
+    assert saved.isdisjoint(entry.relative_path for entry in select_inference_entries(manifest))
+
+
 @pytest.mark.parametrize("stage,extra,expected", [
     ("stage1", "unrecognized_reference.pt", "unknown"),
     ("stage1", "model.safetensors", "mixed"),
