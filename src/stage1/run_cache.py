@@ -148,7 +148,10 @@ class Stage1RunCache:
         with tempfile.NamedTemporaryFile(dir=target.parent, prefix='record-', suffix='.pt', delete=False) as stream:
             temporary = Path(stream.name)
         try:
-            torch.save(envelope, temporary)
+            # A file handle gives the ZIP archive a stable internal root. A
+            # random temporary filename would change identical records' bytes.
+            with temporary.open('wb') as stream:
+                torch.save(envelope, stream)
             try:
                 os.link(temporary, target)
             except FileExistsError:

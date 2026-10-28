@@ -3774,6 +3774,7 @@ def monitor_owned_jobs(
     expected_command_digests: Mapping[int, str],
     poll_interval_seconds: float = 0.25,
     attempt_timeout_seconds: float | None = None,
+    boundary_action: Callable[[], None] | None = None,
 ) -> dict[int, int]:
     """Collect both exits and stop only a revalidated live peer after failure."""
     exits: dict[int, int] = {}
@@ -3805,6 +3806,8 @@ def monitor_owned_jobs(
                             exits[peer_rank] = -15
                     return exits
             if len(exits) < len(ranks):
+                if boundary_action is not None:
+                    boundary_action()
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         "training attempt exceeded its 24-hour deadline"
