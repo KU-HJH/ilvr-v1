@@ -312,7 +312,8 @@ def test_analysis_processor_reproduces_initial_added_token_serialization(tmp_pat
     # objects in additional_special_tokens, changing the exact serialized hash.
     assert reloaded.tokenizer.get_vocab() == initial.tokenizer.get_vocab()
     expected = _processor_identity(initial)
-    assert _processor_identity(reloaded) != expected
+    assert _processor_identity(reloaded, normalize_added_tokens=False) != expected
+    assert _processor_identity(reloaded) == expected
     restored = cli.load_analysis_processor(base)
     assert _processor_identity(restored) == expected
     assert [restored.tokenizer.convert_tokens_to_ids(t) for t in

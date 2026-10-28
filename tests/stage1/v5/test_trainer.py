@@ -212,10 +212,10 @@ def integrated_fixture(tmp_path, *, empty=False, fail=False, real_helper=False, 
             **({'query_config': history_config} if history_case else {}))
         native.validate=debug; native.collect_diagnostics=debug
         class RealHelper:
-            def build(self,teacher,inputs,meta):
+            def build(self,teacher,inputs,meta,**kwargs):
                 helper_active[0]=True
                 try:
-                    self.targets=native.build(teacher,inputs,meta)
+                    self.targets=native.build(teacher,inputs,meta,**kwargs)
                     return self.targets
                 finally: helper_active[0]=False
         trainer.target_builder=RealHelper()
@@ -473,7 +473,7 @@ def test_train_publishes_actual_loader_contract_before_parent_dispatch_and_rejec
         assert saved['execution']['packages']['accelerate']=='1.10.1'
         assert saved['execution']['lora_target_modules']==','.join(DEFAULT_STAGE1_TARGET_SUFFIXES)
         assert set(saved['execution']['source_sha256'])=={'v5_trainer','stage1_trainer','transformers_trainer',
-            'query','targets','history_attention','history_teacher'}
+            'query','targets','history_attention','history_teacher','v5_donors','v5_replay'}
         parent_calls.append(kw)
         return 'parent-result'
     monkeypatch.setattr(CustomTrainerStage1,'train',parent)

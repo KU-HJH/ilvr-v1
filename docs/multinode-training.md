@@ -1,5 +1,43 @@
 # Four-GPU multi-node operation
 
+## Matched Stage1 clean20 periodic continuation
+
+The reviewed matched-standard resume implementation retains the original
+2160-update schedule, save interval216, CE1 + alignment1, clean-entropy top20%,
+EMA1 and saved workers0. Fresh-run workers4 is a separate policy. A legacy
+`stage1_matched_execution.json` v1 marker stays unchanged; continuation requires
+the additional validated `stage1_matched_resume.json` binding.
+
+After both source training supervisors have exited successfully, prepare one
+selected checkpoint in a **new run** using the reviewed checkout on both nodes:
+
+```bash
+./venv/ilvr-venv/bin/python -m src.multinode prepare-stage1-resume \
+  --source-log-dir /root/.codex/worktrees/f187/ILVR/logs/stage1-baseline-clean20ce-egb16-e10-20261027-005501 \
+  --checkpoint-step 216 --run-id stage1-clean20-resume-new \
+  --remote-repo-root /root/workspace/ILVR/.worktrees/stage1-resume-20261027 \
+  --remote-host-repo-root /home/korea/Workspace/hjh/workspace/ILVR/.worktrees/stage1-resume-20261027
+```
+
+Add `--dry-run` to print the planned coordinator command without preparing a
+checkpoint. Preparation authenticates the original supervisor exits, assembles
+four-rank state, checks original Trainer arguments and both launch profiles,
+and copies full state into fresh local/remote checkpoint directories. Existing
+source bytes are retained. Missing/conflicting evidence or state rejects the
+preparation. A partial failed destination is preserved and cannot be reused;
+choose a fresh run ID after resolving the cause.
+
+The resulting `logs/<new-run>/resume-command.json` is the argv for the existing
+`run_multinode_stage1_training.sh` coordinator. Run it with Python subprocess
+or shell-safe argument handling. It retains the source objective, LR, seed,
+epoch budget, batch and DataLoader settings. The coordinator still requires
+two nodes/four ranks, remote rank0 at172.16.11.41 and bond0.11.
+
+For a short continuation witness, prepare with `--stop-after-checkpoint 217`.
+It resumes216, updates once and saves217 before stopping; max_steps remains2160
+and the result is an incomplete training budget. Omit the option for normal
+continuation. Resume from2160 restores complete state and performs no updates.
+
 This is the operator contract for ILVR's fixed two-node, four-process
 training and evaluation launchers. Run every coordinator command from
 `/root/workspace/ILVR` with the repository virtual environment. Do not adapt

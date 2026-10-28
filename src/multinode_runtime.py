@@ -34,6 +34,7 @@ _EVALUATION_STAGING_ROOT = CANONICAL_EVALUATION_STAGING_ROOT
 _RESULT_ROOT = _REPOSITORY_ROOT / "results"
 _LOG_ROOT = _REPOSITORY_ROOT / "logs" / "multinode"
 _STAGE_LOG_ROOT = _REPOSITORY_ROOT / "logs" / "zero-stage-compatibility"
+_STAGE1_NATIVE_VENV = Path('/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/venv/ilvr-venv')
 _OWNERSHIP_SCHEMA_VERSION = 1
 _WITNESS_SCHEMA_VERSION = 1
 _INCOMPLETE_SCHEMA_VERSION = 1
@@ -828,6 +829,10 @@ def receive_launch_plan(
 
 
 _STAGE1_VALUE_OPTIONS = {
+    "--stage1-cache", "--stage1-check-policy", "--stage1-cache-completion",
+    "--stage1-runtime-profile",
+    "--stage1-cache-validation", "--stage1-cache-validation-stop",
+    "--stage1-ce-entropy-top-percent",
     "--query_mode",
     "--history_text_gamma",
     "--history_attention_layers",
@@ -844,6 +849,7 @@ _STAGE1_VALUE_OPTIONS = {
     "--preference-entropy-top-percent",
     "--stage1-v5-selection",
     "--stage1-v5-text-kl-weight",
+    "--stage1-v5-voff-mode",
     "--loss-chunk-positions",
     "--vision-attention-implementation",
     "--warm-up-steps",
@@ -872,9 +878,10 @@ _STAGE1_VALUE_OPTIONS = {
     "--save-total-limit",
     "--resume",
     "--max-steps",
+    "--stop-after-checkpoint",
     "--benchmark-run-config",
 }
-_STAGE1_BOOLEAN_OPTIONS = {"--stage1-v5-debug", "--no-stage1-v5-debug","--topk-include-gt", "--no-topk-include-gt","--final-save", "--no-final-save", "--use_lora"}
+_STAGE1_BOOLEAN_OPTIONS = {"--stage1-match-v5-execution", "--stage1-v5-debug", "--no-stage1-v5-debug","--topk-include-gt", "--no-topk-include-gt","--final-save", "--no-final-save", "--use_lora"}
 _STAGE1_COORDINATOR_OPTIONS = {
     "--output-dir",
     "--log-file",
@@ -1689,7 +1696,8 @@ def build_dil_full_model_probe_commands(
 
 def build_stage1_v5_witness_commands(
     plan: "LaunchPlan", *, commit: str, data_path: Path, image_root: Path,
-    model: Path, audit_path: Path, log_root: str | Path = _LOG_ROOT,
+    model: Path, audit_path: Path | None, log_root: str | Path = _LOG_ROOT,
+    source_checkpoint: Path | None = None,
 ) -> OwnedTmuxCommands:
     """Fixed Stage1-v5 diagnostic under the existing owned node supervisor."""
     from src.multinode import validate_cluster_topology
@@ -1698,7 +1706,13 @@ def build_stage1_v5_witness_commands(
             'stage1', 'dora', 1, 4, 'initial'):
         raise ValueError('v5 witness requires fresh four-rank Stage1 DoRA ZeRO1')
     if not re.fullmatch(r'[a-f0-9]{40}', commit): raise ValueError('invalid witness commit')
-    for value in (data_path,image_root,model,audit_path): _trusted_absolute_path(value)
+    if (audit_path is None) == (source_checkpoint is None):
+        raise ValueError('exactly one witness audit or timing source is required')
+    for value in (data_path,image_root,model,audit_path or source_checkpoint): _trusted_absolute_path(value)
+    if source_checkpoint is not None:
+        # Keep the logical checkpoint spelling for unequal-root mapping.
+        try: source_checkpoint.relative_to(plan.cluster.local_repo_root/'checkpoints')
+        except ValueError as error: raise ValueError('timing source must be under local checkpoints/') from error
     commands=[]; digests=[]; specs=[]
     for machine_rank in (0,1):
         repository=node_repository(plan,machine_rank=machine_rank)
@@ -1709,21 +1723,35 @@ def build_stage1_v5_witness_commands(
             'NCCL_SOCKET_IFNAME':plan.cluster.socket_ifname,'PYTHONDONTWRITEBYTECODE':'1',
             'PYTHONPATH':f"{repository / 'transformers/src'}:{repository}:{repository / 'src'}",
             'ILVR_REPOSITORY_COMMIT':commit}
+        diagnostic=(
+            str(repository/'scripts/profile_stage1_v5.py'),'--mode','replay',
+            '--run-id',plan.run_id,'--data-path',mapped(data_path),'--image-root',mapped(image_root),
+            '--model',mapped(model),'--source-checkpoint',mapped(source_checkpoint),
+            '--deepspeed',mapped(plan.deepspeed_config)) if source_checkpoint is not None else (
+            str(repository/'scripts/verify_stage1_v5.py'),'--mode','distributed-witness',
+            '--run-id',plan.run_id,'--data-path',mapped(data_path),'--image-root',mapped(image_root),
+            '--model',mapped(model),'--audit-json',mapped(audit_path),'--deepspeed',mapped(plan.deepspeed_config),
+            '--output-json',str(repository/'results'/plan.run_id/'stage1-v5-witness.json'))
         command=(str(repository/'venv/ilvr-venv/bin/accelerate'),'launch',
             '--num_machines','2','--num_processes','4','--machine_rank',str(machine_rank),
             '--main_process_ip',plan.cluster.master_addr,'--main_process_port',str(plan.main_process_port),
             '--mixed_precision','bf16','--use_deepspeed','--deepspeed_multinode_launcher','standard',
             '--deepspeed_config_file',mapped(plan.deepspeed_config),
-            str(repository/'scripts/verify_stage1_v5.py'),'--mode','distributed-witness',
-            '--run-id',plan.run_id,'--data-path',mapped(data_path),'--image-root',mapped(image_root),
-            '--model',mapped(model),'--audit-json',mapped(audit_path),'--deepspeed',mapped(plan.deepspeed_config),
-            '--output-json',str(repository/'results'/plan.run_id/'stage1-v5-witness.json'))
+            *diagnostic)
         supervisor,digest,spec=_node_shell_command(plan,machine_rank=machine_rank,commit=commit,
             stage_command=command,environment=environment,log_root=Path(log_root),require_bash_launcher=False)
         tmux=('/usr/bin/tmux','new-session','-d','-s',f'ilvr-{plan.run_id}-initial-rank{machine_rank}','--',*supervisor)
         commands.append(tuple(build_remote_exec(tmux,working_directory=repository,cluster=plan.cluster)) if machine_rank==0 else tmux)
         digests.append(digest); specs.append(spec)
     return OwnedTmuxCommands(remote=commands[0],local=commands[1],command_digests=tuple(digests),node_specs=tuple(specs),finite_loss_evidence_path=None)
+
+
+def build_stage1_v5_forward_timing_commands(
+    plan: "LaunchPlan", *, commit: str, data_path: Path, image_root: Path,
+    model: Path, source_checkpoint: Path, log_root: str | Path = _LOG_ROOT,
+) -> OwnedTmuxCommands:
+    return build_stage1_v5_witness_commands(plan,commit=commit,data_path=data_path,
+        image_root=image_root,model=model,audit_path=None,source_checkpoint=source_checkpoint,log_root=log_root)
 
 
 def build_owned_lifecycle_harness_commands(
@@ -1864,7 +1892,7 @@ def build_owned_tmux_commands(
     stage_log_root: str | Path = _STAGE_LOG_ROOT,
 ) -> OwnedTmuxCommands:
     """Construct remote and local tmux launches without executing either."""
-    from src.multinode import LaunchPlan
+    from src.multinode import LaunchPlan, _argument_value
 
     if not isinstance(plan, LaunchPlan):
         raise TypeError("plan must be a LaunchPlan")
@@ -1881,6 +1909,19 @@ def build_owned_tmux_commands(
             raise ValueError("Stage 1 does not accept coordinator environment overrides")
         base_environment: dict[str, str] = {}
         forwarded = validate_stage1_arguments(stage_arguments)
+        profile_value = _argument_value(forwarded, '--stage1-runtime-profile') or 'default'
+        if profile_value not in ('default', 'native-ema-0180'):
+            raise ValueError('unsupported Stage1 runtime profile')
+        if profile_value == 'native-ema-0180':
+            if (_argument_value(forwarded, '--stage1-variant') == 'v5'
+                    or '--stage1-match-v5-execution' in forwarded):
+                raise ValueError('native EMA runtime requires native standard Stage1')
+        base_environment['ILVR_STAGE1_RUNTIME_PROFILE'] = profile_value
+        base_environment['ILVR_STAGE1_CACHE_ATTEMPT'] = plan.attempt_id
+        validation_mode = _argument_value(forwarded, '--stage1-cache-validation')
+        if validation_mode == 'correctness':
+            base_environment['CUBLAS_WORKSPACE_CONFIG'] = ':4096:8'
+            base_environment['FLASH_ATTENTION_DETERMINISTIC'] = '1'
         stage_owned_arguments: tuple[str, ...] = ()
         finite_loss_evidence_path = (
             Path(result_root)
@@ -1968,6 +2009,8 @@ def build_owned_tmux_commands(
             "PYTHONPATH": f"{repository}:{repository / 'src'}",
             "ILVR_REPOSITORY_COMMIT": commit,
         }
+        if plan.stage == 'stage1' and base_environment.get('ILVR_STAGE1_RUNTIME_PROFILE') == 'native-ema-0180':
+            environment['PATH'] = str(_STAGE1_NATIVE_VENV / 'bin') + ':' + environment['PATH']
         supervisor, digest, node_spec = _node_shell_command(
             plan,
             machine_rank=machine_rank,
@@ -2057,7 +2100,8 @@ class SubprocessCoordinatorRunner:
         if self.checkpoint_root not in (
             _CHECKPOINT_ROOT,
             _CHECKPOINT_ROOT / "zero-stage-compatibility",
-        ):
+        ) and not (self.checkpoint_root == plan.cluster.local_repo_root / 'checkpoints'
+                   and self.checkpoint_root.resolve(strict=True) == _CHECKPOINT_ROOT.resolve(strict=True)):
             raise ValueError("coordinator checkpoint root is not approved")
         self.command_runner = command_runner
         self.serialized_plan: SerializedLaunchPlan | None = None
@@ -2422,6 +2466,19 @@ class SubprocessCoordinatorRunner:
         if not raw or len(raw)>16*1024*1024: raise ValueError('invalid v5 rank record size')
         return raw
 
+    def read_stage1_v5_forward_timing_record(self, rank: int) -> bytes:
+        if self.plan.stage != 'stage1' or rank not in (0,1,2,3):
+            raise ValueError('invalid timing record rank/stage')
+        repository=node_repository(self.plan,machine_rank=0 if rank<2 else 1)
+        path=repository/'results'/self.plan.run_id/f'forward-timing-rank-{rank}.json'
+        if rank>=2: return _read_regular_file(path,maximum_size=16*1024*1024)
+        completed=self._run(build_remote_exec((str(repository/'venv/ilvr-venv/bin/python'),
+            '-m','scripts.profile_stage1_v5','--mode','record-show','--run-id',self.plan.run_id,
+            '--rank',str(rank)),working_directory=repository,cluster=self.plan.cluster))
+        raw=completed.stdout.encode()
+        if not raw or len(raw)>16*1024*1024: raise ValueError('invalid timing record size')
+        return raw
+
     def read_dil_full_model_probe_record(self, rank: int) -> bytes:
         """Read only a fixed rank's metadata after exact-owned process completion."""
         if rank not in (0, 1, 2, 3):
@@ -2720,6 +2777,20 @@ class SubprocessCoordinatorRunner:
             input_bytes=encoded,
         )
 
+    def publish_resume_copy(self, checkpoint, identity):
+        """Publish a complete fresh local copy through the existing exact-list push."""
+        from src.multinode_artifacts import validate_canonical_destination
+        local = self.read_artifact_manifest(1, checkpoint, identity, canonical_owner=True)
+        self._run(self._internal_command(0, 'prepare-stage1-resume-directory', (
+            '--run-id', self.plan.run_id, '--checkpoint-step', str(identity['global_step']))))
+        self._artifact_checkpoint_paths[0] = checkpoint
+        self.validate_push_destination(local, local.entries)
+        self.push_artifacts(local, local.entries)
+        remote = self.read_canonical_artifact_manifest(checkpoint, identity)
+        validate_canonical_destination(local.entries, remote, expected_identity=identity,
+                                       expected_run_id=self.plan.run_id)
+        return remote
+
     def push_artifacts(
         self, manifest: object, entries: Sequence[object]
     ) -> None:
@@ -2802,8 +2873,8 @@ class SubprocessCoordinatorRunner:
         files_path = (
             self.log_root
             / self.plan.run_id
-            / self.plan.attempt_id
-            / "artifact-resume-rank1.files"
+            # Redistribution precedes exclusive launch-attempt creation.
+            / f"{self.plan.attempt_id}-artifact-resume-rank1.files"
         )
         publish_files_list(files_path, entries)  # type: ignore[arg-type]
         self._run_artifact_transfer(
@@ -3455,7 +3526,8 @@ def redistribute_resume_checkpoint(
         manifest, expected_identity=checkpoint_identity
     )
     local = getattr(runner, "read_artifact_manifest")(
-        1, checkpoint, checkpoint_identity
+        1, checkpoint, checkpoint_identity,
+        **({"canonical_owner": True} if (checkpoint / 'rng_state_0.pth').is_file() else {}),
     )
     required, missing = resume_entry_delta(manifest, local)
     if missing:
@@ -3721,6 +3793,7 @@ def monitor_owned_jobs(
     expected_command_digests: Mapping[int, str],
     poll_interval_seconds: float = 0.25,
     attempt_timeout_seconds: float | None = None,
+    boundary_action: Callable[[], None] | None = None,
 ) -> dict[int, int]:
     """Collect both exits and stop only a revalidated live peer after failure."""
     exits: dict[int, int] = {}
@@ -3752,6 +3825,8 @@ def monitor_owned_jobs(
                             exits[peer_rank] = -15
                     return exits
             if len(exits) < len(ranks):
+                if boundary_action is not None:
+                    boundary_action()
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         "training attempt exceeded its 24-hour deadline"
@@ -4143,7 +4218,7 @@ def _remote_repository_module_stdin_command(
     )
 
 
-def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot) -> PreflightReport:
+def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot, *, stage1_runtime_profile='default') -> PreflightReport:
     """Reject all launch blockers before either machine initializes CUDA."""
     if (remote.node, remote.machine_rank) != ("remote", 0):
         raise ValueError("remote snapshot must be machine rank 0")
@@ -4152,21 +4227,23 @@ def validate_preflight(remote: NodeSnapshot, local: NodeSnapshot) -> PreflightRe
     if remote.commit != local.commit:
         raise ValueError("nodes must have the same tracked commit")
 
+    if stage1_runtime_profile not in ('default', 'native-ema-0180'):
+        raise ValueError('unsupported Stage1 runtime profile')
     for node in (remote, local):
-        _validate_snapshot(node)
+        _validate_snapshot(node, deepspeed_version='0.18.0' if stage1_runtime_profile == 'native-ema-0180' else '0.18.7')
     if remote.container_running is not True:
         raise ValueError("remote llm_kd container is not running")
     return PreflightReport(commit=remote.commit, world_size=4)
 
 
-def _validate_snapshot(node: NodeSnapshot) -> None:
+def _validate_snapshot(node: NodeSnapshot, *, deepspeed_version='0.18.7') -> None:
     if not node.tracked_clean:
         raise ValueError(f"{node.node}: tracked files are dirty")
     if (
         not _is_python_311(node.python_version)
         or node.torch_version != "2.7.1+cu128"
         or node.accelerate_version != "1.10.1"
-        or node.deepspeed_version != "0.18.7"
+        or node.deepspeed_version != deepspeed_version
         or not node.torchrun_ok
     ):
         raise ValueError(f"{node.node}: environment versions or torchrun mismatch")
@@ -4219,8 +4296,11 @@ def build_preflight_commands(
     local_run_paths: Sequence[str | Path],
     remote_tmux_sessions: Sequence[str],
     local_tmux_sessions: Sequence[str],
+    stage1_runtime_profile: str = 'default',
 ) -> PreflightCommands:
     """Build once the exact arrays shared by dry-run and live preflight."""
+    if stage1_runtime_profile not in ('default', 'native-ema-0180') or (plan.stage != 'stage1' and stage1_runtime_profile != 'default'):
+        raise ValueError('unsupported stage/runtime profile')
     repository = plan.cluster.remote_repo_root
     remote_argv = _node_info_command(
         plan,
@@ -4231,6 +4311,7 @@ def build_preflight_commands(
         artifact_roots=artifact_roots,
         run_paths=remote_run_paths,
         tmux_sessions=remote_tmux_sessions,
+        stage1_runtime_profile=stage1_runtime_profile,
     )
     local_argv = _node_info_command(
         plan,
@@ -4241,6 +4322,7 @@ def build_preflight_commands(
         artifact_roots=artifact_roots,
         run_paths=local_run_paths,
         tmux_sessions=local_tmux_sessions,
+        stage1_runtime_profile=stage1_runtime_profile,
     )
     return PreflightCommands(
         container_inspect=(
@@ -4322,11 +4404,12 @@ def _node_info_command(
     artifact_roots: Sequence[str | Path],
     run_paths: Sequence[str | Path],
     tmux_sessions: Sequence[str],
+    stage1_runtime_profile: str = 'default',
 ) -> list[str]:
     command = [
         "env",
         f"PYTHONPATH={repository}:{repository / 'src'}",
-        str(repository / "venv" / "ilvr-venv" / "bin" / "python"),
+        str((_STAGE1_NATIVE_VENV if stage1_runtime_profile == 'native-ema-0180' else repository / 'venv/ilvr-venv') / 'bin/python'),
         "-m",
         "src.multinode",
         "node-info",

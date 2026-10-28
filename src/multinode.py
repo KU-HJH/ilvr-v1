@@ -1834,13 +1834,16 @@ def _dil_full_model_probe_main(argv: list[str]) -> int:
 def _stage1_v5_witness_main(argv: list[str]) -> int:
     """The fixed Stage1-v5 diagnostic uses ordinary coordinator ownership."""
     from scripts.verify_stage1_v5 import selected_admission_geometry, validate_rank_records
-    from src.multinode_runtime import build_stage1_v5_witness_commands, publish_small_file
-    parser=argparse.ArgumentParser(prog='train-stage1 --stage1-v5-witness',allow_abbrev=False)
-    parser.add_argument('--stage1-v5-witness',action='store_true',required=True)
+    from src.multinode_runtime import (build_stage1_v5_witness_commands,
+        build_stage1_v5_forward_timing_commands,publish_small_file)
+    timing='--stage1-v5-forward-timing' in argv
+    flag='--stage1-v5-forward-timing' if timing else '--stage1-v5-witness'
+    parser=argparse.ArgumentParser(prog='train-stage1 '+flag,allow_abbrev=False)
+    parser.add_argument(flag,action='store_true',required=True)
     parser.add_argument('--run-id',required=True)
     parser.add_argument('--zero-stage',type=int,choices=(1,),required=True)
     parser.add_argument('--main-process-port',type=int,required=True)
-    for name in ('data-path','image-root','model','audit-json'):
+    for name in ('data-path','image-root','model', 'source-checkpoint' if timing else 'audit-json'):
         parser.add_argument('--'+name,type=Path,required=True)
     for name in ('local-repo-root','remote-repo-root','remote-host-repo-root'):
         parser.add_argument('--'+name,type=Path)
@@ -1851,10 +1854,16 @@ def _stage1_v5_witness_main(argv: list[str]) -> int:
             main_process_port=args.main_process_port,local_repo_root=args.local_repo_root,
             remote_repo_root=args.remote_repo_root,remote_host_repo_root=args.remote_host_repo_root)
         commit=_repository_git_stdout(('rev-parse','HEAD'))
-        commands=build_stage1_v5_witness_commands(plan,commit=commit,data_path=args.data_path,
-            image_root=args.image_root,model=args.model,audit_path=args.audit_json)
-        inputs=(args.data_path,args.image_root,args.model,args.audit_json,
-                _REPOSITORY_ROOT/'scripts/verify_stage1_v5.py',plan.deepspeed_config)
+        if timing:
+            from scripts.profile_stage1_v5 import summarize_records
+            commands=build_stage1_v5_forward_timing_commands(plan,commit=commit,data_path=args.data_path,
+                image_root=args.image_root,model=args.model,source_checkpoint=args.source_checkpoint)
+            specific=(args.source_checkpoint,_REPOSITORY_ROOT/'scripts/profile_stage1_v5.py')
+        else:
+            commands=build_stage1_v5_witness_commands(plan,commit=commit,data_path=args.data_path,
+                image_root=args.image_root,model=args.model,audit_path=args.audit_json)
+            specific=(args.audit_json,_REPOSITORY_ROOT/'scripts/verify_stage1_v5.py')
+        inputs=(args.data_path,args.image_root,args.model,*specific,plan.deepspeed_config)
         roots=tuple(_REPOSITORY_ROOT/k for k in ('checkpoints','results','logs'))
         paths=(_REPOSITORY_ROOT/'checkpoints'/plan.run_id,_REPOSITORY_ROOT/'results'/plan.run_id,
                _REPOSITORY_ROOT/'logs/multinode'/plan.run_id/plan.attempt_id)
@@ -1862,7 +1871,7 @@ def _stage1_v5_witness_main(argv: list[str]) -> int:
         preflight=build_preflight_commands(plan,input_paths=inputs,artifact_roots=roots,
             remote_run_paths=paths,local_run_paths=paths,remote_tmux_sessions=(sessions[0],),local_tmux_sessions=(sessions[1],))
         if args.dry_run:
-            print(json.dumps(dict(kind='stage1-v5-witness',plan=_json_ready(plan),
+            print(json.dumps(dict(kind='stage1-v5-forward-timing' if timing else 'stage1-v5-witness',plan=_json_ready(plan),
                 local=commands.local,remote=commands.remote,node_specs=_json_ready(commands.node_specs),
                 resource_preflight=_json_ready(preflight)),sort_keys=True))
             return 0
@@ -1873,15 +1882,17 @@ def _stage1_v5_witness_main(argv: list[str]) -> int:
         local=collect_node_snapshot(plan,node='local',runner=run,commands=preflight,input_paths=inputs,
             artifact_roots=roots,run_paths=paths,tmux_sessions=(sessions[1],))
         if validate_preflight(remote,local).commit!=commit: raise ValueError('v5 witness preflight commit changed')
-        audited=json.loads(args.audit_json.read_text())
+        audited=None if timing else json.loads(args.audit_json.read_text())
         runner=SubprocessCoordinatorRunner(plan,commands=commands,commit=commit,log_root=_REPOSITORY_ROOT/'logs/multinode')
         start_rank0_then_rank1(plan,runner,commands=commands,ready_timeout_seconds=600)
         exits=monitor_owned_jobs(plan,runner,expected_commit=commit,
             expected_command_digests={0:commands.command_digests[0],1:commands.command_digests[1]})
         if exits!={0:0,1:0}: raise RuntimeError(f'Stage1-v5 witness failed: {exits}')
-        records=[json.loads(runner.read_stage1_v5_witness_record(rank)) for rank in range(4)]
-        result=validate_rank_records(records,run_id=plan.run_id,expected_geometry=selected_admission_geometry(audited),audited=audited)
-        path=_REPOSITORY_ROOT/'results'/plan.run_id/'coordinator-admission.json'
+        reader=runner.read_stage1_v5_forward_timing_record if timing else runner.read_stage1_v5_witness_record
+        records=[json.loads(reader(rank)) for rank in range(4)]
+        result=(summarize_records(records,run_id=plan.run_id) if timing else
+            validate_rank_records(records,run_id=plan.run_id,expected_geometry=selected_admission_geometry(audited),audited=audited))
+        path=_REPOSITORY_ROOT/'results'/plan.run_id/('coordinator-forward-timing.json' if timing else 'coordinator-admission.json')
         publish_small_file(path,json.dumps(result,sort_keys=True).encode())
         print(json.dumps(dict(witness=str(path)),sort_keys=True))
         return 0
@@ -1891,7 +1902,7 @@ def _stage1_v5_witness_main(argv: list[str]) -> int:
 
 
 def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
-    if stage == 'stage1' and '--stage1-v5-witness' in argv:
+    if stage == 'stage1' and any(flag in argv for flag in ('--stage1-v5-witness','--stage1-v5-forward-timing')):
         return _stage1_v5_witness_main(argv)
     if stage == "stage2" and any(value == "--dil-full-model-probe" or value.startswith("--dil-full-model-probe=") for value in argv):
         return _dil_full_model_probe_main(argv)
@@ -1920,12 +1931,18 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 f"result_root must be inside {_REPOSITORY_ROOT / 'results'}"
             ) from error
         forwarded = tuple(stage_arguments)
+        stage1_runtime_profile = 'default'
+        cache_enabled = False
+        cache_validation_mode = None
         if stage == "stage1":
             forwarded = validate_stage1_arguments(forwarded)
             tuning_method = _argument_value(forwarded, "--method")
             if tuning_method not in ("full", "lora", "dora"):
                 raise ValueError("Stage 1 requires --method full, lora, or dora")
             stage_environment: dict[str, str] = {}
+            stage1_runtime_profile = _argument_value(forwarded, '--stage1-runtime-profile') or 'default'
+            cache_enabled = _argument_value(forwarded, '--stage1-cache') == 'run'
+            cache_validation_mode = _argument_value(forwarded, '--stage1-cache-validation')
             resume_requested = _argument_value(forwarded, "--resume") is not None
         else:
             forwarded = validate_stage2_arguments(forwarded)
@@ -1964,14 +1981,16 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 benchmark_evidence_path=str(producer_evidence),
             )
             resume_requested = "RESUME_CHECKPOINT" in stage_environment
-        planned_stop = _argument_value(forwarded, "--stage2_stop_after_checkpoint") if stage == "stage2" else None
+        planned_stop = _argument_value(forwarded, "--stage2_stop_after_checkpoint" if stage == "stage2" else '--stop-after-checkpoint')
+        if cache_validation_mode is not None:
+            planned_stop = _argument_value(forwarded, '--stage1-cache-validation-stop') or '2'
         planned_stop_max_steps = None
         if planned_stop is not None:
-            budget = _argument_value(forwarded, "--max_steps")
+            budget = _argument_value(forwarded, "--max_steps" if stage == 'stage2' else '--max-steps')
             if not (planned_stop.isdecimal() and budget is not None and budget.isdecimal()
                     and 0 < int(planned_stop) < int(budget)):
                 raise ValueError("stage2_stop_after_checkpoint requires 0 < stop < explicit max_steps")
-            if resume_requested:
+            if stage == 'stage2' and resume_requested:
                 raise ValueError("stage2_stop_after_checkpoint is fresh-run only")
             planned_stop_max_steps = int(budget)
         if resume_requested and args.attempt_id == "initial":
@@ -2078,6 +2097,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             local_run_paths=run_paths,
             remote_tmux_sessions=(sessions[0],),
             local_tmux_sessions=(sessions[1],),
+            **({'stage1_runtime_profile': stage1_runtime_profile} if stage1_runtime_profile != 'default' else {}),
         )
 
         def subprocess_runner(command: list[str] | tuple[str, ...]):
@@ -2111,7 +2131,8 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             tmux_sessions=(sessions[1],),
             repository=plan.cluster.local_repo_root,
         )
-        report = validate_preflight(remote_snapshot, local_snapshot)
+        report = validate_preflight(remote_snapshot, local_snapshot,
+            **({'stage1_runtime_profile': stage1_runtime_profile} if stage1_runtime_profile != 'default' else {}))
         if report.commit != commit:
             raise ValueError("validated preflight commit changed before launch")
         runner = SubprocessCoordinatorRunner(
@@ -2120,6 +2141,17 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             commit=commit,
             log_root=log_root,
         )
+        cache_exchange = None
+        if cache_enabled:
+            from stage1.cache_setup import SSD_ROOT
+            from stage1.cache_lifecycle import publish_json
+            from stage1.cache_transport import SubprocessCacheExchange
+            cache_exchange = SubprocessCacheExchange(plan, runner, cache_root=SSD_ROOT / plan.run_id,
+                control_dir=control_directory / 'cache')
+            cache_completion = _argument_value(forwarded, '--stage1-cache-completion') or 'train'
+            publish_json(log_root / plan.run_id / 'cache-run.json', {
+                'schema': 1, 'run_id': plan.run_id, 'attempt': plan.attempt_id,
+                'completion': cache_completion, 'training_complete': False})
         saved_stage1_resume = None
         if resume_requested:
             resume_source = (
@@ -2162,9 +2194,34 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                 0: commands.command_digests[0],
                 1: commands.command_digests[1],
             },
+            **({'boundary_action': cache_exchange.boundary} if cache_exchange is not None else {}),
         )
         if exit_codes != {0: 0, 1: 0}:
             raise RuntimeError(f"multi-node training failed: exit_codes={exit_codes}")
+        if cache_validation_mode is not None:
+            from src.multinode_runtime import build_remote_exec, node_path
+            from stage1.cache_validation import publish_validation_record
+            validation_records = {}
+            for rank in range(4):
+                path = _REPOSITORY_ROOT / 'results' / plan.run_id / f'{plan.attempt_id}-cache-rank-{rank}.json'
+                if rank < 2:
+                    remote_path = node_path(plan, path, machine_rank=0)
+                    result = runner._run(build_remote_exec(('cat', str(remote_path)),
+                        working_directory=plan.cluster.remote_repo_root, cluster=plan.cluster))
+                    publish_validation_record(path, result.stdout.encode())
+                record = json.loads(path.read_text())
+                if record.get('rank') != rank or record.get('world_size') != 4 or record.get('workers') != 4:
+                    raise ValueError('cache verifier lacks actual four-rank/workers4 evidence')
+                validation_records[rank] = record
+            if (validation_records[0]['host'] != validation_records[1]['host']
+                    or validation_records[2]['host'] != validation_records[3]['host']
+                    or validation_records[0]['host'] == validation_records[2]['host']):
+                raise ValueError('cache verifier did not observe two distinct nodes')
+            if cache_validation_mode == 'payload':
+                if any(record.get('payload') is not True for record in validation_records.values()):
+                    raise ValueError('cache payload witness failed')
+                print(json.dumps({'cache_payload_witness': plan.run_id, 'optimizer_updates': 0}))
+                return 0
         ordinary_stage1 = (
             stage == "stage1"
             and _argument_value(forwarded, "--benchmark-run-config") is None
@@ -2209,7 +2266,7 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
                     "--max-steps must identify the final checkpoint step"
                 )
             else:
-                final_step = int(step_value)
+                final_step = int(planned_stop) if planned_stop is not None else int(step_value)
             decode_stage1_training_evidence(
                 raw_evidence,
                 expected_run_id=plan.run_id,
@@ -2250,12 +2307,13 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             commit=commit,
             global_step=final_step,
         )
-        collected_entries = collect_checkpoint_artifacts(
+        collected_entries = _collect_training_checkpoint(
             runner,
             checkpoint_path=checkpoint_path,
             runtime_identity=artifact_identity,
             exit_codes=exit_codes,
             world_size=plan.world_size,
+            terminal=(stage == 'stage1' and resume_requested and resume_step == final_step),
         )
         if (stage == 'stage1' and not resume_requested
                 and _argument_value(forwarded, '--stage1-variant') == 'v5'):
@@ -2298,6 +2356,13 @@ def _training_main(stage: Literal["stage1", "stage2"], argv: list[str]) -> int:
             raise RuntimeError(
                 f"training attempt incomplete; record={incomplete}: {error}"
             ) from error
+        if cache_exchange is not None and planned_stop is None:
+            from stage1.cache_setup import finish_stage1_run_cache
+            publish_json(log_root / plan.run_id / 'cache-run.json', {
+                'schema': 1, 'run_id': plan.run_id, 'attempt': plan.attempt_id,
+                'completion': cache_completion, 'training_complete': True})
+            if cache_completion == 'train':
+                finish_stage1_run_cache(run_id=plan.run_id, completion='complete', runner=cache_exchange)
         print(json.dumps({"training_witness": str(witness)}, sort_keys=True))
         return 0
     except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as error:
@@ -2474,6 +2539,7 @@ def _evaluate_main(argv: list[str]) -> int:
     )
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--attempt-id", default="initial")
+    parser.add_argument('--stage1-cache-training-run-id')
     parser.add_argument("--model-dir", required=True)
     parser.add_argument("--test-data-path", required=True)
     parser.add_argument("--task-name", required=True)
@@ -2558,15 +2624,76 @@ def _evaluate_main(argv: list[str]) -> int:
             return 0
         commit = _repository_git_stdout(("rev-parse", "HEAD"))
         runner = EvaluationSubprocessRunner(plan, commit=commit)
+        cache_completion_record = None
+        if args.stage1_cache_training_run_id is not None:
+            training_id = args.stage1_cache_training_run_id
+            _validate_identifier('cache training run_id', training_id)
+            cache_completion_record = json.loads((_REPOSITORY_ROOT / 'logs/multinode' / training_id / 'cache-run.json').read_text())
+            if (cache_completion_record.get('run_id') != training_id
+                    or cache_completion_record.get('completion') != 'train-eval'
+                    or cache_completion_record.get('training_complete') is not True):
+                raise ValueError('cache cleanup requires the declared completed training/evaluation boundary')
         summary = run_evaluation(plan, runner)
+        if cache_completion_record is not None:
+            from types import SimpleNamespace
+            from stage1.cache_setup import SSD_ROOT, finish_stage1_run_cache
+            from stage1.cache_transport import SubprocessCacheExchange
+            cache_plan = SimpleNamespace(cluster=plan.cluster or ClusterSpec.default(),
+                run_id=training_id, attempt_id=cache_completion_record['attempt'])
+            exchange = SubprocessCacheExchange(cache_plan, runner,
+                cache_root=SSD_ROOT / training_id,
+                control_dir=_REPOSITORY_ROOT / 'logs/multinode' / training_id / cache_completion_record['attempt'] / 'cache')
+            finish_stage1_run_cache(run_id=training_id, completion='complete', runner=exchange)
     except (OSError, RuntimeError, TypeError, ValueError, json.JSONDecodeError) as error:
         parser.error(str(error))
     print(json.dumps(_json_ready(summary), sort_keys=True))
     return 0
 
 
+def _collect_training_checkpoint(runner, *, checkpoint_path, runtime_identity, exit_codes,
+                                 world_size, terminal=False):
+    if not terminal:
+        return collect_checkpoint_artifacts(runner, checkpoint_path=checkpoint_path,
+            runtime_identity=runtime_identity, exit_codes=exit_codes, world_size=world_size)
+    if dict(exit_codes) != {0: 0, 1: 0}:
+        raise ValueError('terminal checkpoint requires successful supervisors on both nodes')
+    from src.multinode_artifacts import validate_canonical_checkpoint_manifest
+    manifest = runner.read_canonical_artifact_manifest(checkpoint_path, runtime_identity)
+    validate_canonical_checkpoint_manifest(manifest, expected_identity=runtime_identity)
+    return manifest.entries
+
+
+def _prepare_stage1_resume_directory(argv):
+    """Reserve a fresh remote run under the existing checkpoint storage link."""
+    parser = argparse.ArgumentParser(prog='prepare-stage1-resume-directory')
+    parser.add_argument('--run-id', required=True)
+    parser.add_argument('--checkpoint-step', required=True, type=int)
+    args = parser.parse_args(argv)
+    if not _RUN_ID_PATTERN.fullmatch(args.run_id) or args.checkpoint_step <= 0:
+        raise ValueError('invalid matched resume destination')
+    root = _open_trusted_directory((_REPOSITORY_ROOT/'checkpoints').resolve(strict=True))
+    run = None
+    try:
+        os.mkdir(args.run_id, dir_fd=root)
+        run = os.open(args.run_id, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root)
+        os.mkdir(f'checkpoint-{args.checkpoint_step}', dir_fd=run)
+    finally:
+        if run is not None: os.close(run)
+        os.close(root)
+    return 0
+
+
 def _main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == 'prepare-stage1-resume':
+        # Training modules use src/ as their import root. Establish the same
+        # repository-owned paths for this public module CLI without requiring
+        # an outer PYTHONPATH (and use this checkout's patched Transformers).
+        sys.path[:0] = [str(_REPOSITORY_ROOT/'src'), str(_REPOSITORY_ROOT/'transformers/src')]
+        from src.stage1.resume_preparation import preparation_main
+        return preparation_main(argv[1:])
+    if argv and argv[0] == 'prepare-stage1-resume-directory':
+        return _prepare_stage1_resume_directory(argv[1:])
     if argv and argv[0] == "lifecycle-matrix":
         return _lifecycle_matrix_main(argv[1:])
     if argv and argv[0] == "validate-results":

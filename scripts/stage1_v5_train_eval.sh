@@ -5,6 +5,7 @@ cd -- "$repo_root"
 run_id= port= remote_root= remote_host_root= max_steps= settings=
 dry_run=false
 query_mode=legacy history_text_gamma=0.9 history_attention_layers=last
+voff_mode=attention_mask
 query_arguments=()
 while (( $# )); do
     case $1 in
@@ -20,6 +21,9 @@ while (( $# )); do
             (( $# >= 2 )) && [[ -n $2 ]] || { printf 'error: %s requires a value\n' "$1" >&2; exit 2; }
             query_arguments+=("$1" "$2")
             shift 2 ;;
+        --stage1-v5-voff-mode)
+            (( $# >= 2 )) && [[ -n $2 ]] || { printf 'error: %s requires a value\n' "$1" >&2; exit 2; }
+            voff_mode=$2; shift 2 ;;
         --dry-run) dry_run=true; shift ;;
         *) printf 'error: unknown argument: %s\n' "$1" >&2; exit 2 ;;
     esac
@@ -30,7 +34,13 @@ done
 [[ $remote_root == /* && $remote_host_root == /* ]] || { printf 'error: explicit absolute remote roots required\n' >&2; exit 2; }
 # Preserve caller query choices across sourced stale settings.
 readonly -a requested_query_arguments=("${query_arguments[@]}")
+readonly requested_voff_mode=$voff_mode
 if [[ -n $settings ]]; then source "$settings"; fi
+voff_mode=$requested_voff_mode
+case $voff_mode in
+    attention_mask|cross_helper_reverse_topk_independent|cross_helper_reverse_topk_cumulative) ;;
+    *) printf 'error: invalid Stage1-v5 V-off mode\n' >&2; exit 2 ;;
+esac
 query_mode=legacy history_text_gamma=0.9 history_attention_layers=last
 history_requested=false
 for (( i=0; i<${#requested_query_arguments[@]}; i+=2 )); do
@@ -70,6 +80,7 @@ train=("$repo_root/run_multinode_stage1_training.sh" --run-id "$run_id" --zero-s
     --vision-attention-implementation flash_attention_2 --max-seq-length-train 32768 --dataloader-num-workers 0
     --save-strategy steps --save-steps "$max_steps" --final-save)
 train+=(--query_mode "$query_mode")
+train+=(--stage1-v5-voff-mode "$voff_mode")
 if [[ $query_mode == adaptive ]]; then
     unset STAGE1_TEXTUAL_STATES
     train+=(--history_text_gamma "$history_text_gamma" --history_attention_layers "$history_attention_layers")

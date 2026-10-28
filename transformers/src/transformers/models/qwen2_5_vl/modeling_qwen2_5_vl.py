@@ -1835,6 +1835,7 @@ class Qwen2_5_VLCausalLMOutputWithPast(ModelOutput):
     stage2_selected_logits: Optional[torch.FloatTensor] = None
     stage2_sidecar_results: Optional[Tuple[Mapping[str, object], ...]] = None
     stage2_sidecar_stats: Optional[Mapping[str, object]] = None
+    stage1_selected_hidden_states: Optional[torch.FloatTensor] = None
 
 
 QWEN2_5_VL_INPUTS_DOCSTRING = r"""
@@ -1959,6 +1960,11 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
 
     def set_output_embeddings(self, new_embeddings):
         self.lm_head = new_embeddings
+
+    def project_stage1_selected_hidden(self, hidden: torch.Tensor, chunk_positions: int) -> torch.Tensor:
+        if type(chunk_positions) is not int or chunk_positions <= 0:
+            raise ValueError('stage1_selected_chunk_positions must be a positive integer')
+        return torch.cat([self.lm_head(chunk) for chunk in hidden.split(chunk_positions)], dim=0)
 
     def set_decoder(self, decoder):
         self.model = decoder
@@ -2703,6 +2709,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         stage2_selective_logits_only: bool = False,
         stage1_selected_positions: Optional[Tuple[Tuple[int, int], ...]] = None,
         stage1_selected_chunk_positions: int = 128,
+        stage1_capture_selected_hidden: bool = False,
     ) -> Union[Tuple, Qwen2_5_VLCausalLMOutputWithPast]:
         r"""
         Args:
@@ -2721,6 +2728,8 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         resolved_use_cache = use_cache if use_cache is not None else self.config.use_cache
 
+        if stage1_capture_selected_hidden and stage1_selected_positions is None:
+            raise ValueError('Stage1 hidden capture requires explicit selected positions')
         if stage1_selected_positions is not None:
             if type(stage1_selected_chunk_positions) is not int or stage1_selected_chunk_positions <= 0:
                 raise ValueError("stage1_selected_chunk_positions must be a positive integer")
@@ -2952,6 +2961,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             
 
         stage1_selected_logits = None
+        captured_stage1_hidden = None
         if stage1_selected_positions is None:
             logits = self.lm_head(hidden_states)
         else:
@@ -2960,10 +2970,10 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
                 selected_hidden = hidden_states[rows, positions]
             else:
                 selected_hidden = hidden_states.new_empty((0, hidden_states.shape[-1]))
-            stage1_selected_logits = torch.cat([
-                self.lm_head(chunk)
-                for chunk in selected_hidden.split(stage1_selected_chunk_positions)
-            ], dim=0)
+            stage1_selected_logits = self.project_stage1_selected_hidden(
+                selected_hidden, stage1_selected_chunk_positions)
+            if stage1_capture_selected_hidden:
+                captured_stage1_hidden = selected_hidden
             logits = None
 
         loss = None
@@ -2990,6 +3000,7 @@ class Qwen2_5_VLForConditionalGeneration(Qwen2_5_VLPreTrainedModel, GenerationMi
             rope_deltas=self.rope_deltas,
             inputs_embeds=inputs_embeds,
             stage1_selected_logits=stage1_selected_logits,
+            stage1_selected_hidden_states=captured_stage1_hidden,
         )
 
     def prepare_inputs_for_generation(

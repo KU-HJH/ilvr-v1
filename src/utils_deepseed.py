@@ -28,6 +28,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--history_text_gamma", type=float, default=.9)
     parser.add_argument("--history_attention_layers", choices=("last", "last4", "all"), default="last")
     parser.add_argument("--stage1_variant", choices=("standard", "v5"), default="standard")
+    parser.add_argument("--stage1_match_v5_execution", action="store_true")
+    parser.add_argument("--stage1_ce_entropy_top_percent", type=float, default=None)
     parser.add_argument("--stage1_loss_type", choices=("dil-bce-orig", "dil_bce_orig"))
     parser.add_argument("--lambda_preference", type=float)
     parser.add_argument("--lambda_topk_entropy", type=float)
@@ -41,7 +43,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--loss_chunk_positions", type=int)
     parser.add_argument("--stage1_v5_selection", choices=("all", "clean", "voff", "gap", "intersection"))
     parser.add_argument("--stage1_v5_text_kl_weight", type=float)
+    from stage1.v5_config import V5_VOFF_MODES
+    parser.add_argument("--stage1_v5_voff_mode", choices=V5_VOFF_MODES)
     parser.add_argument("--stage1_v5_debug", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--stage1_cache', choices=('off', 'run'), default='off')
+    parser.add_argument('--stage1_cache_completion', choices=('train', 'train-eval'), default='train')
+    parser.add_argument('--stage1_runtime_profile', choices=('default', 'native-ema-0180'), default='default')
+    parser.add_argument('--stage1_cache_validation', choices=('payload', 'correctness', 'performance'))
+    parser.add_argument('--stage1_cache_validation_stop', type=int, choices=(1, 2), default=2)
+    parser.add_argument('--stage1_check_policy', choices=('production', 'validation', 'legacy'))
     parser.add_argument("--task", type=str, default="vsp-spatial-reasoning", choices=["vsp-spatial-reasoning", "vsp-spatial-planning", "blink-jigsaw", "sat","vsp-spatial-planning-cot",'zebra-cot'])
     parser.add_argument("--test_data_path", type=str, default=None, help="Path to the test data jsonl file for evaluation after training.")
     parser.add_argument("--latent_size", type=int, default=8)
@@ -201,6 +211,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max_train_samples", type=int)
     parser.add_argument("--max_steps", type=int, default=-1)
     parser.add_argument("--stage2_stop_after_checkpoint", type=int)
+    parser.add_argument("--stage1_stop_after_checkpoint", type=int)
     parser.add_argument("--benchmark_run_config")
     parser.add_argument("--benchmark_evidence_path")
     parser.add_argument("--benchmark_source_data_path")
@@ -236,6 +247,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     args = parser.parse_args(raw_argv)
     _resolve_stage1_v5_args(parser, args, raw_argv)
+    if args.stage1_ce_entropy_top_percent is not None:
+        from stage1.entropy_ce import validate_ce_entropy_percent
+        args.stage1_ce_entropy_top_percent = validate_ce_entropy_percent(args.stage1_ce_entropy_top_percent)
+        if args.stage != 'stage1' or args.stage1_variant != 'standard' or not args.stage1_match_v5_execution:
+            raise ValueError('CE entropy selection requires matched standard Stage1')
+    if args.stage1_match_v5_execution and (args.stage != 'stage1' or args.stage1_variant != 'standard'):
+        raise ValueError('matched execution requires standard Stage1')
     if args.vision_attention_implementation is None:
         args.vision_attention_implementation = args.attention_implementation
     if args.log_file is None:
@@ -367,6 +385,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         )
     elif args.tuning_method_explicit:
         raise ValueError("--tuning_method is only valid for Stage 1 or Stage 2")
+    if args.stage != 'stage1' and (args.stage1_cache != 'off' or args.stage1_check_policy is not None
+            or args.stage1_runtime_profile != 'default' or args.stage1_cache_completion != 'train'
+            or args.stage1_cache_validation is not None):
+        raise ValueError('Stage1 cache/check policy requires Stage1')
+    stop = args.stage1_stop_after_checkpoint
+    if stop is not None and (args.stage != 'stage1'
+            or not args.stage1_match_v5_execution or args.stage1_variant != 'standard'
+            or not 0 < stop < args.max_steps):
+        raise ValueError('Stage1 checkpoint stop requires matched standard scope and 0 < stop < full budget')
     return args
 
 
@@ -378,7 +405,7 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
         'lambda_entropy', 'preference_topk_k', 'preference_topk_mode',
         'topk_include_gt', 'lambda_topk_mass', 'lambda_topk_chosen_mass',
         'preference_entropy_top_percent', 'loss_chunk_positions',
-        'stage1_v5_selection', 'stage1_v5_text_kl_weight',
+        'stage1_v5_selection', 'stage1_v5_text_kl_weight', 'stage1_v5_voff_mode',
     }
     # Resolve saved variant/objective BEFORE any eager fresh-option validation.
     # Omitted entropy support and execution options inherit their exact identity.
@@ -471,10 +498,12 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
     if is_v5:
         config = args.stage1_v5_config
         args.stage1_loss_type = config.loss_type
-        for name in public - {'stage1_loss_type', 'stage1_v5_selection', 'stage1_v5_text_kl_weight'}:
+        for name in public - {'stage1_loss_type', 'stage1_v5_selection', 'stage1_v5_text_kl_weight',
+                              'stage1_v5_voff_mode'}:
             setattr(args, name, getattr(config, name))
         args.stage1_v5_selection = config.selection
         args.stage1_v5_text_kl_weight = config.text_kl_weight
+        args.stage1_v5_voff_mode = config.voff_mode
         args.step_dpo_beta = args.step_preference_beta = config.beta
         args.step_preference_margin = config.margin
         args.step_preference_weight = config.lambda_preference

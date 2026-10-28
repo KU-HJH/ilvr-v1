@@ -116,7 +116,26 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         if not isinstance(window, V5Window) or not isinstance(metadata, V5BatchMetadata):
             raise ValueError('missing v5 metadata/window')
         working = {k:v for k,v in inputs.items() if k not in ('stage1_v5_window','stage1_v5_metadata')}
-        model_inputs, _, targets = self._prepare_stage1_loss_inputs(working)
+        need_voff = self.v5_config.lambda_topk_entropy > 0 or self.v5_config.selection in ('voff','gap','intersection')
+        need_textoff = self.v5_config.text_kl_weight > 0
+        replacing = need_voff and bool(metadata.query_keys) and self.v5_config.voff_mode != 'attention_mask'
+        model_inputs, source_metadata, targets = self._prepare_stage1_loss_inputs(working,
+            **({'voff_mode': self.v5_config.voff_mode} if replacing else {}))
+        replacements = {}
+        if replacing:
+            spans = {(row, index): span for row, sample in enumerate(source_metadata.samples)
+                     for index, span in enumerate(sample.latent_spans)}
+            for block in targets.rejected_blocks:
+                key = (block.batch_index, block.block_index)
+                if key not in spans or key in replacements or block.positions != spans[key].latent_positions:
+                    raise ValueError('replacement block ownership mismatch')
+                replacements[key] = block.values
+            if set(replacements) != set(spans):
+                raise ValueError('replacement block ownership is incomplete')
+            replacements = {(row, spans[(row, index)].start, spans[(row, index)].end): values
+                            for (row, index), values in replacements.items()}
+            if set(replacements) != {(b.batch_index, b.start, b.end) for b in metadata.blocks}:
+                raise ValueError('replacement metadata ownership mismatch')
         labels = model_inputs['labels']
         forward_inputs = dict(model_inputs, use_cache=False, return_dict=True)
         if labels.shape[0] > 1:
@@ -135,14 +154,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                  if keys else outputs.logits.reshape(-1,outputs.logits.shape[-1])[:0])
         reference, voff, textoff = clean.detach(), None, None
         if keys:
-            # Own preparation from original token/image tensors and reference
-            # modules; never reuse F embeddings/KV. Detached helper is shared.
-            reference_inputs = dict(model_inputs, use_cache=False, return_dict=True,
-                stage1_selected_positions=keys,
-                stage1_selected_chunk_positions=self.v5_config.loss_chunk_positions)
-            reference_inputs.pop('labels', None)
-            with torch.no_grad():
-                reference = self.ema_teacher.model(**reference_inputs).stage1_selected_logits
+            reference = self._stage1_reference_logits(model_inputs, keys, source_metadata)
             attention = {}
             for key, positions in zip(keys, candidates):
                 row = clean.new_zeros(labels.shape[1], dtype=torch.float32)
@@ -150,10 +162,9 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 attention[key] = row
             selected = select_v5_text_keys(metadata, attention, clean, reference, self.v5_config, validate=self.stage1_v5_debug)
             blocks = tuple(V5ReplayBlock(b.batch_index,b.start,b.end,b.target_positions,b.target_ids,
-                           tuple(selected[(b.batch_index,q)] for q in b.query_positions))
+                           tuple(selected[(b.batch_index,q)] for q in b.query_positions),
+                           replacements.get((b.batch_index,b.start,b.end)))
                            for b in metadata.blocks)
-            need_voff = self.v5_config.lambda_topk_entropy > 0 or self.v5_config.selection in ('voff','gap','intersection')
-            need_textoff = self.v5_config.text_kl_weight > 0
             if need_voff or need_textoff:
                 # These decoder calls intentionally bypass distributed model
                 # wrappers. ZeRO1 leaves parameters replicated; OFF/reference
@@ -161,7 +172,9 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 with execution.graph('packed'):
                     off = run_v5_packed_replay(qwen.model,qwen.lm_head,trace,blocks,
                         execution=execution,need_voff=need_voff,need_textoff=need_textoff,
-                        chunk_positions=self.v5_config.loss_chunk_positions)
+                        chunk_positions=self.v5_config.loss_chunk_positions,
+                        **({'voff_mode': self.v5_config.voff_mode}
+                           if self.v5_config.voff_mode != 'attention_mask' else {}))
                 voff, textoff = off.voff_logits, off.textoff_logits
         sums = compute_v5_loss_sums(clean, reference, voff, textoff, metadata, self.v5_config,
             validate=self.stage1_v5_debug, collect_diagnostics=self.stage1_v5_debug)
@@ -175,7 +188,9 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         if self.stage1_v5_debug and not bool(torch.isfinite(loss.detach()).all()):
             raise FloatingPointError('Stage1-v5 loss is nonfinite')
         self._latest_stage1_diagnostics = {
-            **sums.diagnostics, 'ce_loss':ce.detach(), 'alignment_loss':alignment.detach(),
+            **sums.diagnostics,
+            **{key:value for key,value in targets.diagnostics.items() if key.startswith('rejected_')},
+            'ce_loss':ce.detach(), 'alignment_loss':alignment.detach(),
             'total_loss':loss.detach(), 'auxiliary_scale':loss.new_tensor(block_scale),
             'dil_scale':loss.new_tensor(dil_scale),
             'global_dil_tokens':loss.new_tensor(window.global_dil_tokens),
@@ -211,6 +226,45 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 raise error
             raise RuntimeError('Stage1-v5 publication failed on another rank')
         self.accelerator.wait_for_everyone()
+
+    @torch.no_grad()
+    def _stage1_reference_logits(self, model_inputs, keys, source_metadata):
+        cache = getattr(self, 'run_cache', None)
+        enabled = cache is not None and cache.plan.reference_hidden
+        if enabled and (self.ema_teacher.decay != 1. or cache.plan.helper != 'targets'):
+            raise ValueError('reference cache requires fixed helper targets and invariant full inputs')
+        if enabled and source_metadata.batch_size != 1:
+            raise ValueError('reference cache requires the supported fixed microbatch-1 geometry')
+        chunks = self.v5_config.loss_chunk_positions
+        if enabled and cache.phase.value == 1:
+            from .cache_payloads import restore_teacher_forward_state
+            record = cache.read('reference', source_metadata.samples[0].source_index)
+            if (record.get('kind') != 'reference' or record['positions'] != tuple(q for _, q in keys)
+                    or record['sequence_length'] != source_metadata.sequence_length
+                    or record['chunk_positions'] != chunks
+                    or record['hidden'].shape[0] != len(keys)):
+                raise ValueError('cached reference query/projection geometry differs')
+            owner = resolve_qwen2_5_vl_model(self.ema_teacher.model)
+            restore_teacher_forward_state(self.ema_teacher.model, record['forward_state'])
+            hidden = record['hidden'].to(device=next(owner.parameters()).device)
+            return owner.project_stage1_selected_hidden(hidden, chunks)
+        # Original token/image preparation and reference owner; never F's KV or
+        # embeddings. Capture only already selected final hidden rows.
+        reference_inputs = dict(model_inputs, use_cache=False, return_dict=True,
+            stage1_selected_positions=keys, stage1_selected_chunk_positions=chunks)
+        reference_inputs.pop('labels', None)
+        if enabled:
+            reference_inputs['stage1_capture_selected_hidden'] = True
+        output = self.ema_teacher.model(**reference_inputs)
+        if enabled:
+            from .cache_payloads import capture_teacher_forward_state
+            cache.publish('reference', source_metadata.samples[0].source_index, {
+                'kind': 'reference', 'positions': tuple(q for _, q in keys),
+                'sequence_length': source_metadata.sequence_length, 'chunk_positions': chunks,
+                'hidden': output.stage1_selected_hidden_states,
+                'forward_state': capture_teacher_forward_state(self.ema_teacher.model),
+            })
+        return output.stage1_selected_logits
 
     def save_model(self, output_dir=None, _internal_call=False):
         if not self._v5_contract_ready:
@@ -274,13 +328,17 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         layers = (resolve_query_layers(query_config.attention_layers, len(qwen.model.layers))
                   if query_config.mode == 'adaptive' else ())
         execution['query_config'] = query_execution_config(query_config, layers)
+        from .v5_donors import select_reverse_topk_donors
+        from transformers.models.qwen2_5_vl.stage1_v5_replay import run_v5_packed_replay
         execution['source_sha256'] = {
             key:hashlib.sha256(Path(inspect.getsourcefile(cls)).read_bytes()).hexdigest()
             for key,cls in (('v5_trainer',CustomTrainerStage1V5),
                             ('stage1_trainer',CustomTrainerStage1),('transformers_trainer',Trainer),
                             ('query',Stage1QueryConfig),('targets',Stage1TeacherTargetBuilder),
                             ('history_attention',ReducedHistoryAttentionObserver),
-                            ('history_teacher',HistoryPrefixAdapter))}
+                            ('history_teacher',HistoryPrefixAdapter),
+                            ('v5_donors',select_reverse_topk_donors),
+                            ('v5_replay',run_v5_packed_replay))}
         return build_v5_contract(self.v5_config,self.v5_reference_identity,
             ce_weight=self.ce_weight,sim_weight=self.sim_weight,schedule=schedule,execution=execution)
 

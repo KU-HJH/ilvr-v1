@@ -89,11 +89,25 @@ def _base_identity(base_path: Path) -> tuple[str, dict[str, tuple[Path, str]]]:
     return _hash_files(base_path, identity_files), keys
 
 
-def _processor_identity(processor) -> str:
+def _processor_identity(processor, *, normalize_added_tokens: bool = True) -> str:
     # Serialized tokenizer vocabulary/special mapping, image processing and templates.
     with tempfile.TemporaryDirectory(prefix='stage1-v5-processor-') as temporary:
         directory = Path(temporary)
         processor.save_pretrained(directory)
+        # HF reload may turn AddedToken entries in the special-token map into
+        # strings while retaining their exact flags in added_tokens_decoder.
+        # Authenticate one equivalent representation, including those flags.
+        mapping_path = directory / 'special_tokens_map.json'
+        if normalize_added_tokens and mapping_path.is_file():
+            mapping = json.loads(mapping_path.read_text())
+            values = mapping.get('additional_special_tokens', [])
+            decoder = getattr(getattr(processor, 'tokenizer', None), 'added_tokens_decoder', {})
+            states = {token.content: token.__getstate__() for token in decoder.values()}
+            normalized = [{key: value for key, value in states[item].items() if key != 'special'}
+                          if isinstance(item, str) and item in states else item for item in values]
+            if normalized != values:
+                mapping['additional_special_tokens'] = normalized
+                mapping_path.write_text(json.dumps(mapping, indent=2, sort_keys=True, ensure_ascii=False) + '\n')
         files = [p for p in directory.rglob('*') if p.is_file()]
         if not files:
             raise ValueError('processor serialization is empty')
@@ -298,7 +312,8 @@ def restore_v5_reference(teacher: Stage1EmaTeacher, student: nn.Module, processo
     base_digest, keys = _base_identity(Path(base_path))
     if base_digest != expected.base_content_sha256:
         raise ValueError('original base content identity mismatch')
-    if _processor_identity(processor) != expected.processor_sha256:
+    if (_processor_identity(processor) != expected.processor_sha256
+            and _processor_identity(processor, normalize_added_tokens=False) != expected.processor_sha256):
         raise ValueError('processor content identity mismatch')
     if teacher.parameter_names != expected.selected_parameter_names:
         raise ValueError('selected reference parameter identity mismatch')

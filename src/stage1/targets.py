@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import MutableMapping, Sequence
 
@@ -22,6 +23,7 @@ from stage1.types import (
     Stage1BatchMetadata,
     Stage1SampleMetadata,
     Stage1TeacherTargets,
+    Stage1RejectedLatentBlock,
 )
 
 
@@ -43,6 +45,7 @@ class Stage1TeacherTargetBuilder:
         validate: bool = True,
         collect_diagnostics: bool = True,
         query_config: Stage1QueryConfig | None = None,
+        run_cache=None,
     ) -> None:
         if not math.isfinite(coverage_p) or not 0.0 < coverage_p <= 1.0:
             raise ValueError("coverage_p must be finite and in (0, 1]")
@@ -55,6 +58,7 @@ class Stage1TeacherTargetBuilder:
         self.query_config = query_config or Stage1QueryConfig()
         self.validate = bool(validate)
         self.collect_diagnostics = bool(collect_diagnostics)
+        self.run_cache = run_cache
         self.tokenizer = tokenizer
         self.coverage_p = float(coverage_p)
         self.image_pool_k = int(image_pool_k)
@@ -98,25 +102,58 @@ class Stage1TeacherTargetBuilder:
         teacher: nn.Module,
         batch: MutableMapping[str, object],
         metadata: Stage1BatchMetadata,
+        *, voff_mode: str = 'attention_mask',
     ) -> Stage1TeacherTargets:
         """Consume helper tensors and return row-major targets for the batch."""
+        from .v5_config import V5_VOFF_MODES
+        if voff_mode not in V5_VOFF_MODES:
+            raise ValueError('unsupported Stage1-v5 voff_mode')
+        cache = self.run_cache
+        sources = batch.pop('stage1_cache_sources', None)
+        if cache is not None:
+            # PyTorch's pinned-memory collator preserves values but converts
+            # ordinary tuples to lists; ownership is the ordered IDs, not type.
+            sources = tuple(sources) if isinstance(sources, (tuple, list)) else None
+            if sources != tuple(sample.source_index for sample in metadata.samples):
+                raise ValueError('cache source descriptors must match current samples')
+            if cache.phase.value == 1 and cache.plan.helper == 'targets':
+                from .cache_payloads import decode_target_batch, restore_teacher_forward_state
+                records = tuple(cache.read('targets', index) for index in sources)
+                batch.pop('pixel_values_latent', None)
+                batch.pop('image_grid_thw_latent')
+                targets = decode_target_batch(records, metadata,
+                    device=self._teacher_device(teacher, batch['input_ids'].device))
+                executed = [record['forward_state'] for record in records if record['forward_state'] is not None]
+                if executed:
+                    restore_teacher_forward_state(teacher, executed[-1])
+                if self.collect_diagnostics:
+                    diagnostics = self._diagnostics(targets.latent_values)
+                    if targets.rejected_blocks:
+                        for kind in ('helper', 'original'):
+                            diagnostics[f'rejected_{kind}_blocks'] = targets.latent_values.new_tensor(
+                                sum(b.donor_kind == kind for b in targets.rejected_blocks), dtype=torch.long)
+                    targets = replace(targets, diagnostics=diagnostics)
+                return targets
+        elif sources is not None:
+            raise ValueError('cached preprocessing requires its bound target cache')
+        vision_replay = cache is not None and cache.phase.value == 1 and cache.plan.helper == 'vision'
+        rejected_blocks = []
         missing_helpers = [
             key
             for key in ("pixel_values_latent", "image_grid_thw_latent")
-            if key not in batch
+            if key not in batch and not (vision_replay and key == 'pixel_values_latent')
         ]
         if missing_helpers:
             raise KeyError(f"missing Stage 1 helper tensors: {missing_helpers}")
-        helper_pixels = batch.pop("pixel_values_latent")
+        helper_pixels = batch.pop("pixel_values_latent", None)
         helper_grid = batch.pop("image_grid_thw_latent")
 
         input_ids = self._require_tensor(batch, "input_ids")
         attention_mask = self._require_tensor(batch, "attention_mask")
         original_pixels = self._require_tensor(batch, "pixel_values")
         original_grid = self._require_tensor(batch, "image_grid_thw")
-        helper_pixels = self._require_tensor_value(
-            helper_pixels, "pixel_values_latent"
-        )
+        if not vision_replay:
+            helper_pixels = self._require_tensor_value(helper_pixels, 'pixel_values_latent')
         helper_grid = self._require_tensor_value(
             helper_grid, "image_grid_thw_latent"
         )
@@ -143,9 +180,9 @@ class Stage1TeacherTargetBuilder:
         teacher_attention = attention_mask.to(device)
         original_pixels = original_pixels.to(device)
         original_grid = original_grid.to(device)
-        helper_pixels = helper_pixels.to(
-            device=device, dtype=getattr(teacher.visual, "dtype", helper_pixels.dtype)
-        )
+        if helper_pixels is not None:
+            helper_pixels = helper_pixels.to(
+                device=device, dtype=getattr(teacher.visual, 'dtype', helper_pixels.dtype))
         helper_grid = helper_grid.to(device)
 
         image_token_id = self._teacher_image_token_id(teacher)
@@ -155,6 +192,7 @@ class Stage1TeacherTargetBuilder:
         selected_counts: list[tuple[int, ...]] = []
         selected_candidate_indices: list[tuple[tuple[int, ...], ...]] = []
         selection_margins: list[tuple[float | str, ...]] = []
+        forward_states = []
         for sample_index, sample in enumerate(metadata.samples):
             (
                 sample_values,
@@ -184,7 +222,7 @@ class Stage1TeacherTargetBuilder:
                         sample,
                         "original grid",
                     ),
-                    helper_pixels=self._owned_slice(
+                    helper_pixels=None if helper_pixels is None else self._owned_slice(
                         helper_pixels,
                         sample.helper_pixel_range,
                         sample,
@@ -197,6 +235,8 @@ class Stage1TeacherTargetBuilder:
                         "helper grid",
                     ),
                     image_token_id=image_token_id,
+                    **({'rejected_blocks': rejected_blocks, 'batch_index': sample_index}
+                       if voff_mode != 'attention_mask' else {}),
                 )
             )
             packed.extend(sample_values)
@@ -204,6 +244,10 @@ class Stage1TeacherTargetBuilder:
             selected_counts.append(block_counts)
             selected_candidate_indices.append(block_indices)
             selection_margins.append(block_margins)
+            if cache is not None and cache.plan.helper == 'targets':
+                from .cache_payloads import capture_teacher_forward_state
+                forward_states.append(None if self.query_config.mode == 'adaptive' and not sample.latent_spans
+                                      else capture_teacher_forward_state(teacher))
             for span, selected_count in zip(sample.latent_spans, block_counts):
                 if selected_count:
                     latent_mask[
@@ -217,14 +261,40 @@ class Stage1TeacherTargetBuilder:
             raise RuntimeError(
                 "row-major latent target count does not match latent mask"
             )
-        return Stage1TeacherTargets(
+        diagnostics = self._diagnostics(latent_values) if self.collect_diagnostics else {}
+        if rejected_blocks and self.collect_diagnostics:
+            for kind in ('helper', 'original'):
+                diagnostics[f'rejected_{kind}_blocks'] = latent_values.new_tensor(
+                    sum(b.donor_kind == kind for b in rejected_blocks), dtype=torch.long)
+        targets = Stage1TeacherTargets(
             latent_values=latent_values,
             latent_mask=latent_mask,
             selected_counts=tuple(selected_counts),
-            diagnostics=self._diagnostics(latent_values) if self.collect_diagnostics else {},
+            diagnostics=diagnostics,
             selected_candidate_indices=tuple(selected_candidate_indices),
             selection_margins=tuple(selection_margins),
+            rejected_blocks=tuple(rejected_blocks),
         )
+        if cache is not None and cache.plan.helper == 'targets':
+            from .cache_payloads import encode_target_sample
+            for row, sample in enumerate(metadata.samples):
+                cache.publish('targets', sample.source_index, encode_target_sample(
+                    targets, metadata, row, forward_state=forward_states[row]))
+        return targets
+
+    def _helper_visual(self, teacher, sample, pixels, grid):
+        cache = self.run_cache
+        if cache is not None and cache.plan.helper == 'vision' and cache.phase.value == 1:
+            record = cache.read('vision', sample.source_index)
+            if record.get('kind') != 'vision' or len(record['counts']) != grid.shape[0]:
+                raise ValueError('cached vision partitions do not match helper geometry')
+            return record['features'].to(device=grid.device), record['counts']
+        features = teacher.visual(pixels, grid_thw=grid)
+        counts = self._visual_token_counts(grid, teacher)
+        if cache is not None and cache.plan.helper == 'vision':
+            cache.publish('vision', sample.source_index,
+                {'kind': 'vision', 'features': features, 'counts': counts})
+        return features, counts
 
     def _build_sample(
         self,
@@ -238,6 +308,7 @@ class Stage1TeacherTargetBuilder:
         helper_pixels,
         helper_grid,
         image_token_id,
+        rejected_blocks=None, batch_index=0,
     ):
         build_sample = (self._build_sample_adaptive
                         if self.query_config.mode == "adaptive"
@@ -247,6 +318,8 @@ class Stage1TeacherTargetBuilder:
             sample_attention=sample_attention, original_pixels=original_pixels,
             original_grid=original_grid, helper_pixels=helper_pixels,
             helper_grid=helper_grid, image_token_id=image_token_id,
+            **({'rejected_blocks': rejected_blocks, 'batch_index': batch_index}
+               if rejected_blocks is not None else {}),
         )
 
     def _build_sample_legacy(
@@ -261,6 +334,7 @@ class Stage1TeacherTargetBuilder:
         helper_pixels,
         helper_grid,
         image_token_id,
+        rejected_blocks=None, batch_index=0,
     ):
         text_outputs = teacher(
             input_ids=sample_ids,
@@ -277,9 +351,9 @@ class Stage1TeacherTargetBuilder:
             teacher, text_outputs, sample_ids
         )
         if helper_grid.shape[0]:
-            helper_features = teacher.visual(helper_pixels, grid_thw=helper_grid)
+            helper_features, helper_counts = self._helper_visual(teacher, sample, helper_pixels, helper_grid)
             helper_images = self._split_visual_features(
-                helper_features, helper_grid, teacher
+                helper_features, helper_grid, teacher, counts=helper_counts
             )
         else:
             helper_images = ()
@@ -365,6 +439,11 @@ class Stage1TeacherTargetBuilder:
                 query,
                 max_count=len(span.latent_positions),
             )
+            if rejected_blocks is not None:
+                rejected_blocks.append(self._rejected_block(
+                    teacher, sample, helper_images, query, block_index, batch_index,
+                    getattr(text_outputs, 'inputs_embeds', None), sample_ids,
+                    original_grid, image_token_id))
             packed.append(selected)
             block_counts.append(int(selected.shape[0]))
             block_indices.append(indices)
@@ -399,6 +478,7 @@ class Stage1TeacherTargetBuilder:
         helper_pixels,
         helper_grid,
         image_token_id,
+        rejected_blocks=None, batch_index=0,
     ):
         qwen = resolve_qwen2_5_vl_model(teacher)
         owner = getattr(teacher, "module", teacher)
@@ -465,8 +545,8 @@ class Stage1TeacherTargetBuilder:
         if (len(sample.helper_to_block) != helper_grid.shape[0]
                 or helper_grid.ndim != 2 or helper_grid.shape[1] != 3
                 or bool((helper_grid <= 0).any())
-                or helper_pixels.ndim != 2
-                or helper_pixels.shape[0] != int(helper_grid.prod(dim=1).sum())
+                or (helper_pixels is not None and (helper_pixels.ndim != 2
+                    or helper_pixels.shape[0] != int(helper_grid.prod(dim=1).sum())))
                 or any(type(i) is not int or not 0 <= i < len(sample.latent_spans)
                        for i in sample.helper_to_block)
                 or set(sample.helper_to_block) != set(range(len(sample.latent_spans)))):
@@ -486,10 +566,10 @@ class Stage1TeacherTargetBuilder:
         adapter = HistoryPrefixAdapter(
             teacher, input_ids=sample_ids, attention_mask=sample_attention,
             original_pixels=original_pixels, original_grid=original_grid)
-        helper_features = teacher.visual(helper_pixels, grid_thw=helper_grid)
-        if not bool(torch.isfinite(helper_features).all()):
+        helper_features, helper_counts = self._helper_visual(teacher, sample, helper_pixels, helper_grid)
+        if self.validate and not bool(torch.isfinite(helper_features).all()):
             raise FloatingPointError("teacher helper visual features must be finite")
-        helper_images = self._split_visual_features(helper_features, helper_grid, teacher)
+        helper_images = self._split_visual_features(helper_features, helper_grid, teacher, counts=helper_counts)
         candidates = self._sample_helper_candidates(helper_images, sample)
         if any(values.shape[0] == 0 for values in candidates):
             raise ValueError("adaptive history requires nonempty candidates for every block")
@@ -500,7 +580,7 @@ class Stage1TeacherTargetBuilder:
         prompt = adapter.prepare(assistant_end, ())
         prompt_hidden = adapter.forward(prompt).last_hidden_state
         self._hidden_states(SimpleNamespace(hidden_states=prompt_hidden),
-                            (1, assistant_end), validate=True)
+                            (1, assistant_end), validate=self.validate)
         user_query = self._user_query(
             teacher=teacher, sample=sample, sample_ids=prompt.input_ids[0],
             hidden_pre=prompt_hidden[0], hidden_last=prompt_hidden[0],
@@ -520,7 +600,7 @@ class Stage1TeacherTargetBuilder:
             ) as observer:
                 hidden = adapter.forward(prefix).last_hidden_state
             if (hidden.shape != prefix.inputs_embeds.shape
-                    or not bool(torch.isfinite(hidden).all())):
+                    or (self.validate and not bool(torch.isfinite(hidden).all()))):
                 raise ValueError("adaptive prefix hidden states must be finite [1,S,H]")
             current_mean = (hidden[0, list(text_spans[index])].float().mean(0, keepdim=True)
                             if text_spans[index] else None)
@@ -531,9 +611,13 @@ class Stage1TeacherTargetBuilder:
             query = compose_history_query(user_query, text_summary, latent_sum, mass).query
             selected, indices, margin = self._select(
                 candidates[index], query, max_count=len(span.latent_positions))
+            if rejected_blocks is not None:
+                rejected_blocks.append(self._rejected_block(
+                    teacher, sample, helper_images, query, index, batch_index,
+                    prompt.inputs_embeds, prompt.input_ids, original_grid, image_token_id))
             if (selected.ndim != 2 or not 0 < selected.shape[0] <= len(span.latent_positions)
                     or selected.shape[1] != hidden.shape[-1]
-                    or not bool(torch.isfinite(selected).all())):
+                    or (self.validate and not bool(torch.isfinite(selected).all()))):
                 raise ValueError("adaptive selection must contain finite raw first-Kstar targets")
             count = int(selected.shape[0])
             ledger.append(HistorySelection(index, span.latent_positions[:count],
@@ -544,6 +628,49 @@ class Stage1TeacherTargetBuilder:
             block_margins.append(margin)
         return (packed, tuple(block_counts), tuple(block_indices), tuple(block_margins),
                 prompt_hidden[0, :0])
+
+    def _rejected_block(self, teacher, sample, helper_images, query, block_index,
+                        batch_index, original_embeddings, original_ids, original_grid,
+                        image_token_id):
+        from .v5_donors import select_reverse_topk_donors
+        prefix = f'source_index={sample.source_index} block={block_index}: '
+        span = sample.latent_spans[block_index]
+        if (not span.latent_positions
+                or span.latent_positions != tuple(range(span.start + 1, span.end))
+                or len(sample.helper_image_ids) != len(helper_images)):
+            raise ValueError(prefix + 'replacement requires complete body and helper image identities')
+        excluded = {identity for identity, owner in zip(sample.helper_image_ids, sample.helper_to_block)
+                    if owner == block_index}
+        original_candidates = ()
+        if not any(identity not in excluded for identity in sample.helper_image_ids):
+            # This must be the prepared teacher feature tensor, never the generic
+            # special-token embedding fallback used by the historical query path.
+            if (not isinstance(original_embeddings, torch.Tensor)
+                    or original_embeddings.ndim != 3
+                    or original_embeddings.shape[:2] != original_ids.shape
+                    or original_embeddings.shape[0] != 1):
+                raise ValueError(prefix + 'missing projected original image embeddings')
+            merge = int(teacher.visual.spatial_merge_size)
+            if (original_grid.dtype != torch.long or original_grid.ndim != 2
+                    or original_grid.shape[-1] != 3 or merge <= 0
+                    or bool((original_grid <= 0).any())
+                    or bool((original_grid[:, 1:] % merge != 0).any())):
+                raise ValueError(prefix + 'invalid projected original image grid')
+            counts = self._visual_token_counts(original_grid, teacher)
+            values = original_embeddings[0, original_ids[0] == image_token_id]
+            if (not counts or sum(counts) != values.shape[0]
+                    or len(sample.original_image_ids) != len(counts)
+                    or any(not isinstance(i, str) or not i for i in sample.original_image_ids)):
+                raise ValueError(prefix + 'projected original image feature ownership mismatch')
+            original_candidates = tuple(self._maybe_group_for_helper(v, self.helper_group_L)
+                                        for v in values.split(counts))
+        grouped = tuple(self._maybe_group_for_helper(v, self.helper_group_L) for v in helper_images)
+        selected = select_reverse_topk_donors(grouped, sample.helper_image_ids,
+            sample.helper_to_block, block_index, original_candidates, query,
+            count=len(span.latent_positions), source_index=sample.source_index)
+        return Stage1RejectedLatentBlock(batch_index, block_index, span.latent_positions,
+            selected.values, selected.donor_kind, selected.image_indices,
+            selected.candidate_indices, f'clean_teacher_{self.query_config.mode}')
 
     @staticmethod
     def _owned_slice(tensor, owned_range, sample, role):
@@ -642,12 +769,12 @@ class Stage1TeacherTargetBuilder:
         counts = grid[:, 0] * (grid[:, 1] // merge) * (grid[:, 2] // merge)
         return tuple(int(count.item()) for count in counts)
 
-    def _split_visual_features(self, features, grid_thw, teacher):
+    def _split_visual_features(self, features, grid_thw, teacher, *, counts=None):
         if not isinstance(features, torch.Tensor) or features.ndim != 2:
             raise ValueError("teacher helper visual features must have shape [N, H]")
         if self.validate and not bool(torch.isfinite(features).all().item()):
             raise FloatingPointError("teacher helper visual features must be finite")
-        counts = self._visual_token_counts(grid_thw, teacher)
+        counts = self._visual_token_counts(grid_thw, teacher) if counts is None else counts
         if sum(counts) != features.shape[0]:
             raise ValueError(
                 "teacher helper feature rows must match helper image grids"

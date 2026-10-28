@@ -563,3 +563,28 @@ def test_admission_rejects_unbound_common_profile_and_learning_rate(mutation):
     else: records[0]['continuations'][1]['learning_rates']=[2e-5]
     with pytest.raises(ValueError):
         api().validate_rank_records(records,run_id='v5-protocol',expected_geometry=[geometry_row()],audited=audited)
+
+
+def test_admission_authenticates_old_wire_shape_then_compares_resolved_mask_objective():
+    """A new config default must not reject valid old mask-profile admission."""
+    from copy import deepcopy
+    from dataclasses import replace
+    from stage1.v5_config import Stage1V5Config
+    from stage1.v5_reference import V5ReferenceIdentity
+    from stage1.v5_resume import build_v5_contract
+    audited,binding=binding_fixture()
+    before=deepcopy(binding)
+    assert 'voff_mode' not in binding['contract']['config']
+    api().validate_runtime_binding(audited,binding)
+    assert binding==before  # authentication must not inject defaults into saved wire data
+    # This admission protocol still describes its original fixed mask profile;
+    # resolving defaults must not broaden it to a replacement objective.
+    old=binding['contract']
+    replacement=build_v5_contract(replace(Stage1V5Config(lambda_topk_entropy=.1,
+        preference_topk_k=50),voff_mode='cross_helper_reverse_topk_cumulative'),
+        V5ReferenceIdentity(**old['reference']),**old['coefficients'],
+        schedule=old['schedule'],execution=old['execution'])
+    with pytest.raises(ValueError,match='different resolved v5 objective'):
+        api().validate_contract_profile(replacement,audited)
+    old['config']['voff_mode']='attention_mask'
+    with pytest.raises(ValueError):api().validate_runtime_binding(audited,binding)

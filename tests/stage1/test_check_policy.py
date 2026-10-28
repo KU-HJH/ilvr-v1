@@ -1,0 +1,123 @@
+"""Production skips audits while optimizer/EMA semantics and live noise survive."""
+import importlib
+
+import pytest
+import torch
+
+from tests.stage1.test_trainer import (
+    CountingStudent, CountingTargetBuilder, make_batch, make_deepspeed_trainer,
+    make_trainer,
+)
+
+
+def test_policy_preserves_saved_behavior_and_restricts_validation():
+    assert importlib.util.find_spec('stage1.run_cache'), 'check policy is missing'
+    from stage1.run_cache import resolve_stage1_check_policy as resolve
+    assert resolve(requested=None, saved=None, validation=False) == 'production'
+    assert resolve(requested=None, saved={}, validation=False) == 'legacy'
+    assert resolve(requested=None, saved={'check_policy': 'production'}, validation=False) == 'production'
+    assert resolve(requested='validation', saved=None, validation=True) == 'validation'
+    with pytest.raises(ValueError, match='validation'):
+        resolve(requested='validation', saved=None, validation=False)
+    with pytest.raises(ValueError, match='resume'):
+        resolve(requested='production', saved={}, validation=False)
+
+
+@pytest.mark.parametrize('applied', [False, True])
+def test_production_skips_optional_scans_but_keeps_applied_step(applied, monkeypatch):
+    trainer, engine, _ = make_deepspeed_trainer(norm_groups=[torch.tensor(1.)], step_applied=applied)
+    trainer.stage1_check_policy = 'production'
+    monkeypatch.setattr(trainer, '_validate_deepspeed_gradient_norm',
+                        lambda *_: pytest.fail('diagnostic norm executed in production'))
+    engine.set_gradient_accumulation_boundary(True)
+    engine.step()
+    assert trainer._successful_optimizer_steps == int(applied)
+    assert trainer.ema_teacher.update_count == int(applied)
+    if applied:
+        torch.testing.assert_close(trainer.ema_teacher.values_at_update[0],
+                                   trainer.model.language_scale.detach())
+
+
+def test_production_keeps_alignment_noise_and_omits_target_audits(monkeypatch):
+    mask = torch.tensor([[False, True, False]])
+    trainer = make_trainer(CountingStudent(hidden_size=2),
+                          CountingTargetBuilder(torch.tensor([[1., 2.]]), mask, ((1,),)))
+    trainer.stage1_check_policy = 'production'
+    for name in ('_validate_targets', '_validate_ema_teacher_device'):
+        monkeypatch.setattr(trainer, name, lambda *_: pytest.fail('optional target audit executed'))
+    before = torch.random.get_rng_state()
+    loss = trainer.compute_loss(trainer.model, make_batch(mask))
+    assert not torch.equal(before, torch.random.get_rng_state())
+    loss.backward()
+    assert trainer.model.language_scale.grad is not None
+    assert trainer._latest_stage1_diagnostics is None
+
+
+def test_adaptive_production_omits_whole_hidden_finite_scans(monkeypatch):
+    import inspect
+    from tests.stage1.history_fixtures import make_history_case
+    from tests.stage1.test_history_targets import builder, observe_build
+    calls = []
+    original = torch.isfinite
+    def observe(value):
+        caller = inspect.currentframe().f_back
+        if caller.f_code.co_filename.endswith('/stage1/targets.py'):
+            calls.append(tuple(value.shape))
+        return original(value)
+    monkeypatch.setattr(torch, 'isfinite', observe)
+    case = make_history_case()
+    observe_build(case, builder(case, validate=False, collect_diagnostics=False))
+    assert calls == []
+
+
+def test_v5_production_policy_overrides_debug_at_actual_loss_dispatch(tmp_path, monkeypatch):
+    from tests.stage1.v5.test_trainer import integrated_fixture
+    import stage1.v5_trainer as module
+    trainer, batch, *_ = integrated_fixture(tmp_path, debug=True)
+    trainer.stage1_check_policy = 'production'
+    observed = []
+    original = module.compute_v5_loss_sums
+    def objective(*args, **kwargs):
+        observed.append((kwargs['validate'], kwargs['collect_diagnostics']))
+        return original(*args, **kwargs)
+    monkeypatch.setattr(module, 'compute_v5_loss_sums', objective)
+    batches, _ = trainer.get_batch_samples(iter([batch]), 4)
+    trainer.training_step(trainer.model, batches[0])
+    assert observed == [(False, False)]
+    assert trainer.stage1_v5_debug is False
+    assert trainer._latest_stage1_diagnostics is None
+
+
+def test_v5_legacy_policy_preserves_saved_debug_flag(tmp_path):
+    from tests.stage1.v5.test_trainer import integrated_fixture
+    trainer, *_ = integrated_fixture(tmp_path, debug=True)
+    trainer.stage1_check_policy = 'legacy'
+    assert trainer.stage1_v5_debug is True and trainer._stage1_checks_enabled()
+
+
+def test_native_peft_checkpoint_retains_historical_stochastic_context(monkeypatch):
+    from types import SimpleNamespace
+    from transformers import Trainer
+    from stage1.trainer import CustomTrainerStage1
+    from stage1.equivalence import (SampleStableStage1Dropout, stage1_checkpoint_context_fn,
+        _require_stage1_stochastic_context)
+    from torch.utils.checkpoint import checkpoint
+    model = torch.nn.Sequential(SampleStableStage1Dropout('native-site', .1), torch.nn.Linear(2, 2))
+    trainer = CustomTrainerStage1.__new__(CustomTrainerStage1)
+    trainer.stage1_match_v5_execution = False
+    trainer.args = SimpleNamespace(seed=42)
+    trainer.state = SimpleNamespace(global_step=0)
+    batch = make_batch(torch.tensor([[False, True, False]]))
+    observed = []
+    def native_step(self, model, inputs, num_items_in_batch=None):
+        observed.append(_require_stage1_stochastic_context())
+        x = torch.ones(1, 3, 2, requires_grad=True)
+        value = checkpoint(model, x, use_reentrant=False, context_fn=stage1_checkpoint_context_fn)
+        value.sum().backward()
+        return value.detach()
+    monkeypatch.setattr(Trainer, 'training_step', native_step)
+    result = trainer.training_step(model, batch)
+    assert observed and torch.isfinite(result).all()
+    assert model[1].weight.grad is not None
+    with pytest.raises(RuntimeError, match='missing'):
+        _require_stage1_stochastic_context()

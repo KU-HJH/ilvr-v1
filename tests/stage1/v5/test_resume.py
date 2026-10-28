@@ -176,7 +176,7 @@ def test_runtime_contract_records_effective_topology_and_independent_query_seman
     assert query['formula_id'] != saved['formula_id']
     assert set(saved['execution']['source_sha256']) == {
         'v5_trainer', 'stage1_trainer', 'transformers_trainer',
-        'query', 'targets', 'history_attention', 'history_teacher'}
+        'query', 'targets', 'history_attention', 'history_teacher', 'v5_donors', 'v5_replay'}
     if mode == 'adaptive':
         assert query['text_gamma'] == .55 and query['attention_layers'] == 'all'
         assert query['resolved_layer_indices'] == [0, 1]
@@ -224,3 +224,50 @@ def test_explicit_null_query_metadata_rejects_before_resume_inheritance(tmp_path
             resume.validate_v5_resume(saved, {})
         else:
             resume.resolve_v5_query_resume(saved, {})
+
+
+def test_exact_frozen_historical_contracts_remain_readable_without_new_keys(tmp_path):
+    from pathlib import Path
+    from copy import deepcopy
+    frozen = json.loads((Path(__file__).parent/'fixtures/historical-contracts.json').read_text())
+    for version, saved in frozen.items():
+        before = deepcopy(saved)
+        path = tmp_path / 'stage1_v5.json'
+        path.write_text(json.dumps(saved))
+        assert api().load_v5_contract(tmp_path) == before
+        assert 'voff_mode' not in saved['config']
+        if version == '1':
+            with pytest.raises(ValueError, match='historical'):
+                api().validate_v5_resume(saved, {})
+        else:
+            assert api().validate_v5_resume(saved, {}).voff_mode == 'attention_mask'
+            with pytest.raises(ValueError, match='conflict'):
+                api().validate_v5_resume(saved, {'voff_mode':'cross_helper_reverse_topk_cumulative'})
+        assert saved == before
+        saved['config']['voff_mode'] = 'attention_mask'
+        path.write_text(json.dumps(saved))
+        with pytest.raises(ValueError):
+            api().load_v5_contract(tmp_path)
+
+
+@pytest.mark.parametrize('mode', ['cross_helper_reverse_topk_independent', 'cross_helper_reverse_topk_cumulative'])
+@pytest.mark.parametrize('selection', ['all', 'clean'])
+def test_replacement_contract_roundtrip_and_conflicts(tmp_path, mode, selection):
+    from dataclasses import replace
+    from stage1.v5_reference import V5ReferenceIdentity
+    config = replace(Stage1V5Config(lambda_topk_entropy=.1, lambda_topk_mass=.05,
+        preference_topk_k=50), voff_mode=mode, selection=selection,
+        preference_entropy_top_percent=20 if selection == 'clean' else None)
+    denominator = 'actual_window_selected_dil_tokens' if selection == 'clean' else 'actual_window_eligible_dil_tokens'
+    saved = api().build_v5_contract(config,V5ReferenceIdentity(1,'a'*64,'b'*64,'c'*64,('lora_A',)),
+        ce_weight=.1,sim_weight=.1,schedule={'dil_denominator':denominator},execution={})
+    assert saved['schema_version'] == 4
+    (tmp_path/'stage1_v5.json').write_text(json.dumps(saved))
+    assert api().load_v5_contract(tmp_path) == saved
+    assert api().validate_v5_resume(saved,{}) == config
+    assert api().validate_v5_resume(saved,{'stage1_v5_voff_mode':mode}) == config
+    assert api().resolve_v5_query_resume(saved,{}).mode == 'legacy'
+    with pytest.raises(ValueError,match='conflict'):
+        api().validate_v5_resume(saved,{'voff_mode':'attention_mask'})
+    saved['semantics']['interventions'] = 'independent_clean_prefix_voff_body_textoff_previous_text_v1'
+    with pytest.raises(ValueError): api().validate_v5_resume(saved,{})

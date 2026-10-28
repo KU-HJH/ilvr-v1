@@ -32,6 +32,14 @@ from .ema import (
 from .targets import Stage1TeacherTargetBuilder
 from .query import Stage1QueryConfig
 from .types import Stage1BatchMetadata, Stage1TeacherTargets
+from .equivalence import (
+    SampleStableStage1Dropout, Stage1StochasticContext,
+    activate_stage1_stochastic_context,
+)
+from .matched_execution import (
+    enable_matched_standard_execution, reject_matched_execution_resume,
+    write_matched_execution_identity,
+)
 
 
 _HELPER_INPUTS = frozenset(
@@ -235,17 +243,53 @@ class CustomTrainerStage1(SFTTrainer):
         ema_teacher: Stage1EmaTeacher | None = None,
         stage1_peft_metadata=None,
         collect_stage1_diagnostics: bool = False,
+        stage1_check_policy: str | None = None,
+        run_cache=None,
+        match_v5_execution: bool = False,
+        ce_entropy_top_percent: float | None = None,
+        matched_resume_profile=None,
+        stop_after_checkpoint=None,
         **kwargs,
     ) -> None:
         if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
             raise TypeError("Stage 1 trainer requires a DeepSpeed runtime profile")
         self.deepspeed_runtime_profile = deepspeed_runtime_profile
+        self.run_cache = run_cache
         self.stage1_peft_metadata = stage1_peft_metadata
         # Preserve the repository's legacy constructor spelling across the
         # tokenizer -> processing_class Trainer API migration.
         if "tokenizer" in kwargs and "processing_class" not in kwargs:
             kwargs["processing_class"] = kwargs.pop("tokenizer")
         super().__init__(*args, **kwargs)
+        self.stage1_match_v5_execution = bool(match_v5_execution)
+        self.matched_resume_profile = matched_resume_profile
+        self.stage1_stop_after_checkpoint = stop_after_checkpoint
+        if stop_after_checkpoint is not None:
+            from .matched_resume import MatchedCheckpointStop
+            if (not self.stage1_match_v5_execution or type(stop_after_checkpoint) is not int
+                    or not 0 < stop_after_checkpoint < self.args.max_steps
+                    or self.args.save_only_model):
+                raise ValueError('matched checkpoint stop requires full state and 0 < stop < full budget')
+            self.add_callback(MatchedCheckpointStop(stop_after_checkpoint))
+        if self.stage1_match_v5_execution:
+            enable_matched_standard_execution(self)
+        self.stage1_check_policy = stage1_check_policy or (
+            'validation' if collect_stage1_diagnostics or getattr(self, 'stage1_v5_debug', False)
+            else 'production'
+        )
+        self.ce_entropy_top_percent = ce_entropy_top_percent
+        self.ce_entropy_special_token_ids = ()
+        if ce_entropy_top_percent is not None:
+            from .entropy_ce import validate_ce_entropy_percent
+            self.ce_entropy_top_percent = validate_ce_entropy_percent(ce_entropy_top_percent)
+            if not self.stage1_match_v5_execution:
+                raise ValueError('CE entropy selection requires matched standard Stage1')
+            processor = self.processing_class
+            tokenizer = getattr(processor, 'tokenizer', processor)
+            special_ids = getattr(tokenizer, 'all_special_ids', None)
+            if not special_ids:
+                raise ValueError('CE entropy selection requires tokenizer special IDs')
+            self.ce_entropy_special_token_ids = tuple(special_ids)
 
         self.sim_weight = self._finite_weight(sim_weight, "sim_weight")
         self.ce_weight = self._finite_weight(ce_weight, "ce_weight")
@@ -256,7 +300,7 @@ class CustomTrainerStage1(SFTTrainer):
         if query_config is not None and not isinstance(query_config, Stage1QueryConfig):
             raise TypeError('query_config must be a Stage1QueryConfig')
         self.query_config = query_config or Stage1QueryConfig()
-        self.collect_stage1_diagnostics = bool(collect_stage1_diagnostics)
+        self.collect_stage1_diagnostics = bool(collect_stage1_diagnostics) and self._stage1_checks_enabled()
         self._latest_stage1_diagnostics = None
         self._representative_gradient_norm: float | None = None
         self._successful_optimizer_steps = 0
@@ -290,6 +334,7 @@ class CustomTrainerStage1(SFTTrainer):
                 query_config=self.query_config,
                 validate=self._stage1_checks_enabled(),
                 collect_diagnostics=self._stage1_checks_enabled(),
+                run_cache=run_cache,
             )
         self.target_builder = target_builder
 
@@ -312,6 +357,9 @@ class CustomTrainerStage1(SFTTrainer):
                 write_deepspeed_runtime_sidecar(
                     directory, self.deepspeed_runtime_profile
                 )
+                self._write_stage1_cache_contract(directory)
+                if getattr(self, 'stage1_match_v5_execution', False):
+                    write_matched_execution_identity(directory, ce_entropy_top_percent=getattr(self, 'ce_entropy_top_percent', None))
             except Exception as error:
                 local_error = error
         local_failure = torch.tensor(
@@ -351,6 +399,26 @@ class CustomTrainerStage1(SFTTrainer):
             else "lora"
         )
 
+    def training_step(self, model, inputs, num_items_in_batch=None):
+        # V5 owns its graph/replay context. Native PEFT retains the historical
+        # sample-keyed context through both forward and checkpoint backward.
+        if not getattr(self, 'stage1_match_v5_execution', False) and hasattr(self, 'v5_config'):
+            return super().training_step(model, inputs, num_items_in_batch)
+        sites = tuple(module.site_name for module in model.modules()
+                      if isinstance(module, SampleStableStage1Dropout))
+        if not sites and not getattr(self, 'stage1_match_v5_execution', False):
+            return super().training_step(model, inputs, num_items_in_batch)
+        metadata = inputs.get('stage1_batch_metadata')
+        if not isinstance(metadata, Stage1BatchMetadata):
+            raise TypeError('Stage1 dropout execution requires Stage1 batch metadata')
+        context = Stage1StochasticContext(
+            base_seed=self.args.seed, optimizer_global_step=self.state.global_step,
+            rows=tuple((sample.source_index if sample.canonical_slot_id is None
+                        else sample.canonical_slot_id, sample.unpadded_length)
+                       for sample in metadata.samples), expected_sites=sites)
+        with activate_stage1_stochastic_context(context):
+            return super().training_step(model, inputs, num_items_in_batch)
+
     def compute_loss(
         self, model, inputs, return_outputs=False, num_items_in_batch=None
     ):
@@ -362,14 +430,14 @@ class CustomTrainerStage1(SFTTrainer):
         if not isinstance(labels, torch.Tensor) or labels.ndim != 2:
             raise TypeError("Stage 1 labels must be a rank-2 tensor")
         forward_inputs = model_inputs
-        if labels.shape[0] > 1:
+        if labels.shape[0] > 1 or getattr(self, 'ce_entropy_top_percent', None) is not None:
             forward_inputs = dict(model_inputs)
             forward_inputs.pop("labels")
 
         outputs = model(**forward_inputs)
         ce_loss, alignment_loss = self._stage1_native_losses(outputs, labels, targets)
         loss = self.ce_weight * ce_loss + self.sim_weight * alignment_loss
-        if not bool(torch.isfinite(loss.detach()).all().item()):
+        if self._stage1_checks_enabled() and not bool(torch.isfinite(loss.detach()).all().item()):
             raise FloatingPointError("Stage 1 loss is nonfinite")
 
         if self.collect_stage1_diagnostics:
@@ -390,10 +458,27 @@ class CustomTrainerStage1(SFTTrainer):
         return (loss, outputs) if return_outputs else loss
 
     def _stage1_checks_enabled(self) -> bool:
-        # Ordinary Stage1 retains strict diagnostics; v5 opts into its runtime flag.
-        return getattr(self, "stage1_v5_debug", True)
+        return getattr(self, '_stage1_optional_checks', getattr(self, 'stage1_v5_debug', True))
 
-    def _prepare_stage1_loss_inputs(self, inputs) -> tuple[dict, Stage1BatchMetadata, Stage1TeacherTargets]:
+    @property
+    def stage1_check_policy(self):
+        return getattr(self, '_stage1_check_policy', 'legacy')
+
+    @stage1_check_policy.setter
+    def stage1_check_policy(self, value):
+        if value not in ('production', 'validation', 'legacy'):
+            raise ValueError('unsupported Stage1 check policy')
+        self._stage1_check_policy = value
+        self._stage1_optional_checks = (
+            getattr(self, 'stage1_v5_debug', True) if value == 'legacy'
+            else value == 'validation'
+        )
+        if value != 'legacy' and hasattr(self, 'stage1_v5_debug'):
+            self.stage1_v5_debug = self._stage1_optional_checks
+        if value == 'production' and hasattr(self, 'collect_stage1_diagnostics'):
+            self.collect_stage1_diagnostics = False
+
+    def _prepare_stage1_loss_inputs(self, inputs, *, voff_mode='attention_mask') -> tuple[dict, Stage1BatchMetadata, Stage1TeacherTargets]:
         """Build helper targets once, preserving the original model tensors."""
         working_inputs = dict(inputs)
         metadata = working_inputs.pop("stage1_batch_metadata", None)
@@ -405,7 +490,8 @@ class CustomTrainerStage1(SFTTrainer):
         if self._stage1_checks_enabled():
             self._validate_ema_teacher_device(working_inputs)
         targets = self.target_builder.build(
-            self.ema_teacher.model, working_inputs, metadata
+            self.ema_teacher.model, working_inputs, metadata,
+            **({'voff_mode': voff_mode} if voff_mode != 'attention_mask' else {}),
         )
         if self._stage1_checks_enabled():
             self._validate_targets(targets, metadata, working_inputs)
@@ -422,21 +508,26 @@ class CustomTrainerStage1(SFTTrainer):
     def _stage1_native_losses(self, outputs, labels: torch.Tensor, targets: Stage1TeacherTargets) -> tuple[torch.Tensor, torch.Tensor]:
         """Unchanged native per-sample CE and latent alignment reductions."""
         model_ce_loss = getattr(outputs, "loss", None)
-        if labels.shape[0] == 1 and (
+        percent = getattr(self, 'ce_entropy_top_percent', None)
+        if percent is not None:
+            from .entropy_ce import select_entropy_ce_labels
+            labels = select_entropy_ce_labels(outputs.logits, labels, percent=percent,
+                special_token_ids=self.ce_entropy_special_token_ids)
+        if percent is None and labels.shape[0] == 1 and (
             not isinstance(model_ce_loss, torch.Tensor)
             or model_ce_loss.numel() != 1
         ):
             raise RuntimeError("Stage 1 student forward must return a scalar loss")
-        ce_loss = self._equal_sample_ce_loss(outputs, labels, model_ce_loss)
+        ce_loss = self._equal_sample_ce_loss(outputs, labels, model_ce_loss, recompute=percent is not None)
         outputs.loss = ce_loss
         alignment_loss = self._alignment_loss(outputs, targets)
         return ce_loss, alignment_loss
 
     @staticmethod
-    def _equal_sample_ce_loss(outputs, labels, model_ce_loss) -> torch.Tensor:
+    def _equal_sample_ce_loss(outputs, labels, model_ce_loss, *, recompute=False) -> torch.Tensor:
         if not isinstance(labels, torch.Tensor) or labels.ndim != 2:
             raise TypeError("Stage 1 labels must be a rank-2 tensor")
-        if labels.shape[0] == 1:
+        if labels.shape[0] == 1 and not recompute:
             return model_ce_loss
 
         logits = getattr(outputs, "logits", None)
@@ -771,7 +862,12 @@ class CustomTrainerStage1(SFTTrainer):
         accelerate_version = importlib_metadata.version("accelerate")
         deepspeed_version = importlib_metadata.version("deepspeed")
         supported_deepspeed = deepspeed_version == _SUPPORTED_DEEPSPEED_VERSION
-        if deepspeed_version == "0.18.7":
+        if getattr(self, 'stage1_match_v5_execution', False):
+            supported_deepspeed = (deepspeed_version == '0.18.7'
+                and self.deepspeed_runtime_profile.enabled
+                and self.deepspeed_runtime_profile.zero_stage == 1
+                and self.deepspeed_runtime_profile.world_size == 4)
+        elif deepspeed_version == "0.18.7":
             from .v5_trainer import CustomTrainerStage1V5
 
             supported_deepspeed = (
@@ -786,7 +882,7 @@ class CustomTrainerStage1(SFTTrainer):
             raise RuntimeError(
                 "unsupported DeepSpeed Stage 1 lifecycle: expected "
                 f"accelerate {_SUPPORTED_ACCELERATE_VERSION} and deepspeed "
-                f"{_SUPPORTED_DEEPSPEED_VERSION} (or 0.18.7 for v5 ZeRO-1), found accelerate "
+                f"{_SUPPORTED_DEEPSPEED_VERSION} (or 0.18.7 for v5/matched standard ZeRO-1), found accelerate "
                 f"{accelerate_version} and deepspeed {deepspeed_version}"
             )
 
@@ -1017,6 +1113,14 @@ class CustomTrainerStage1(SFTTrainer):
                     write_deepspeed_runtime_sidecar(
                         checkpoint_dir, self.deepspeed_runtime_profile
                     )
+                    self._write_stage1_cache_contract(checkpoint_dir)
+                    if getattr(self, 'stage1_match_v5_execution', False):
+                        write_matched_execution_identity(checkpoint_dir, ce_entropy_top_percent=getattr(self, 'ce_entropy_top_percent', None))
+                        resume_profile = getattr(self, 'matched_resume_profile', None)
+                        if resume_profile is not None:
+                            from .matched_resume import write_matched_resume_contract, checkpoint_source
+                            write_matched_resume_contract(checkpoint_dir, resume_profile,
+                                source=checkpoint_source(checkpoint_dir))
                 except Exception as error:
                     ema_save_error = error
             local_failure = torch.tensor(
@@ -1043,6 +1147,21 @@ class CustomTrainerStage1(SFTTrainer):
         finally:
             self._stage1_deferred_checkpoint_rotation = None
 
+    def _write_stage1_cache_contract(self, directory):
+        from .cache_setup import write_stage1_cache_contract, INITIAL_TEACHER
+        cache = getattr(self, 'run_cache', None)
+        write_stage1_cache_contract(directory, None if cache is None else cache.plan,
+            phase=0 if cache is None else cache.phase.value,
+            check_policy=self.stage1_check_policy,
+            completion=getattr(self, 'stage1_cache_completion', 'train'))
+        if cache is not None and cache.plan.helper == 'targets' and not hasattr(self, 'v5_config'):
+            source = Path(self.args.output_dir) / INITIAL_TEACHER
+            destination = Path(directory) / INITIAL_TEACHER
+            if source != destination and not destination.exists():
+                # Hard link the immutable initial state within the checkpoint
+                # filesystem; no additional whole-model copy per checkpoint.
+                os.link(source, destination)
+
     def _rotate_checkpoints(self, use_mtime=False, output_dir=None) -> None:
         if getattr(self, "_defer_stage1_checkpoint_rotation", False):
             if self._stage1_deferred_checkpoint_rotation is not None:
@@ -1059,6 +1178,19 @@ class CustomTrainerStage1(SFTTrainer):
         **kwargs,
     ):
         """Require and defer compatible EMA state for Stage 1 resume."""
+
+        requested = kwargs.get('model_path', resume_from_checkpoint)
+        if requested is True:
+            requested = get_last_checkpoint(self.args.output_dir)
+        if requested is not False:
+            contract = reject_matched_execution_resume(requested,
+                enabled=getattr(self, 'stage1_match_v5_execution', False))
+            if contract is not None:
+                from .matched_resume import validate_matched_trainer_resume
+                validate_matched_trainer_resume(self, contract)
+                stop = getattr(self, 'stage1_stop_after_checkpoint', None)
+                if stop is not None and stop <= contract['source']['checkpoint_step']:
+                    raise ValueError('checkpoint stop must follow the resumed step')
 
         self._publish_deepspeed_runtime_identity(
             Path(self.args.output_dir), label="Stage 1 runtime identity publication"
@@ -1094,18 +1226,32 @@ class CustomTrainerStage1(SFTTrainer):
                 pending_checkpoint, self.deepspeed_runtime_profile
             )
             self._stage1_ema_checkpoint_path(pending_checkpoint)
+            if getattr(self, 'stage1_match_v5_execution', False):
+                # Native PEFT Trainer restores adapters, but not ILVR's separate
+                # sparse output-token rows. Composition already restores these;
+                # the direct Trainer entrypoint must restore them too.
+                from .token_rows import load_sparse_token_rows
+                load_sparse_token_rows(self.model, pending_checkpoint,
+                                       self.stage1_peft_metadata.latent_token_ids)
         self._stage1_pending_ema_checkpoint = pending_checkpoint
         resolved_resume = (
             None if pending_checkpoint is None else str(pending_checkpoint)
         )
         if "model_path" in kwargs:
             kwargs["model_path"] = resolved_resume
-        return super().train(
+        result = super().train(
             resume_from_checkpoint=resolved_resume,
             trial=trial,
             ignore_keys_for_eval=ignore_keys_for_eval,
             **kwargs,
         )
+        # Native RNG restoration lives inside its epoch loop. A completed
+        # matched checkpoint runs no epochs, but still restores full state.
+        if (pending_checkpoint is not None
+                and getattr(self, 'stage1_match_v5_execution', False)
+                and contract['source']['checkpoint_step'] == self.args.max_steps):
+            self._load_rng_state(str(pending_checkpoint))
+        return result
 
     def _save(self, output_dir=None, state_dict=None):
         """Keep Trainer's gathered state while writing canonical PEFT weights."""
@@ -1173,6 +1319,8 @@ class CustomTrainerStage1(SFTTrainer):
             _save_stage1_peft_supplements(self.model, target, metadata)
         if self.args.should_save:
             classify_stage1_artifact(target)
+            if getattr(self, 'stage1_match_v5_execution', False):
+                write_matched_execution_identity(target, ce_entropy_top_percent=getattr(self, 'ce_entropy_top_percent', None))
 
 
 __all__ = [

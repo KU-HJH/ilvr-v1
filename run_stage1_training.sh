@@ -5,6 +5,11 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cd -- "$script_dir"
 repository_python="$script_dir/venv/ilvr-venv/bin/python"
 repository_accelerate="$script_dir/venv/ilvr-venv/bin/accelerate"
+if [[ ${ILVR_STAGE1_RUNTIME_PROFILE:-default} == native-ema-0180 ]]; then
+    native_stage1_venv=/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/venv/ilvr-venv
+    repository_python="$native_stage1_venv/bin/python"
+    repository_accelerate="$native_stage1_venv/bin/accelerate"
+fi
 [[ -x $repository_python ]] || {
     printf 'error: repository Python is not executable: %s\n' "$repository_python" >&2
     exit 2
@@ -174,9 +179,18 @@ while (( $# )); do
         --query_mode) require_value "$@"; query_mode=$2; extra_worker_arguments+=(--query_mode "$2"); shift 2 ;;
         --history_text_gamma|--history_attention_layers) require_value "$@"; extra_worker_arguments+=("$1" "$2"); shift 2 ;;
         --sim-weight) require_value "$@"; extra_worker_arguments+=(--sim_weight "$2"); shift 2 ;;
+        --stage1-match-v5-execution) extra_worker_arguments+=(--stage1_match_v5_execution); shift ;;
+        --stop-after-checkpoint) require_value "$@"; extra_worker_arguments+=(--stage1_stop_after_checkpoint "$2"); shift 2 ;;
+        --stage1-ce-entropy-top-percent) extra_worker_arguments+=(--stage1_ce_entropy_top_percent "$2"); shift 2 ;;
         --stage1-v5-debug) extra_worker_arguments+=(--stage1_v5_debug); shift ;;
         --no-stage1-v5-debug) extra_worker_arguments+=(--no-stage1_v5_debug); shift ;;
         --stage1-variant) require_value "$@"; extra_worker_arguments+=(--stage1_variant "$2"); shift 2 ;;
+        --stage1-cache) require_value "$@"; extra_worker_arguments+=(--stage1_cache "$2"); shift 2 ;;
+        --stage1-cache-completion) require_value "$@"; extra_worker_arguments+=(--stage1_cache_completion "$2"); shift 2 ;;
+        --stage1-runtime-profile) require_value "$@"; extra_worker_arguments+=(--stage1_runtime_profile "$2"); shift 2 ;;
+        --stage1-cache-validation) require_value "$@"; extra_worker_arguments+=(--stage1_cache_validation "$2"); shift 2 ;;
+        --stage1-cache-validation-stop) require_value "$@"; extra_worker_arguments+=(--stage1_cache_validation_stop "$2"); shift 2 ;;
+        --stage1-check-policy) require_value "$@"; extra_worker_arguments+=(--stage1_check_policy "$2"); shift 2 ;;
         --stage1-loss-type) require_value "$@"; extra_worker_arguments+=(--stage1_loss_type "$2"); shift 2 ;;
         --lambda-preference) require_value "$@"; extra_worker_arguments+=(--lambda_preference "$2"); shift 2 ;;
         --lambda-topk-entropy) require_value "$@"; extra_worker_arguments+=(--lambda_topk_entropy "$2"); shift 2 ;;
@@ -188,6 +202,7 @@ while (( $# )); do
         --preference-entropy-top-percent) require_value "$@"; extra_worker_arguments+=(--preference_entropy_top_percent "$2"); shift 2 ;;
         --stage1-v5-selection) require_value "$@"; extra_worker_arguments+=(--stage1_v5_selection "$2"); shift 2 ;;
         --stage1-v5-text-kl-weight) require_value "$@"; extra_worker_arguments+=(--stage1_v5_text_kl_weight "$2"); shift 2 ;;
+        --stage1-v5-voff-mode) require_value "$@"; extra_worker_arguments+=(--stage1_v5_voff_mode "$2"); shift 2 ;;
         --loss-chunk-positions) require_value "$@"; extra_worker_arguments+=(--loss_chunk_positions "$2"); shift 2 ;;
         --vision-attention-implementation) require_value "$@"; extra_worker_arguments+=(--vision_attention_implementation "$2"); shift 2 ;;
         --warm-up-steps) require_value "$@"; extra_worker_arguments+=(--warm_up_steps "$2"); shift 2 ;;

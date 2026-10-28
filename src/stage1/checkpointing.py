@@ -104,6 +104,7 @@ _NON_MODEL_BINARY_FILES = frozenset(
         "rng_state.pth",
         STAGE1_EMA_TEACHER_STATE_FILENAME,
         "stage1_v5_reference.pt",
+        "stage1_cache_initial_teacher.pt",
         "training_args.bin",
     }
 )

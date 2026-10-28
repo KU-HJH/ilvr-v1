@@ -1209,6 +1209,31 @@ def test_subprocess_runner_uses_bounded_node_json_then_exact_rsync_list(tmp_path
     )
 
 
+def test_resume_transfer_does_not_precreate_the_launch_attempt(tmp_path, monkeypatch):
+    import src.multinode_artifacts as artifacts
+    from src.multinode_runtime import prepare_attempt_directory
+    plan = launch_plan()
+    runner = SubprocessCoordinatorRunner(plan,
+        commands=build_owned_tmux_commands(plan, commit='b' * 40),
+        commit='b' * 40, log_root=tmp_path / 'logs')
+    destination = tmp_path / 'checkpoint'
+    destination.mkdir()
+    runner._reserved_transfer_destinations[destination] = destination
+    monkeypatch.setattr(artifacts, 'resolve_local_checkpoint_destination', lambda path: path)
+    monkeypatch.setattr(artifacts, 'validate_transferred_entry_subset', lambda *args: None)
+    monkeypatch.setattr(artifacts, 'build_pull_command', lambda *args, **kwargs: ('transfer',))
+    transfers = []
+    runner._run_artifact_transfer = lambda command: transfers.append(command)
+    manifest = strict_manifest(0)
+    runner.pull_resume_artifacts(manifest, manifest.entries[:1], destination)
+    # This is the actual next launch operation; transfer metadata must not
+    # claim its exclusive directory first.
+    attempt = prepare_attempt_directory(log_root=runner.log_root,
+        run_id=plan.run_id, attempt_id=plan.attempt_id)
+    assert attempt.is_dir() and transfers == [('transfer',)]
+    assert len(list((runner.log_root / plan.run_id).glob('**/*resume*.files'))) == 1
+
+
 def test_checkpoint_transfer_has_long_bounded_timeout_and_propagates_timeout(
     tmp_path,
 ):
@@ -2417,6 +2442,27 @@ def test_v5_completed_checkpoint_manifest_cli_retains_reference_for_resume(tmp_p
     assert pair <= {entry.relative_path for entry in select_resume_entries(manifest)}
     assert pair.isdisjoint(entry.relative_path for entry in select_inference_entries(manifest))
     assert (checkpoint / "stage1_v5_reference.pt").read_bytes() == b"initial selected reference"
+
+
+def test_cache_initial_teacher_retained_for_resume_excluded_from_inference(tmp_path, capsys):
+    from src.multinode import _main
+    from stage1.checkpointing import classify_stage1_artifact, Stage1ArtifactKind
+    values = identity(tuning_method='dora', zero_stage=1, model_state_layout='replicated')
+    root = tmp_path / 'checkpoints'
+    checkpoint = root / values['run_id'] / 'checkpoint-2'
+    write_observed_full_checkpoint(checkpoint, values=values)
+    (checkpoint / 'model.safetensors').unlink()
+    write_loader_artifact(checkpoint, stage='stage1', method='dora')
+    (checkpoint / 'stage1_run_cache.json').write_text('{"schema":1,"mode":"run"}')
+    (checkpoint / 'stage1_cache_initial_teacher.pt').write_bytes(b'original teacher state')
+    assert _main(['artifact-manifest', '--run-directory', str(checkpoint), '--run-id', values['run_id'],
+        '--checkpoint-root', str(root), '--node-rank', '0', '--process-rank', '0', '--process-rank', '1',
+        '--runtime-identity-json', json.dumps(values), '--completion-marker']) == 0
+    manifest = NodeArtifactManifest.from_json(json.loads(capsys.readouterr().out))
+    assert classify_stage1_artifact(checkpoint) is Stage1ArtifactKind.PEFT
+    saved = {Path('stage1_run_cache.json'), Path('stage1_cache_initial_teacher.pt')}
+    assert saved <= {entry.relative_path for entry in select_resume_entries(manifest)}
+    assert saved.isdisjoint(entry.relative_path for entry in select_inference_entries(manifest))
 
 
 @pytest.mark.parametrize("stage,extra,expected", [

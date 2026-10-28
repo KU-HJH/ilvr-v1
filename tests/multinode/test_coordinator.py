@@ -856,6 +856,18 @@ def test_monitor_stops_live_peer_only_after_exact_revalidation(fake_runner):
     ]
 
 
+def test_monitor_executes_optional_boundary_then_retires(fake_runner):
+    fake_runner.statuses = {0: None, 1: None}
+    calls = []
+    def boundary():
+        calls.append('boundary')
+        fake_runner.statuses = {0: 0, 1: 0}
+    exits = monitor_owned_jobs(plan(), fake_runner, expected_commit='a' * 40,
+        expected_command_digests={0: 'unused', 1: 'unused'}, boundary_action=boundary)
+    assert exits == {0: 0, 1: 0}
+    assert calls == ['boundary']
+
+
 def test_attempt_monitor_has_fixed_24_hour_bound_and_cleans_proven_peers(
     fake_runner, monkeypatch
 ):

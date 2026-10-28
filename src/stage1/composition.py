@@ -445,7 +445,8 @@ def _load_stage1_model(source, config, args, dependencies):
     """Reuse the authenticated mixed-backend construction for opt-in v5."""
     model_kwargs = dict(torch_dtype=torch.bfloat16, cache_dir=args.cache_dir,
                         trust_remote_code=True)
-    if getattr(args, 'stage1_variant', 'standard') == 'v5':
+    if (getattr(args, 'stage1_variant', 'standard') == 'v5'
+            or getattr(args, 'stage1_match_v5_execution', False)):
         from stage2.attention_backend import load_qwen2_5_vl_with_attention
         return load_qwen2_5_vl_with_attention(source,
             attention_implementation=args.attention_implementation,
@@ -484,6 +485,14 @@ def build_stage1_training_components(
     data_path, image_root, output_dir = _require_stage1_inputs(args)
     tuning = resolve_stage1_tuning_config(args)
     is_v5 = getattr(args, 'stage1_variant', 'standard') == 'v5'
+    matched_standard = bool(getattr(args, 'stage1_match_v5_execution', False))
+    if matched_standard:
+        from stage1.matched_execution import validate_matched_standard_execution
+        if is_v5:
+            raise ValueError('matched execution requires standard Stage1')
+        validate_matched_standard_execution(args, tuning, profile)
+        from transformers import set_seed
+        set_seed(args.seed)
     from stage1.query import Stage1QueryConfig
     query_config = getattr(args, 'stage1_query_config', Stage1QueryConfig())
     if query_config.mode == 'adaptive' and not is_v5:
@@ -507,6 +516,21 @@ def build_stage1_training_components(
         output_dir, args.resume_from_checkpoint_path
     )
     checkpoint = decision.checkpoint_path
+    from stage1.cache_setup import load_stage1_cache_contract
+    from stage1.run_cache import resolve_stage1_check_policy
+    cache_saved = load_stage1_cache_contract(checkpoint, requested=getattr(args, 'stage1_cache', 'off'))
+    check_policy = resolve_stage1_check_policy(requested=getattr(args, 'stage1_check_policy', None),
+        saved=cache_saved, validation=bool(getattr(args, '_stage1_cache_validation', False)))
+    from stage1.matched_execution import reject_matched_execution_resume
+    matched_contract = reject_matched_execution_resume(checkpoint, enabled=matched_standard)
+    matched_resume_profile = None
+    matched_training_args = None
+    if matched_standard:
+        from stage1.matched_resume import capture_matched_resume_profile, validate_matched_resume_profile
+        matched_training_args = build_stage1_training_arguments(args)
+        matched_resume_profile = capture_matched_resume_profile(args, matched_training_args)
+        if matched_contract is not None:
+            validate_matched_resume_profile(matched_contract['profile'], matched_resume_profile)
     metadata = None
     metadata_snapshot = decision.peft_metadata_snapshot
     if decision.artifact_kind is Stage1ArtifactKind.PEFT:
@@ -654,6 +678,12 @@ def build_stage1_training_components(
             )
 
     model.visual.requires_grad_(False)
+    if matched_standard:
+        from stage2.attention_backend import validate_qwen2_5_vl_attention_backends
+        from peft_common import resolve_qwen2_5_vl_model
+        validate_qwen2_5_vl_attention_backends(resolve_qwen2_5_vl_model(model),
+            attention_implementation=args.attention_implementation,
+            vision_attention_implementation=args.vision_attention_implementation)
     parameter_report = dependencies.validate_boundary(
         model, tuning, latent_ids, zero_stage=profile.zero_stage
     )
@@ -663,7 +693,7 @@ def build_stage1_training_components(
     token_ids = LatentTokenIds(*latent_ids)
     collator = dependencies.collator_factory(processor, token_ids, args.latent_size,
         **({'stage1_variant': 'v5'} if is_v5 else {}))
-    training_args = build_stage1_training_arguments(args)
+    training_args = matched_training_args or build_stage1_training_arguments(args)
     factory = dependencies.trainer_factory
     v5_kwargs = {}
     if is_v5:
@@ -738,11 +768,23 @@ def build_stage1_training_components(
         ce_weight=args.ce_weight,
         deepspeed_runtime_profile=profile,
         ema_method=tuning.method,
+        stage1_check_policy=check_policy,
         stage1_peft_metadata=metadata,
         collect_stage1_diagnostics=(bool(getattr(args, "stage1_v5_debug", False)) if is_v5
                                    else bool(getattr(args, "benchmark_evidence_path", None))),
+        **({'match_v5_execution': True, 'matched_resume_profile': matched_resume_profile}
+           if matched_standard else {}),
+        **({'ce_entropy_top_percent': args.stage1_ce_entropy_top_percent}
+           if getattr(args, 'stage1_ce_entropy_top_percent', None) is not None else {}),
+        **({'stop_after_checkpoint': args.stage1_stop_after_checkpoint}
+           if getattr(args, 'stage1_stop_after_checkpoint', None) is not None else {}),
         **v5_kwargs,
     )
+    trainer.stage1_cache_completion = getattr(args, 'stage1_cache_completion', 'train')
+    if getattr(args, 'stage1_cache', 'off') == 'run':
+        from stage1.cache_setup import configure_stage1_run_cache
+        configure_stage1_run_cache(args, trainer=trainer, examples=dataset, collator=collator,
+            processor=processor, data_path=data_path, checkpoint=checkpoint, saved=cache_saved)
     if tuning.method != "full" and args.gradient_checkpointing:
         validate_stage1_checkpoint_context(getattr(trainer, "model", model))
     return Stage1TrainingComponents(
@@ -766,7 +808,10 @@ def run_stage1(
     rank_config_digest_provider: Callable | None = None,
 ) -> None:
     """Train once and, when requested, perform one separately timed final save."""
-
+    validation_mode = getattr(args, 'stage1_cache_validation', None)
+    if validation_mode is not None:
+        from stage1.cache_validation import configure_validation
+        configure_validation(args)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if deepspeed_runtime_profile is None:
         profile = bind_deepspeed_runtime_profile(args, world_size=world_size)
@@ -867,6 +912,21 @@ def run_stage1(
             assert smoke_resume_snapshot is not None
     total_start = monotonic() if producing else None
     components = component_builder(args)
+    if validation_mode is not None:
+        from stage1.cache_validation import payload_witness, Stage1CacheValidationObserver
+        validation_output = Path(__file__).resolve().parents[2] / 'results' / Path(args.save_model_path).name
+        if len(components.dataset) != 16:
+            raise ValueError('cache validation requires its explicit complete 16-row dataset')
+        if validation_mode == 'payload':
+            payload_witness(components.trainer, args, validation_output)
+            from stage1.cache_setup import close_stage1_cache_readers
+            close_stage1_cache_readers(components.trainer)
+            return
+        observer = Stage1CacheValidationObserver({'mode': validation_mode,
+            'stop': args.stage1_cache_validation_stop}, validation_output)
+        observer.install(components.trainer)
+        if validation_mode == 'performance' and components.trainer.run_cache is not None:
+            payload_witness(components.trainer, args, validation_output, prepare_only=True)
     model_load_seconds = monotonic() - total_start if producing else 0.0
     resume = components.resume_decision.checkpoint_path
     trainer_start = monotonic()
@@ -920,6 +980,9 @@ def run_stage1(
         if components.trainer.is_world_process_zero():
             publish_stage1_training_evidence(training_evidence_path, **evidence)
 
+    if getattr(components.trainer, 'run_cache', None) is not None:
+        from stage1.cache_setup import close_stage1_cache_readers
+        close_stage1_cache_readers(components.trainer)
     if not producing:
         return
 
