@@ -7,6 +7,39 @@ import pytest
 import torch
 
 
+def test_performance_io_observes_four_real_workers_without_changing_payload(tmp_path):
+    from stage1.cache_validation import PerformanceMeasurements
+    from tests.stage1.test_run_cache import make_cache
+    cache = make_cache(tmp_path)
+    original_read = cache.read
+    metrics = PerformanceMeasurements(cache)
+    metrics.install()
+    class Records(torch.utils.data.Dataset):
+        def __len__(self):
+            return 4
+        def __getitem__(self, index):
+            if cache.phase.value == 0:
+                cache.publish('preprocess', index, {'ids': torch.tensor([index])})
+                return index
+            return cache.read('preprocess', index)['ids'].item()
+    loader = torch.utils.data.DataLoader(Records(), batch_size=1, num_workers=4,
+        persistent_workers=True, multiprocessing_context='fork')
+    try:
+        assert [int(x) for x in loader] == [0, 1, 2, 3]
+        cache.phase.value = 1
+        assert [int(x) for x in loader] == [0, 1, 2, 3]
+        report = metrics.snapshot()
+        assert report['publish']['calls'] == report['read']['calls'] == 4
+        assert report['publish']['seconds'] > 0 and report['read']['seconds'] > 0
+        assert len(report['worker_peak_rss_kib']) == 4
+        assert all(x > 0 for x in report['worker_peak_rss_kib'])
+        assert report['cache_bytes'] > 0 and report['parent_rss_kib'] > 0
+    finally:
+        loader._iterator._shutdown_workers()
+        metrics.restore()
+    assert cache.read == original_read
+
+
 def witness(profile='v5'):
     from stage1.cache_validation import fingerprint
     def fp(value):

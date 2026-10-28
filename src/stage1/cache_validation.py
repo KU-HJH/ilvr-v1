@@ -200,6 +200,67 @@ def publish_validation_record(path, payload):
     return _publish_bytes_no_replace(path, payload)
 
 
+class PerformanceMeasurements:
+    """Verifier-only timings; shared counters include the four forked workers."""
+    def __init__(self, cache):
+        import multiprocessing
+        self.cache = cache
+        self.shared = multiprocessing.Array('d', 9)  # read/write count/time + five RSS peaks
+        self.restorations, self.timings = [], {}
+
+    def install(self):
+        import resource
+        if self.cache is None:
+            return
+        for name, offset in (('publish', 0), ('read', 2)):
+            original = getattr(self.cache, name)
+            def measured(*args, _original=original, _offset=offset, **kwargs):
+                started = time.monotonic()
+                try:
+                    return _original(*args, **kwargs)
+                finally:
+                    elapsed = time.monotonic() - started
+                    worker = torch.utils.data.get_worker_info()
+                    slot = 4 if worker is None else 5 + worker.id
+                    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                    with self.shared.get_lock():
+                        self.shared[_offset] += 1
+                        self.shared[_offset + 1] += elapsed
+                        self.shared[slot] = max(self.shared[slot], rss)
+            self.restorations.append((self.cache, name, original))
+            setattr(self.cache, name, measured)
+
+    def observe(self, owner, name, label):
+        original = getattr(owner, name)
+        def measured(*args, **kwargs):
+            started = time.monotonic()
+            try:
+                return original(*args, **kwargs)
+            finally:
+                self.timings.setdefault(label, []).append(time.monotonic() - started)
+        self.restorations.append((owner, name, original))
+        setattr(owner, name, measured)
+
+    def snapshot(self):
+        import resource
+        with self.shared.get_lock():
+            values = list(self.shared)
+        status = Path('/proc/self/status').read_text().splitlines()
+        return {'publish': {'calls': int(values[0]), 'seconds': values[1]},
+            'read': {'calls': int(values[2]), 'seconds': values[3]},
+            'worker_peak_rss_kib': values[5:],
+            'parent_rss_kib': int(next(x.split()[1] for x in status if x.startswith('VmRSS:'))),
+            'parent_peak_rss_kib': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+            'cache_bytes': sum(p.stat().st_size for p in self.cache.plan.root.glob('*/*.pt')) if self.cache else 0,
+            'timings': dict(self.timings),
+            'limitation': 'Nested/parallel wall times are not additive; RSS includes shared pages and model memory; prepare includes payload audit.'}
+
+    def restore(self):
+        for owner, name, original in reversed(self.restorations):
+            setattr(owner, name, original)
+        self.restorations.clear()
+
+
 def payload_witness(trainer, args, output_dir, *, prepare_only=False):
     """Original fast frozen forwards, actual workers and coordinator boundary."""
     from .cache_lifecycle import Stage1CacheEpochCallback
@@ -229,7 +290,10 @@ def payload_witness(trainer, args, output_dir, *, prepare_only=False):
         for phase in (0, 1):
             if phase == 1:
                 callback = next(c for c in trainer.callback_handler.callbacks if isinstance(c, Stage1CacheEpochCallback))
+                boundary_started = time.monotonic()
                 callback.on_epoch_end(trainer.args, SimpleNamespace(epoch=1.), None)
+                if prepare_only:
+                    trainer._cache_performance.timings['boundary_validation_exchange_seconds'] = [time.monotonic() - boundary_started]
                 gathered = [None] * 4
                 torch.distributed.all_gather_object(gathered, rows)
                 rows = {key: value for part in gathered for key, value in part.items()}
@@ -270,6 +334,8 @@ def payload_witness(trainer, args, output_dir, *, prepare_only=False):
                     assert_frozen_replay(rows[index], record)
     restore_teacher_forward_state(teacher, initial_forward)
     trainer.target_builder._helper_visual = original_visual
+    if prepare_only:
+        trainer._cache_performance.timings['prepare_with_payload_audit_seconds'] = [time.monotonic() - started]
     if not prepare_only:
         _write_rank_record(output_dir, {'kind': 'payload', 'workers': 4, 'rows': len(rows),
             'payload': True, 'projection': True, 'rng_state': True, 'lifecycle': True,
@@ -297,6 +363,12 @@ class Stage1CacheValidationObserver(TrainerCallback):
     def install(self, trainer):
         self.trainer = trainer
         self.profile = 'v5' if hasattr(trainer, 'v5_config') else 'native-ema'
+        if self.performance:
+            self.measurements = trainer._cache_performance = PerformanceMeasurements(trainer.run_cache)
+            self.measurements.install()
+            self.measurements.observe(trainer, 'get_batch_samples', 'batch_fetch_and_count_seconds')
+            self.measurements.observe(trainer, '_prepare_inputs', 'input_preparation_host_seconds')
+            self.measurements.observe(trainer, '_prepare_stage1_loss_inputs', 'target_preparation_host_seconds')
         if self.profile == 'v5' and not self.performance:
             self.observe_v5_semantics()
         original_loader = trainer.get_train_dataloader
@@ -418,6 +490,9 @@ class Stage1CacheValidationObserver(TrainerCallback):
                 rng_after=rng_state())
 
     def on_train_begin(self, args, state, control, **kwargs):
+        if self.performance:
+            self.preparation = self.measurements.snapshot()
+            self.measurements.timings.clear()
         self.before = self.snapshot()
         self.initial_step = state.global_step
         self.started = time.monotonic()
@@ -440,5 +515,9 @@ class Stage1CacheValidationObserver(TrainerCallback):
             'workers': self.workers, 'initial_step': self.initial_step, 'final_step': state.global_step,
             'seconds': time.monotonic() - self.started,
             'production_checks': {'optional_calls': self.optional_calls}}
+        if self.performance:
+            record.update(preparation=self.preparation, measurements=self.measurements.snapshot())
         _write_rank_record(self.output_dir, record)
         self.restore_observers()
+        if self.performance:
+            self.measurements.restore()

@@ -922,11 +922,11 @@ def run_stage1(
             from stage1.cache_setup import close_stage1_cache_readers
             close_stage1_cache_readers(components.trainer)
             return
-        if validation_mode == 'performance' and components.trainer.run_cache is not None:
-            payload_witness(components.trainer, args, validation_output, prepare_only=True)
         observer = Stage1CacheValidationObserver({'mode': validation_mode,
             'stop': args.stage1_cache_validation_stop}, validation_output)
         observer.install(components.trainer)
+        if validation_mode == 'performance' and components.trainer.run_cache is not None:
+            payload_witness(components.trainer, args, validation_output, prepare_only=True)
     model_load_seconds = monotonic() - total_start if producing else 0.0
     resume = components.resume_decision.checkpoint_path
     trainer_start = monotonic()
