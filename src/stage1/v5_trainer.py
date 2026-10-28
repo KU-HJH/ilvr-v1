@@ -154,14 +154,7 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                  if keys else outputs.logits.reshape(-1,outputs.logits.shape[-1])[:0])
         reference, voff, textoff = clean.detach(), None, None
         if keys:
-            # Own preparation from original token/image tensors and reference
-            # modules; never reuse F embeddings/KV. Detached helper is shared.
-            reference_inputs = dict(model_inputs, use_cache=False, return_dict=True,
-                stage1_selected_positions=keys,
-                stage1_selected_chunk_positions=self.v5_config.loss_chunk_positions)
-            reference_inputs.pop('labels', None)
-            with torch.no_grad():
-                reference = self.ema_teacher.model(**reference_inputs).stage1_selected_logits
+            reference = self._stage1_reference_logits(model_inputs, keys, source_metadata)
             attention = {}
             for key, positions in zip(keys, candidates):
                 row = clean.new_zeros(labels.shape[1], dtype=torch.float32)
@@ -233,6 +226,45 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 raise error
             raise RuntimeError('Stage1-v5 publication failed on another rank')
         self.accelerator.wait_for_everyone()
+
+    @torch.no_grad()
+    def _stage1_reference_logits(self, model_inputs, keys, source_metadata):
+        cache = getattr(self, 'run_cache', None)
+        enabled = cache is not None and cache.plan.reference_hidden
+        if enabled and (self.ema_teacher.decay != 1. or cache.plan.helper != 'targets'):
+            raise ValueError('reference cache requires fixed helper targets and invariant full inputs')
+        if enabled and source_metadata.batch_size != 1:
+            raise ValueError('reference cache requires the supported fixed microbatch-1 geometry')
+        chunks = self.v5_config.loss_chunk_positions
+        if enabled and cache.phase.value == 1:
+            from .cache_payloads import restore_teacher_forward_state
+            record = cache.read('reference', source_metadata.samples[0].source_index)
+            if (record.get('kind') != 'reference' or record['positions'] != tuple(q for _, q in keys)
+                    or record['sequence_length'] != source_metadata.sequence_length
+                    or record['chunk_positions'] != chunks
+                    or record['hidden'].shape[0] != len(keys)):
+                raise ValueError('cached reference query/projection geometry differs')
+            owner = resolve_qwen2_5_vl_model(self.ema_teacher.model)
+            restore_teacher_forward_state(self.ema_teacher.model, record['forward_state'])
+            hidden = record['hidden'].to(device=next(owner.parameters()).device)
+            return owner.project_stage1_selected_hidden(hidden, chunks)
+        # Original token/image preparation and reference owner; never F's KV or
+        # embeddings. Capture only already selected final hidden rows.
+        reference_inputs = dict(model_inputs, use_cache=False, return_dict=True,
+            stage1_selected_positions=keys, stage1_selected_chunk_positions=chunks)
+        reference_inputs.pop('labels', None)
+        if enabled:
+            reference_inputs['stage1_capture_selected_hidden'] = True
+        output = self.ema_teacher.model(**reference_inputs)
+        if enabled:
+            from .cache_payloads import capture_teacher_forward_state
+            cache.publish('reference', source_metadata.samples[0].source_index, {
+                'kind': 'reference', 'positions': tuple(q for _, q in keys),
+                'sequence_length': source_metadata.sequence_length, 'chunk_positions': chunks,
+                'hidden': output.stage1_selected_hidden_states,
+                'forward_state': capture_teacher_forward_state(self.ema_teacher.model),
+            })
+        return output.stage1_selected_logits
 
     def save_model(self, output_dir=None, _internal_call=False):
         if not self._v5_contract_ready:
