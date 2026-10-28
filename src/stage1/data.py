@@ -120,7 +120,7 @@ def _find_subsequence_starts(sequence: torch.Tensor, pattern: torch.Tensor) -> l
     ]
 
 
-def _collate_processed_rows(rows: Sequence[dict[str, object]]) -> dict[str, object]:
+def _collate_processed_rows(rows: Sequence[dict[str, object]], *, include_helper_pixels=True) -> dict[str, object]:
     """Right-pad row tokens and concatenate row-owned vision tensors in order."""
     if not rows:
         raise ValueError("Stage 1 packing requires at least one processed row")
@@ -166,7 +166,7 @@ def _collate_processed_rows(rows: Sequence[dict[str, object]]) -> dict[str, obje
         "image_out_mask": image_out_mask,
         "pixel_values": concatenate("pixel_values"),
         "image_grid_thw": concatenate("image_grid_thw"),
-        "pixel_values_latent": concatenate("pixel_values_latent"),
+        **({"pixel_values_latent": concatenate("pixel_values_latent")} if include_helper_pixels else {}),
         "image_grid_thw_latent": concatenate("image_grid_thw_latent"),
     }
 
@@ -174,7 +174,8 @@ def _collate_processed_rows(rows: Sequence[dict[str, object]]) -> dict[str, obje
 class Stage1DataCollator:
     """Collate Stage 1 samples without inferring ownership across batch rows."""
 
-    def __init__(self, processor, token_ids, latent_size, stage1_variant: str = 'standard'):
+    def __init__(self, processor, token_ids, latent_size, stage1_variant: str = 'standard',
+                 *, run_cache=None):
         if (
             not isinstance(latent_size, int)
             or isinstance(latent_size, bool)
@@ -184,6 +185,7 @@ class Stage1DataCollator:
         if stage1_variant not in ('standard', 'v5'):
             raise ValueError('unsupported Stage 1 variant')
         self.stage1_variant = stage1_variant
+        self.run_cache = run_cache
         self.processor = processor
         self.token_ids = token_ids
         self.latent_size = latent_size
@@ -196,6 +198,54 @@ class Stage1DataCollator:
     def __call__(
         self, examples: Sequence[PreparedStage1Example]
     ) -> dict[str, object]:
+        cache = self.run_cache
+        if cache is None:
+            return self._live_call(examples)
+        examples = tuple(examples)
+        from .cache_payloads import encode_static_row, decode_static_row
+        if cache.phase.value == 0:
+            batch = self._live_call(examples)
+            metadata = batch['stage1_batch_metadata']
+            v5_blocks = getattr(batch.get('stage1_v5_metadata'), 'blocks', ())
+            for index, sample in enumerate(metadata.samples):
+                row = {key: batch[key][index, :sample.unpadded_length]
+                       for key in ('input_ids', 'attention_mask', 'labels', 'image_out_mask')}
+                row.update(
+                    pixel_values=batch['pixel_values'][slice(*sample.original_pixel_range)],
+                    image_grid_thw=batch['image_grid_thw'][slice(*sample.original_grid_range)],
+                    image_grid_thw_latent=batch['image_grid_thw_latent'][slice(*sample.helper_grid_range)],
+                    pad_token_id=self._processor_pad_token_id(),
+                )
+                record = encode_static_row(row, sample=sample, v5_blocks=tuple(
+                    block for block in v5_blocks if block.batch_index == index))
+                cache.publish('preprocess', sample.source_index, record)
+            batch['stage1_cache_sources'] = tuple(example.source_index for example in examples)
+            return batch
+        if not examples:
+            raise ValueError('Stage 1 collator requires at least one example')
+        self._validate_sample_identity(examples)
+        records = tuple(decode_static_row(cache.read('preprocess', example.source_index))
+                        for example in examples)
+        batch = _collate_processed_rows([record['row'] for record in records],
+                                       include_helper_pixels=False)
+        metadata = self._build_metadata(examples, batch,
+            tuple(record['latent_spans'] for record in records),
+            tuple(record['unpadded_length'] for record in records),
+            tuple(record['original_pixel_count'] for record in records),
+            tuple(record['helper_pixel_count'] for record in records),
+            tuple(record['original_grid_count'] for record in records),
+            tuple(record['helper_grid_count'] for record in records))
+        batch['stage1_batch_metadata'] = metadata
+        batch['stage1_cache_sources'] = tuple(example.source_index for example in examples)
+        if self.stage1_variant == 'v5':
+            from .v5_metadata import V5BatchMetadata, V5Block
+            batch['stage1_v5_metadata'] = V5BatchMetadata(tuple(
+                V5Block(batch_index=index, **block)
+                for index, record in enumerate(records) for block in record['v5_blocks']))
+        return batch
+
+    def _live_call(self, examples: Sequence[PreparedStage1Example]) -> dict[str, object]:
+        """The original preprocessing path, also used for duplicate first-epoch rows."""
         examples = tuple(examples)
         if not examples:
             raise ValueError("Stage 1 collator requires at least one example")
