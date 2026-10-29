@@ -1477,7 +1477,7 @@ def build_push_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{source}/",
         f"{_REMOTE_HOST}:{destination}/",
@@ -1710,7 +1710,7 @@ def build_pull_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{_REMOTE_HOST}:{source}/",
         f"{local_destination}/",
@@ -1983,7 +1983,7 @@ def build_evaluation_pull_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{_REMOTE_HOST}:{remote}/",
         f"{output}/",
@@ -2021,7 +2021,7 @@ def build_prepared_inference_pull_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{_REMOTE_HOST}:{remote}/",
         f"{Path(destination)}/",
@@ -2073,7 +2073,7 @@ def build_prepared_inference_push_command(
     return (
         *prefix[:-1],
         "--rsync-path",
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync",
         "--",
         f"{source.parent}/",
         f"{_REMOTE_HOST}:{remote_parent}/",

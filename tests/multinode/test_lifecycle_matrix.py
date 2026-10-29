@@ -504,7 +504,7 @@ def test_remote_phase_evidence_uses_only_the_fixed_bounded_node_cli(tmp_path):
     remote = shlex.split(calls[0][0][6])
     assert remote[:7] == [
         "/usr/bin/docker", "exec", "--workdir", str(REPO_ROOT),
-        "llm_kd", "/usr/bin/bash", "-lc",
+        "llm_kd_rdma", "/usr/bin/bash", "-lc",
     ]
     assert len(remote) == 8
     assert shlex.split(remote[7]) == [

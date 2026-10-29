@@ -851,7 +851,7 @@ def test_push_never_overwrites_and_is_scoped_to_the_run():
     assert "--from0" in command
     assert "--checksum" not in command
     assert command[command.index("--rsync-path") + 1] == (
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync"
     )
     assert command[-2] == (
         f"{_REPOSITORY_ROOT}/checkpoints/"
@@ -879,7 +879,7 @@ def test_pull_selects_only_local_process_ranks_and_common_metadata(tmp_path):
     assert {item.process_rank for item in selected} == {None, 0, 1, 2, 3}
     command = build_pull_command(combined, tmp_path / "checkpoint-copy")
     assert command[command.index("--rsync-path") + 1] == (
-        "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
+        "/usr/bin/docker exec -i llm_kd_rdma /usr/bin/rsync"
     )
     assert command[-2].startswith(
         f"korea@172.16.11.41:{_REPOSITORY_ROOT}/checkpoints/"

@@ -47,7 +47,7 @@ def test_default_cluster_is_fixed_two_node_four_process_topology():
     spec = ClusterSpec.default()
 
     assert spec.remote_host == "korea@172.16.11.41"
-    assert spec.remote_container == "llm_kd"
+    assert spec.remote_container == "llm_kd_rdma"
     assert spec.remote_repo_root == REPO_ROOT
     if REPO_ROOT.is_relative_to("/root/workspace/ILVR"):
         relative = REPO_ROOT.relative_to(Path("/root/workspace/ILVR"))

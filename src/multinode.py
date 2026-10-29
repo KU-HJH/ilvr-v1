@@ -110,7 +110,7 @@ class ClusterSpec:
                 raise ValueError("native checkout requires explicit remote repository roots") from error
             remote_repo_root = local
         return cls(
-            remote_host="korea@172.16.11.41", remote_container="llm_kd",
+            remote_host="korea@172.16.11.41", remote_container="llm_kd_rdma",
             local_repo_root=local,
             remote_repo_root=_repository_root(remote_repo_root),
             remote_host_repo_root=_repository_root(remote_host_repo_root),
@@ -128,7 +128,7 @@ def _repository_root(value: str | Path) -> Path:
 
 
 def validate_cluster_topology(cluster: ClusterSpec) -> None:
-    expected = dict(remote_host="korea@172.16.11.41", remote_container="llm_kd",
+    expected = dict(remote_host="korea@172.16.11.41", remote_container="llm_kd_rdma",
         master_addr="172.16.11.41", socket_ifname="bond0.11", remote_rank=0,
         local_rank=1, num_machines=2, gpus_per_node=2, num_processes=4)
     for name, value in expected.items():

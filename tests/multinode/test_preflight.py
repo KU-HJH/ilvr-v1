@@ -148,7 +148,7 @@ def test_preflight_rejects_commit_mismatch_before_launch():
     ("changes", "message"),
     [
         ({"tracked_clean": False}, "tracked files"),
-        ({"container_running": False}, "llm_kd"),
+        ({"container_running": False}, "llm_kd_rdma"),
         ({"torch_version": "2.7.0+cu126"}, "environment versions"),
         ({"gpu_names": ("NVIDIA H100 NVL",)}, "exactly two GPUs"),
         ({"gpu_names": ("NVIDIA A100", "NVIDIA A100")}, "H100"),
@@ -203,7 +203,7 @@ def test_remote_exec_shell_quotes_each_argument():
     ]
     assert len(command) == 7
     remote = shlex.split(command[6])
-    assert remote[:3] == ["/usr/bin/docker", "exec", "llm_kd"]
+    assert remote[:3] == ["/usr/bin/docker", "exec", "llm_kd_rdma"]
     assert remote[3:5] == ["/usr/bin/bash", "-lc"]
     assert shlex.split(remote[5]) == ["python", "-c", "print('safe value')"]
 
@@ -235,7 +235,7 @@ def test_remote_collection_checks_container_then_parses_probe_json():
         "inspect",
         "--format",
         "{{.State.Running}}",
-        "llm_kd",
+        "llm_kd_rdma",
     ]
     assert calls[1][:6] == [
         "/usr/bin/ssh",
@@ -393,7 +393,7 @@ def test_preflight_commands_use_the_canonical_repo_venv_and_config():
         commands.local_node_info.index("--deepspeed-config") + 1
     ] == str(REPO_ROOT / "configs/deepspeed_zero2.json")
     remote_docker = shlex.split(commands.remote_node_info[-1])
-    assert remote_docker[:3] == ["/usr/bin/docker", "exec", "llm_kd"]
+    assert remote_docker[:3] == ["/usr/bin/docker", "exec", "llm_kd_rdma"]
     assert shlex.split(remote_docker[-1])[:2] == [
         "env",
         f"PYTHONPATH={REPO_ROOT}:{REPO_ROOT / 'src'}",
