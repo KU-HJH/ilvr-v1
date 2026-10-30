@@ -71,7 +71,7 @@ def test_matched_schedule_accounts_for_the_three_microbatch_final_window():
     ('ce_weight', .1), ('sim_weight', .1), ('gradient_accumulation_steps', 2),
     ('per_device_train_batch_size', 2), ('gradient_checkpointing', False),
     ('attention_implementation', 'flash_attention_2'),
-    ('vision_attention_implementation', 'sdpa'), ('ema_tau', .99),
+    ('vision_attention_implementation', 'sdpa'), ('ema_tau', -0.1),
 ])
 def test_matched_profile_rejects_drift_before_model_loading(field, value):
     from stage1.matched_execution import validate_matched_standard_execution
@@ -223,3 +223,46 @@ def test_coordinator_opt_in_reaches_both_actual_worker_parsers():
         assert parsed.stage1_variant == 'standard'
         assert parsed.ce_weight == parsed.sim_weight == 1
         assert parsed.gradient_accumulation_steps == 4 and parsed.epochs == 10
+
+
+@pytest.mark.parametrize('decay', [0., .999, 1.])
+def test_matched_standard_accepts_native_ema_decay(decay):
+    """Catches rejecting EMA before matched standard model construction."""
+    from stage1.matched_execution import validate_matched_standard_execution
+    args = SimpleNamespace(ce_weight=1., sim_weight=1., ema_tau=decay,
+        per_device_train_batch_size=1, gradient_accumulation_steps=4,
+        gradient_checkpointing=True, attention_implementation='sdpa',
+        vision_attention_implementation='flash_attention_2')
+    validate_matched_standard_execution(args, SimpleNamespace(method='dora'),
+        SimpleNamespace(enabled=True, zero_stage=1, world_size=4))
+
+
+@pytest.mark.parametrize('decay', [-.1, 1.01, float('nan'), float('inf')])
+def test_matched_standard_rejects_invalid_ema_decay(decay):
+    with pytest.raises(ValueError):
+        test_matched_standard_accepts_native_ema_decay(decay)
+
+
+def test_matched_native_deepspeed_updates_ema_only_after_applied_boundary(native_deepspeed_lifecycle):
+    """An admitted EMA profile must actually update once, after the student."""
+    from stage1.matched_execution import enable_matched_standard_execution
+    trainer, engine, wrapper = native_deepspeed_lifecycle
+    trainer.__class__ = CustomTrainerStage1
+    enable_matched_standard_execution(trainer)
+    trainer.ema_teacher.decay = .999
+    trainer._install_deepspeed_step_adapter()
+    for _ in range(3):
+        wrapper.backward(engine.module(torch.ones(1, 1)).sum()/4,
+                         sync_gradients=False, scale_wrt_gas=False)
+        torch.testing.assert_close(trainer.ema_teacher.model.weight, torch.tensor([[1.]]), rtol=0, atol=0)
+        assert trainer._successful_optimizer_steps == 0
+    wrapper.backward(engine.module(torch.ones(1, 1)).sum()/4,
+                     sync_gradients=True, scale_wrt_gas=False)
+    torch.testing.assert_close(engine.module.weight, torch.tensor([[.9]]))
+    torch.testing.assert_close(trainer.ema_teacher.model.weight, torch.tensor([[.9999]]), rtol=0, atol=1e-7)
+    assert trainer._successful_optimizer_steps == 1
+    engine.optimizer.overflow = True
+    wrapper.backward(engine.module(torch.ones(1, 1)).sum(),
+                     sync_gradients=True, scale_wrt_gas=False)
+    torch.testing.assert_close(trainer.ema_teacher.model.weight, torch.tensor([[.9999]]), rtol=0, atol=1e-7)
+    assert trainer._successful_optimizer_steps == 1

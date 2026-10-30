@@ -52,6 +52,7 @@ def test_compatible_matched_checkpoint_is_not_blanket_rejected(tmp_path):
     ('training', 'seed', 43),
     ('worker', 'stage1_ce_entropy_top_percent', None),
     ('worker', 'sim_weight', .1),
+    ('worker', 'ema_tau', .999),
 ])
 def test_resume_refuses_live_profile_drift(tmp_path, section, key, value):
     """A saved globalstep cannot authorize a changed objective, LR or loader."""
@@ -149,7 +150,8 @@ def test_exported_contract_rejects_colliding_profile(tmp_path):
     assert (checkpoint / 'stage1_matched_resume.json').read_bytes() == before
 
 
-def test_native_clean20_resume_matches_epoch_tail_and_all_state(tmp_path):
+@pytest.mark.parametrize('decay,percent', [(1., 20.), (.999, None)])
+def test_native_matched_resume_matches_epoch_tail_and_all_state(tmp_path, decay, percent):
     """Real Stage1 Trainer/EMA/clean20: seven microbatches, GAS4, split at epoch1."""
     from dataclasses import replace
     import torch
@@ -175,19 +177,19 @@ def test_native_clean20_resume_matches_epoch_tail_and_all_state(tmp_path):
         reset()
         args = _stage1_args(tmp_path, method='dora', output_dir=tmp_path/name,
             batch_size=1, gradient_accumulation_steps=4, max_steps=6, save_steps=2)
-        args.ema_tau = 1.
+        args.ema_tau = decay
         args.lora_dropout = .05
         args.sim_weight = 1.
         trainer = build_stage1_training_components(args, dependencies=replace(
             _tiny_dependencies(), prepare_dataset=lambda *_: list(range(7)))).trainer
         enable_matched_standard_execution(trainer)
         trainer.ce_weight = trainer.sim_weight = 1.
-        trainer.ce_entropy_top_percent = 20.
+        trainer.ce_entropy_top_percent = percent
         trainer.ce_entropy_special_token_ids = (125, 126, 127)
         trainer.matched_resume_profile = {
             'worker': {'stage1_variant': 'standard', 'stage1_match_v5_execution': True,
-                       'stage1_ce_entropy_top_percent': 20., 'ce_weight': 1.,
-                       'sim_weight': 1., 'ema_tau': 1.},
+                       'stage1_ce_entropy_top_percent': percent, 'ce_weight': 1.,
+                       'sim_weight': 1., 'ema_tau': decay},
             'training': _values(trainer.args, TRAINING_FIELDS),
             'data_sha256': 'd'*64, 'base_sha256': {'config.json': 'b'*64}}
         order = []
@@ -199,6 +201,7 @@ def test_native_clean20_resume_matches_epoch_tail_and_all_state(tmp_path):
         return trainer, order
     try:
         full, full_order = make('full')
+        initial_teacher = deepcopy(full.ema_teacher.model.state_dict())
         full_before = Before(full)
         full.add_callback(full_before)
         full.train()
@@ -206,6 +209,10 @@ def test_native_clean20_resume_matches_epoch_tail_and_all_state(tmp_path):
         expected_optimizer = deepcopy(full.optimizer.state_dict())
         expected_scheduler = deepcopy(full.lr_scheduler.state_dict())
         expected_teacher = deepcopy(full.ema_teacher.state_dict())
+        if decay < 1.:
+            assert any(not torch.equal(v, initial_teacher[k]) for k, v in full.ema_teacher.model.state_dict().items())
+        assert full.ema_teacher.decay == decay
+        assert full._successful_optimizer_steps == 6
         expected_rng = _capture_rng_state()
         interrupted, first_order = make('split')
         from stage1.matched_resume import MatchedCheckpointStop
@@ -252,3 +259,21 @@ def test_direct_trainer_rejects_objective_drift_before_runtime_setup(tmp_path):
     trainer.ema_teacher = SimpleNamespace(decay=1.)
     with pytest.raises(ValueError, match='profile'):
         trainer.train(resume_from_checkpoint=checkpoint)
+
+
+@pytest.mark.parametrize('decay', [0., .999, 1.])
+def test_saved_native_ema_decay_is_accepted_without_rewriting(tmp_path, decay):
+    checkpoint, contract = checkpoint_with_resume_contract(tmp_path)
+    contract['profile']['worker']['ema_tau'] = decay
+    path = checkpoint / 'stage1_matched_resume.json'
+    path.write_text(json.dumps(contract))
+    before = path.read_bytes()
+    restored = reject_matched_execution_resume(checkpoint, enabled=True)
+    assert restored['profile']['worker']['ema_tau'] == decay
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize('decay', [-.1, 1.01, float('nan'), float('inf')])
+def test_saved_invalid_ema_decay_is_rejected(tmp_path, decay):
+    with pytest.raises(ValueError):
+        test_saved_native_ema_decay_is_accepted_without_rewriting(tmp_path, decay)

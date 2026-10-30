@@ -155,9 +155,13 @@ def load_matched_resume_contract(checkpoint):
         raise ValueError('matched resume requires saved worker/training settings')
     if (worker.get('stage1_variant') != 'standard'
             or worker.get('stage1_match_v5_execution') is not True
-            or worker.get('ce_weight') != 1. or worker.get('sim_weight') != 1.
-            or worker.get('ema_tau') != 1.):
+            or worker.get('ce_weight') != 1. or worker.get('sim_weight') != 1.):
         raise ValueError('unsupported matched resume objective')
+    from .ema import _validate_decay
+    try:
+        _validate_decay(worker.get('ema_tau'))
+    except (TypeError, ValueError) as error:
+        raise ValueError('unsupported matched resume EMA decay') from error
     required = {'max_steps', 'num_train_epochs', 'per_device_train_batch_size',
                 'gradient_accumulation_steps', 'dataloader_num_workers',
                 'learning_rate', 'warmup_steps', 'seed'}

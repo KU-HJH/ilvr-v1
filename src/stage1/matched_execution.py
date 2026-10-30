@@ -19,10 +19,15 @@ _IDENTITY = {
 
 
 def validate_matched_standard_execution(args, tuning, profile):
+    from .ema import _validate_decay
+    try:
+        _validate_decay(args.ema_tau)
+    except (TypeError, ValueError) as error:
+        raise ValueError('unsupported matched standard Stage1 EMA decay') from error
     if (tuning.method != 'dora' or not profile.enabled
             or profile.zero_stage != 1 or profile.world_size != 4
             or args.ce_weight != 1. or args.sim_weight != 1.
-            or args.ema_tau != 1. or args.per_device_train_batch_size != 1
+            or args.per_device_train_batch_size != 1
             or args.gradient_accumulation_steps != 4 or not args.gradient_checkpointing
             or args.attention_implementation != 'sdpa'
             or args.vision_attention_implementation != 'flash_attention_2'):
