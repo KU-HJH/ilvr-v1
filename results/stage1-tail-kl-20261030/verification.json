@@ -1,0 +1,61 @@
+{
+  "approval": {
+    "user_message": "\uc9c4\ud589\ud574",
+    "design_version": "design commitment v1",
+    "spec": "docs/superpowers/specs/2026-10-30-stage1-tail-kl-design.md",
+    "scope": "Native Stage1 V5 optional conditional tail KL, independent review and verification; no training or merge/push"
+  },
+  "phase": "implementation/review/verification complete; human integration decision pending",
+  "path": "bounded native; existing isolated worktree; one concrete task brief",
+  "skills_executed": {
+    "using-superpowers": "intake and resumed phase reconciliation",
+    "readchk": "scope and distribution direction reconciled",
+    "brainstorming": "v1 design approved",
+    "hate": "first-nail formulated; causal RED/GREEN now passed",
+    "using-git-worktrees": "existing external4391 isolation verified",
+    "executing-plans": "native task-start/task-done and ledger",
+    "test-driven-development": "causal missing helper/config/options/source binding failures followed by passing witnesses",
+    "requesting-code-review": "fresh independent agent review with no blocking findings",
+    "verification-before-completion": "full suite on reviewed source; complete output and exit0 inspected",
+    "finishing-a-development-branch": "same full suite reused for test-pass gate; detached environment identified; human handoff pending"
+  },
+  "nonapplicable": {
+    "writing-plans": "bounded approved extension, concrete task brief used",
+    "macrothink": "commitment documented bounded cheap falsification did not trigger fresh broad design reads"
+  },
+  "reviewed_head": "cfd466cf58cac7596291cf9b1469cc8b3fcdc515",
+  "changed_file_sha256": {
+    "docs/superpowers/plans/2026-10-30-stage1-tail-kl-task-brief.md": "2edd37c2308f08ac5192719d42216e4d5ffeac027e039c1b9ea17a2f42dfe3f7",
+    "docs/superpowers/specs/2026-10-30-stage1-tail-kl-design.md": "3d38b7cad80b706d159f255beefc3b871ef8a10d274f4a7376a6031c1d98d6ed",
+    "run_stage1_training.sh": "7f356b3cbf6ff5e57202230298c36db0aed8d9ac0a51e82ca9d85f20352dbfed",
+    "src/multinode_runtime.py": "c0bbc3a6e4b45e7ef95c2903edbaa4299225149125932af2f538ca9543fa8d7e",
+    "src/stage1/trainer.py": "8bf07cfa0b3bd1933a8cdc7019ee416d9b4a9609ad0edad8ed587a5cf4191101",
+    "src/stage1/v5_config.py": "8715629b844b5db1c063d594cd8523671df7382da28e695ccfbb86457bbece32",
+    "src/stage1/v5_objective.py": "4df0f3009c8677ad168919b227856273b9813b7250420fbb4ef58cfb0facb302",
+    "src/stage1/v5_resume.py": "f97e2fd0741c745264bc9930017aa0ad417e0a09f4b65c9e04f635bae557bb6a",
+    "src/stage1/v5_trainer.py": "104da19a61f3f36c730fe781f46af7d397e635c6015cb7512738fa1d5282f28d",
+    "src/step_preference/topk_entropy_loss.py": "b63480efc935216cba79d38cc2392dfe3cb9a4b97926b4a6ceb1e5a0688fc297",
+    "src/utils_deepseed.py": "ded2b4fbb99397681e6000ae42054a68973bec8347a9972a9bc6f5e17a38d425",
+    "tests/multinode/test_stage1_tail_kl.py": "fe3ecbd61fc55138f207e8c1c090c7a269f31a09a6230b7d12167149e8fd66ca",
+    "tests/stage1/v5/test_tail_kl.py": "4893ca22c3055a18b5c7a6a8cd87801549193005854c9d8be8269ccaccb68514"
+  },
+  "focused": "644 passed in 50.15s",
+  "independent": "30 passed in 9.48s",
+  "full_suite": {
+    "command": "env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=transformers/src:src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-tail-kl-dev-20261030/full",
+    "exit_code": 0,
+    "summary": "5278 passed, 11 skipped, 1 warning in 1282.99s (0:21:22)",
+    "log": "logs/stage1-tail-kl-20261030/full.log",
+    "warning": "existing TORCH_CUDA_ARCH_LIST unset warning"
+  },
+  "requirement_witnesses": {
+    "conditional_kl_detach_T_squared_no_mass": "hand-derived first-nail head10/head10000 and T1/T2 arithmetic+gradient tests",
+    "empty_singleton_ragged_support": "zero gradients and padded ID0 support tests",
+    "same_selection_chunk_block_reduction": "all/clean masks; independent/sync_topk; chunk1/128 objective oracle",
+    "existing_voff_and_production_metrics": "real tiny Qwen parent backward; entropy0/.1; diagnosticsoff; expected call sequence and weighted sum",
+    "cli_and_resume": "both coordinator worker parses; saved settings inheritance/drift rejection; schemas2/3/4 and new5; strict source hashes",
+    "disabled_and_existing_regressions": "full project suite5278pass11skip"
+  },
+  "limitations": "No GPU performance/4-rank training or convergence claim; strict source identity may reject historical cross-revision resumes.",
+  "minor_deferred": "Historical design paragraph still says pending; current status is recorded here, in header and ledger."
+}

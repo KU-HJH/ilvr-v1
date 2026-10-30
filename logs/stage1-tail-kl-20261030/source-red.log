@@ -1,0 +1,43 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+________ test_tail_runtime_identity_binds_kernel_and_objective_sources _________
+
+tmp_path = PosixPath('/raid/workspace/ILVR/checkpoints/stage1-tail-kl-dev-20261030/source-red/test_tail_runtime_identity_bin0')
+
+    def test_tail_runtime_identity_binds_kernel_and_objective_sources(tmp_path):
+        """Catches accepting a resume after only its tail math source changes."""
+        import hashlib
+        import inspect
+        from copy import deepcopy
+        from types import SimpleNamespace
+        from torch.utils.data import DataLoader
+        from deepspeed_runtime import DeepSpeedRuntimeProfile
+        from peft_common import resolve_qwen2_5_vl_model
+        from stage1.types import DEFAULT_STAGE1_TARGET_SUFFIXES
+        from stage1.v5_reference import V5ReferenceIdentity
+        from step_preference import topk_entropy_loss
+        from tests.stage1.v5.test_trainer import integrated_fixture
+        from pathlib import Path
+        trainer, *_ = integrated_fixture(tmp_path, debug=False)
+        trainer.v5_config = replace(trainer.v5_config, lambda_tail_kl=.7)
+        trainer.v5_reference_identity = V5ReferenceIdentity(1, 'a'*64, 'b'*64, 'c'*64, ('weight',))
+        trainer.stage1_peft_metadata = SimpleNamespace(base_model_reference='original/tiny',
+            requested_target_suffixes=DEFAULT_STAGE1_TARGET_SUFFIXES)
+        trainer.coverage_p = .9; trainer.image_pool_k = 2; trainer.helper_group_L = 2
+        trainer.textual_states = 'previous'
+        resolve_qwen2_5_vl_model(trainer.model).config.compress_strategy = 'average'
+        trainer.args.bf16 = True; trainer.args.max_seq_length = 32768; trainer.args.max_steps = 3
+        trainer.deepspeed_runtime_profile = DeepSpeedRuntimeProfile(True, 1, None, 'a'*64, 4)
+        trainer.train_dataset = list(range(10))
+        saved = trainer._build_v5_runtime_contract(DataLoader(trainer.train_dataset, batch_size=1))
+        for key, function in [('tail_kl', topk_entropy_loss.entropy_support_tail_kl),
+                              ('v5_objective', compute_v5_loss_sums)]:
+>           assert saved['execution']['source_sha256'][key] == hashlib.sha256(
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+                Path(inspect.getsourcefile(function)).read_bytes()).hexdigest()
+E           KeyError: 'tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:207: KeyError
+=========================== short test summary info ============================
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_runtime_identity_binds_kernel_and_objective_sources
+1 failed in 8.80s

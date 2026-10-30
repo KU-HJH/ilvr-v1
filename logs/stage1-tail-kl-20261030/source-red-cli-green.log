@@ -1,0 +1,22 @@
+F...                                                                     [100%]
+=================================== FAILURES ===================================
+________ test_tail_runtime_identity_binds_kernel_and_objective_sources _________
+
+tmp_path = PosixPath('/raid/workspace/ILVR/checkpoints/stage1-tail-kl-dev-20261030/source-red-cli-green/test_tail_runtime_identity_bin0')
+
+    def test_tail_runtime_identity_binds_kernel_and_objective_sources(tmp_path):
+        """Catches accepting a resume after only its tail math source changes."""
+        import hashlib
+        import inspect
+        from copy import deepcopy
+        from types import SimpleNamespace
+        from torch.utils.data import DataLoader
+        from deepspeed_runtime import DeepSpeedRuntimeProfile
+        from peft_common import resolve_qwen2_5_vl_model
+>       from stage1.peft import DEFAULT_STAGE1_TARGET_SUFFIXES
+E       ImportError: cannot import name 'DEFAULT_STAGE1_TARGET_SUFFIXES' from 'stage1.peft' (/root/.codex/worktrees/4391/ILVR/src/stage1/peft.py)
+
+tests/stage1/v5/test_tail_kl.py:188: ImportError
+=========================== short test summary info ============================
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_runtime_identity_binds_kernel_and_objective_sources
+1 failed, 3 passed in 3.34s

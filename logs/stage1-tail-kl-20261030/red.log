@@ -1,0 +1,523 @@
+FFFFFFFFFF......FFFFFFFFF                                                [100%]
+=================================== FAILURES ===================================
+_____________ test_tail_kl_and_gradient_ignore_head_mass[10.0-1.0] _____________
+
+temperature = 1.0, head = 10.0
+
+    @pytest.mark.parametrize('temperature', [1., 2.])
+    @pytest.mark.parametrize('head', [10., 10000.])
+    def test_tail_kl_and_gradient_ignore_head_mass(temperature, head):
+        """First nail: p=(.75,.25), q=(.25,.75), whatever the excluded head mass."""
+        clean = torch.tensor([[head, head + 1, temperature * math.log(3), 0.]], requires_grad=True)
+        off = torch.tensor([[head + 8, head - 1, 0., temperature * math.log(3)]], requires_grad=True)
+        support = build_entropy_support(clean, off, torch.tensor([0]),
+            k=2, mode='sync_topk', include_gt=False)
+>       loss = tail(clean, off, support, temperature=temperature)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/stage1/v5/test_tail_kl.py:30: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (tensor([[10.0000, 11.0000,  1.0986,  0.0000]], requires_grad=True), tensor([[18.0000,  9.0000,  0.0000,  1.0986]], requires_grad=True), CandidateSupport(ids=tensor([[1, 0]]), valid=tensor([[True, True]]), gt_coverage=tensor([True])))
+kwargs = {'temperature': 1.0}
+
+    def tail(*args, **kwargs):
+        from step_preference import topk_entropy_loss
+        function = getattr(topk_entropy_loss, 'entropy_support_tail_kl', None)
+>       assert callable(function), 'conditional tail KL implementation missing'
+E       AssertionError: conditional tail KL implementation missing
+E       assert False
+E        +  where False = callable(None)
+
+tests/stage1/v5/test_tail_kl.py:18: AssertionError
+_____________ test_tail_kl_and_gradient_ignore_head_mass[10.0-2.0] _____________
+
+temperature = 2.0, head = 10.0
+
+    @pytest.mark.parametrize('temperature', [1., 2.])
+    @pytest.mark.parametrize('head', [10., 10000.])
+    def test_tail_kl_and_gradient_ignore_head_mass(temperature, head):
+        """First nail: p=(.75,.25), q=(.25,.75), whatever the excluded head mass."""
+        clean = torch.tensor([[head, head + 1, temperature * math.log(3), 0.]], requires_grad=True)
+        off = torch.tensor([[head + 8, head - 1, 0., temperature * math.log(3)]], requires_grad=True)
+        support = build_entropy_support(clean, off, torch.tensor([0]),
+            k=2, mode='sync_topk', include_gt=False)
+>       loss = tail(clean, off, support, temperature=temperature)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/stage1/v5/test_tail_kl.py:30: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (tensor([[10.0000, 11.0000,  2.1972,  0.0000]], requires_grad=True), tensor([[18.0000,  9.0000,  0.0000,  2.1972]], requires_grad=True), CandidateSupport(ids=tensor([[1, 0]]), valid=tensor([[True, True]]), gt_coverage=tensor([True])))
+kwargs = {'temperature': 2.0}
+
+    def tail(*args, **kwargs):
+        from step_preference import topk_entropy_loss
+        function = getattr(topk_entropy_loss, 'entropy_support_tail_kl', None)
+>       assert callable(function), 'conditional tail KL implementation missing'
+E       AssertionError: conditional tail KL implementation missing
+E       assert False
+E        +  where False = callable(None)
+
+tests/stage1/v5/test_tail_kl.py:18: AssertionError
+___________ test_tail_kl_and_gradient_ignore_head_mass[10000.0-1.0] ____________
+
+temperature = 1.0, head = 10000.0
+
+    @pytest.mark.parametrize('temperature', [1., 2.])
+    @pytest.mark.parametrize('head', [10., 10000.])
+    def test_tail_kl_and_gradient_ignore_head_mass(temperature, head):
+        """First nail: p=(.75,.25), q=(.25,.75), whatever the excluded head mass."""
+        clean = torch.tensor([[head, head + 1, temperature * math.log(3), 0.]], requires_grad=True)
+        off = torch.tensor([[head + 8, head - 1, 0., temperature * math.log(3)]], requires_grad=True)
+        support = build_entropy_support(clean, off, torch.tensor([0]),
+            k=2, mode='sync_topk', include_gt=False)
+>       loss = tail(clean, off, support, temperature=temperature)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/stage1/v5/test_tail_kl.py:30: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (tensor([[1.0000e+04, 1.0001e+04, 1.0986e+00, 0.0000e+00]], requires_grad=True), tensor([[1.0008e+04, 9.9990e+03, 0.00... requires_grad=True), CandidateSupport(ids=tensor([[1, 0]]), valid=tensor([[True, True]]), gt_coverage=tensor([True])))
+kwargs = {'temperature': 1.0}
+
+    def tail(*args, **kwargs):
+        from step_preference import topk_entropy_loss
+        function = getattr(topk_entropy_loss, 'entropy_support_tail_kl', None)
+>       assert callable(function), 'conditional tail KL implementation missing'
+E       AssertionError: conditional tail KL implementation missing
+E       assert False
+E        +  where False = callable(None)
+
+tests/stage1/v5/test_tail_kl.py:18: AssertionError
+___________ test_tail_kl_and_gradient_ignore_head_mass[10000.0-2.0] ____________
+
+temperature = 2.0, head = 10000.0
+
+    @pytest.mark.parametrize('temperature', [1., 2.])
+    @pytest.mark.parametrize('head', [10., 10000.])
+    def test_tail_kl_and_gradient_ignore_head_mass(temperature, head):
+        """First nail: p=(.75,.25), q=(.25,.75), whatever the excluded head mass."""
+        clean = torch.tensor([[head, head + 1, temperature * math.log(3), 0.]], requires_grad=True)
+        off = torch.tensor([[head + 8, head - 1, 0., temperature * math.log(3)]], requires_grad=True)
+        support = build_entropy_support(clean, off, torch.tensor([0]),
+            k=2, mode='sync_topk', include_gt=False)
+>       loss = tail(clean, off, support, temperature=temperature)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/stage1/v5/test_tail_kl.py:30: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (tensor([[1.0000e+04, 1.0001e+04, 2.1972e+00, 0.0000e+00]], requires_grad=True), tensor([[1.0008e+04, 9.9990e+03, 0.00... requires_grad=True), CandidateSupport(ids=tensor([[1, 0]]), valid=tensor([[True, True]]), gt_coverage=tensor([True])))
+kwargs = {'temperature': 2.0}
+
+    def tail(*args, **kwargs):
+        from step_preference import topk_entropy_loss
+        function = getattr(topk_entropy_loss, 'entropy_support_tail_kl', None)
+>       assert callable(function), 'conditional tail KL implementation missing'
+E       AssertionError: conditional tail KL implementation missing
+E       assert False
+E        +  where False = callable(None)
+
+tests/stage1/v5/test_tail_kl.py:18: AssertionError
+_________ test_empty_and_singleton_tail_are_connected_zero_without_nan _________
+
+    def test_empty_and_singleton_tail_are_connected_zero_without_nan():
+        """Catches all-masked softmax NaNs and padded ID0 overwriting membership."""
+        clean = torch.tensor([[2., 1., 0.], [2., 1., 0.]], requires_grad=True)
+        off = torch.tensor([[0., 1., 2.], [0., 1., 2.]], requires_grad=True)
+        support = CandidateSupport(torch.tensor([[0, 1, 2], [0, 1, 0]]),
+            torch.tensor([[True, True, True], [True, True, False]]), torch.tensor([False, True]))
+>       loss = tail(clean, off, support)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+tests/stage1/v5/test_tail_kl.py:43: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+args = (tensor([[2., 1., 0.],
+        [2., 1., 0.]], requires_grad=True), tensor([[0., 1., 2.],
+        [0., 1., 2.]], requir...[0, 1, 0]]), valid=tensor([[ True,  True,  True],
+        [ True,  True, False]]), gt_coverage=tensor([False,  True])))
+kwargs = {}
+
+    def tail(*args, **kwargs):
+        from step_preference import topk_entropy_loss
+        function = getattr(topk_entropy_loss, 'entropy_support_tail_kl', None)
+>       assert callable(function), 'conditional tail KL implementation missing'
+E       AssertionError: conditional tail KL implementation missing
+E       assert False
+E        +  where False = callable(None)
+
+tests/stage1/v5/test_tail_kl.py:18: AssertionError
+_ test_tail_objective_reuses_ragged_support_and_block_reduction[1-independent-supports0] _
+
+mode = 'independent', supports = [[0, 1], [1, 2, 3], [0, 2, 1]], chunk = 1
+
+    @pytest.mark.parametrize('mode,supports', [
+        ('independent', [[0, 1], [1, 2, 3], [0, 2, 1]]),
+        ('sync_topk', [[2, 0], [0, 2, 3], [1, 3]]),
+    ])
+    @pytest.mark.parametrize('chunk', [1, 128])
+    def test_tail_objective_reuses_ragged_support_and_block_reduction(mode, supports, chunk):
+        """Catches different support, wrong denominator, or late-bound chunk masks."""
+        clean, ref, off, text = fixture()
+>       config = Stage1V5Config(lambda_tail_kl=.7, preference_topk_k=2,
+            preference_topk_mode=mode, topk_include_gt=True, loss_chunk_positions=chunk)
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:58: TypeError
+_ test_tail_objective_reuses_ragged_support_and_block_reduction[1-sync_topk-supports1] _
+
+mode = 'sync_topk', supports = [[2, 0], [0, 2, 3], [1, 3]], chunk = 1
+
+    @pytest.mark.parametrize('mode,supports', [
+        ('independent', [[0, 1], [1, 2, 3], [0, 2, 1]]),
+        ('sync_topk', [[2, 0], [0, 2, 3], [1, 3]]),
+    ])
+    @pytest.mark.parametrize('chunk', [1, 128])
+    def test_tail_objective_reuses_ragged_support_and_block_reduction(mode, supports, chunk):
+        """Catches different support, wrong denominator, or late-bound chunk masks."""
+        clean, ref, off, text = fixture()
+>       config = Stage1V5Config(lambda_tail_kl=.7, preference_topk_k=2,
+            preference_topk_mode=mode, topk_include_gt=True, loss_chunk_positions=chunk)
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:58: TypeError
+_ test_tail_objective_reuses_ragged_support_and_block_reduction[128-independent-supports0] _
+
+mode = 'independent', supports = [[0, 1], [1, 2, 3], [0, 2, 1]], chunk = 128
+
+    @pytest.mark.parametrize('mode,supports', [
+        ('independent', [[0, 1], [1, 2, 3], [0, 2, 1]]),
+        ('sync_topk', [[2, 0], [0, 2, 3], [1, 3]]),
+    ])
+    @pytest.mark.parametrize('chunk', [1, 128])
+    def test_tail_objective_reuses_ragged_support_and_block_reduction(mode, supports, chunk):
+        """Catches different support, wrong denominator, or late-bound chunk masks."""
+        clean, ref, off, text = fixture()
+>       config = Stage1V5Config(lambda_tail_kl=.7, preference_topk_k=2,
+            preference_topk_mode=mode, topk_include_gt=True, loss_chunk_positions=chunk)
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:58: TypeError
+_ test_tail_objective_reuses_ragged_support_and_block_reduction[128-sync_topk-supports1] _
+
+mode = 'sync_topk', supports = [[2, 0], [0, 2, 3], [1, 3]], chunk = 128
+
+    @pytest.mark.parametrize('mode,supports', [
+        ('independent', [[0, 1], [1, 2, 3], [0, 2, 1]]),
+        ('sync_topk', [[2, 0], [0, 2, 3], [1, 3]]),
+    ])
+    @pytest.mark.parametrize('chunk', [1, 128])
+    def test_tail_objective_reuses_ragged_support_and_block_reduction(mode, supports, chunk):
+        """Catches different support, wrong denominator, or late-bound chunk masks."""
+        clean, ref, off, text = fixture()
+>       config = Stage1V5Config(lambda_tail_kl=.7, preference_topk_k=2,
+            preference_topk_mode=mode, topk_include_gt=True, loss_chunk_positions=chunk)
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:58: TypeError
+_ test_tail_uses_clean_token_selection_and_production_diagnostics_can_stay_off _
+
+    def test_tail_uses_clean_token_selection_and_production_diagnostics_can_stay_off():
+        clean, ref, off, text = fixture()
+>       config = Stage1V5Config(lambda_tail_kl=1., preference_topk_k=2,
+            selection='clean', preference_entropy_top_percent=20, preference_topk_mode='sync_topk')
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:77: TypeError
+___________ test_tail_default_is_off_and_has_independent_temperature ___________
+
+    def test_tail_default_is_off_and_has_independent_temperature():
+        config = resolve_v5_config({})
+>       assert config.lambda_tail_kl == 0
+               ^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Stage1V5Config' object has no attribute 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:103: AttributeError
+_______ test_tail_contract_roundtrip_and_drift_rejection[attention_mask] _______
+
+mode = 'attention_mask'
+
+    @pytest.mark.parametrize('mode', ['attention_mask', 'cross_helper_reverse_topk_independent',
+                                      'cross_helper_reverse_topk_cumulative'])
+    def test_tail_contract_roundtrip_and_drift_rejection(mode):
+        from stage1.v5_resume import build_v5_contract, validate_v5_resume
+        from stage1.v5_reference import V5ReferenceIdentity
+        reference = V5ReferenceIdentity(1, 'a'*64, 'b'*64, 'c'*64, ('lora_A',))
+>       config = Stage1V5Config(lambda_tail_kl=.7, tail_kl_temperature=2., preference_topk_k=2, voff_mode=mode)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:115: TypeError
+_ test_tail_contract_roundtrip_and_drift_rejection[cross_helper_reverse_topk_independent] _
+
+mode = 'cross_helper_reverse_topk_independent'
+
+    @pytest.mark.parametrize('mode', ['attention_mask', 'cross_helper_reverse_topk_independent',
+                                      'cross_helper_reverse_topk_cumulative'])
+    def test_tail_contract_roundtrip_and_drift_rejection(mode):
+        from stage1.v5_resume import build_v5_contract, validate_v5_resume
+        from stage1.v5_reference import V5ReferenceIdentity
+        reference = V5ReferenceIdentity(1, 'a'*64, 'b'*64, 'c'*64, ('lora_A',))
+>       config = Stage1V5Config(lambda_tail_kl=.7, tail_kl_temperature=2., preference_topk_k=2, voff_mode=mode)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:115: TypeError
+_ test_tail_contract_roundtrip_and_drift_rejection[cross_helper_reverse_topk_cumulative] _
+
+mode = 'cross_helper_reverse_topk_cumulative'
+
+    @pytest.mark.parametrize('mode', ['attention_mask', 'cross_helper_reverse_topk_independent',
+                                      'cross_helper_reverse_topk_cumulative'])
+    def test_tail_contract_roundtrip_and_drift_rejection(mode):
+        from stage1.v5_resume import build_v5_contract, validate_v5_resume
+        from stage1.v5_reference import V5ReferenceIdentity
+        reference = V5ReferenceIdentity(1, 'a'*64, 'b'*64, 'c'*64, ('lora_A',))
+>       config = Stage1V5Config(lambda_tail_kl=.7, tail_kl_temperature=2., preference_topk_k=2, voff_mode=mode)
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:115: TypeError
+_________ test_historical_contract_keeps_its_field_set_and_tail_off[2] _________
+
+version = 2
+
+    @pytest.mark.parametrize('version', [2, 3, 4])
+    def test_historical_contract_keeps_its_field_set_and_tail_off(version):
+        from stage1.v5_resume import build_v5_contract, validate_v5_resume
+        from stage1.v5_reference import V5ReferenceIdentity
+        kwargs = {'selection': 'clean', 'preference_entropy_top_percent':20} if version == 3 else {}
+        if version == 4:
+            kwargs['voff_mode'] = 'cross_helper_reverse_topk_independent'
+        config = Stage1V5Config(**kwargs)
+        reference = V5ReferenceIdentity(1, 'a'*64, 'b'*64, 'c'*64, ('lora_A',))
+        saved = build_v5_contract(config, reference, ce_weight=.1, sim_weight=.1,
+            schedule={'dil_denominator': 'actual_window_selected_dil_tokens' if version == 3
+                      else 'actual_window_eligible_dil_tokens'}, execution={})
+        assert saved['schema_version'] == version
+        assert 'lambda_tail_kl' not in saved['config']
+        assert 'tail_kl_temperature' not in saved['config']
+>       assert validate_v5_resume(saved, {}).lambda_tail_kl == 0
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Stage1V5Config' object has no attribute 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:143: AttributeError
+_________ test_historical_contract_keeps_its_field_set_and_tail_off[3] _________
+
+version = 3
+
+    @pytest.mark.parametrize('version', [2, 3, 4])
+    def test_historical_contract_keeps_its_field_set_and_tail_off(version):
+        from stage1.v5_resume import build_v5_contract, validate_v5_resume
+        from stage1.v5_reference import V5ReferenceIdentity
+        kwargs = {'selection': 'clean', 'preference_entropy_top_percent':20} if version == 3 else {}
+        if version == 4:
+            kwargs['voff_mode'] = 'cross_helper_reverse_topk_independent'
+        config = Stage1V5Config(**kwargs)
+        reference = V5ReferenceIdentity(1, 'a'*64, 'b'*64, 'c'*64, ('lora_A',))
+        saved = build_v5_contract(config, reference, ce_weight=.1, sim_weight=.1,
+            schedule={'dil_denominator': 'actual_window_selected_dil_tokens' if version == 3
+                      else 'actual_window_eligible_dil_tokens'}, execution={})
+        assert saved['schema_version'] == version
+        assert 'lambda_tail_kl' not in saved['config']
+        assert 'tail_kl_temperature' not in saved['config']
+>       assert validate_v5_resume(saved, {}).lambda_tail_kl == 0
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Stage1V5Config' object has no attribute 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:143: AttributeError
+_________ test_historical_contract_keeps_its_field_set_and_tail_off[4] _________
+
+version = 4
+
+    @pytest.mark.parametrize('version', [2, 3, 4])
+    def test_historical_contract_keeps_its_field_set_and_tail_off(version):
+        from stage1.v5_resume import build_v5_contract, validate_v5_resume
+        from stage1.v5_reference import V5ReferenceIdentity
+        kwargs = {'selection': 'clean', 'preference_entropy_top_percent':20} if version == 3 else {}
+        if version == 4:
+            kwargs['voff_mode'] = 'cross_helper_reverse_topk_independent'
+        config = Stage1V5Config(**kwargs)
+        reference = V5ReferenceIdentity(1, 'a'*64, 'b'*64, 'c'*64, ('lora_A',))
+        saved = build_v5_contract(config, reference, ce_weight=.1, sim_weight=.1,
+            schedule={'dil_denominator': 'actual_window_selected_dil_tokens' if version == 3
+                      else 'actual_window_eligible_dil_tokens'}, execution={})
+        assert saved['schema_version'] == version
+        assert 'lambda_tail_kl' not in saved['config']
+        assert 'tail_kl_temperature' not in saved['config']
+>       assert validate_v5_resume(saved, {}).lambda_tail_kl == 0
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Stage1V5Config' object has no attribute 'lambda_tail_kl'
+
+tests/stage1/v5/test_tail_kl.py:143: AttributeError
+____ test_real_v5_backward_logs_all_weighted_terms_without_diagnostics[0.0] ____
+
+tmp_path = PosixPath('/raid/workspace/ILVR/checkpoints/stage1-tail-kl-dev-20261030/red/test_real_v5_backward_logs_all0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x745c161d1890>
+entropy = 0.0
+
+    @pytest.mark.parametrize('entropy', [0., .1])
+    def test_real_v5_backward_logs_all_weighted_terms_without_diagnostics(tmp_path, monkeypatch, entropy):
+        """Catches missing tail-only replay, extra forwards, or debug-only metric wiring."""
+        from transformers import Trainer
+        from tests.stage1.v5.test_trainer import integrated_fixture
+        trainer, inputs, calls, _, backs, _ = integrated_fixture(tmp_path, debug=False)
+>       trainer.v5_config = replace(trainer.v5_config, lambda_tail_kl=.7,
+            lambda_topk_entropy=entropy, lambda_topk_mass=.05 if entropy else 0.)
+
+tests/stage1/v5/test_tail_kl.py:154: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+obj = Stage1V5Config(loss_type='dil_bce_orig', beta=1.0, margin=0.0, lambda_preference=1.0, lambda_topk_entropy=0.1, prefere...ight=0.01, temperature=2.0, rho_min=0.3, rho_max=0.5, text_cap=0.3, low_attention_mass=0.1, low_attention_fraction=0.1)
+changes = {'lambda_tail_kl': 0.7, 'lambda_topk_entropy': 0.0, 'lambda_topk_mass': 0.0, 'loss_type': 'dil_bce_orig', ...}
+
+    def replace(obj, /, **changes):
+        """Return a new object replacing specified fields with new values.
+    
+        This is especially useful for frozen classes.  Example usage::
+    
+          @dataclass(frozen=True)
+          class C:
+              x: int
+              y: int
+    
+          c = C(1, 2)
+          c1 = replace(c, x=3)
+          assert c1.x == 3 and c1.y == 2
+        """
+    
+        # We're going to mutate 'changes', but that's okay because it's a
+        # new dict, even if called with 'replace(obj, **my_changes)'.
+    
+        if not _is_dataclass_instance(obj):
+            raise TypeError("replace() should be called on dataclass instances")
+    
+        # It's an error to have init=False fields in 'changes'.
+        # If a field is not in 'changes', read its value from the provided obj.
+    
+        for f in getattr(obj, _FIELDS).values():
+            # Only consider normal fields or InitVars.
+            if f._field_type is _FIELD_CLASSVAR:
+                continue
+    
+            if not f.init:
+                # Error if this field is specified in changes.
+                if f.name in changes:
+                    raise ValueError(f'field {f.name} is declared with '
+                                     'init=False, it cannot be specified with '
+                                     'replace()')
+                continue
+    
+            if f.name not in changes:
+                if f._field_type is _FIELD_INITVAR and f.default is MISSING:
+                    raise ValueError(f"InitVar {f.name!r} "
+                                     'must be specified with replace()')
+                changes[f.name] = getattr(obj, f.name)
+    
+        # Create the new object, which calls __init__() and
+        # __post_init__() (if defined), using all of the init fields we've
+        # added and/or left in 'changes'.  If there are values supplied in
+        # changes that aren't fields, this will correctly raise a
+        # TypeError.
+>       return obj.__class__(**changes)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+/usr/lib/python3.11/dataclasses.py:1503: TypeError
+____ test_real_v5_backward_logs_all_weighted_terms_without_diagnostics[0.1] ____
+
+tmp_path = PosixPath('/raid/workspace/ILVR/checkpoints/stage1-tail-kl-dev-20261030/red/test_real_v5_backward_logs_all1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x745c06e7e510>
+entropy = 0.1
+
+    @pytest.mark.parametrize('entropy', [0., .1])
+    def test_real_v5_backward_logs_all_weighted_terms_without_diagnostics(tmp_path, monkeypatch, entropy):
+        """Catches missing tail-only replay, extra forwards, or debug-only metric wiring."""
+        from transformers import Trainer
+        from tests.stage1.v5.test_trainer import integrated_fixture
+        trainer, inputs, calls, _, backs, _ = integrated_fixture(tmp_path, debug=False)
+>       trainer.v5_config = replace(trainer.v5_config, lambda_tail_kl=.7,
+            lambda_topk_entropy=entropy, lambda_topk_mass=.05 if entropy else 0.)
+
+tests/stage1/v5/test_tail_kl.py:154: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+obj = Stage1V5Config(loss_type='dil_bce_orig', beta=1.0, margin=0.0, lambda_preference=1.0, lambda_topk_entropy=0.1, prefere...ight=0.01, temperature=2.0, rho_min=0.3, rho_max=0.5, text_cap=0.3, low_attention_mass=0.1, low_attention_fraction=0.1)
+changes = {'lambda_tail_kl': 0.7, 'lambda_topk_entropy': 0.1, 'lambda_topk_mass': 0.05, 'loss_type': 'dil_bce_orig', ...}
+
+    def replace(obj, /, **changes):
+        """Return a new object replacing specified fields with new values.
+    
+        This is especially useful for frozen classes.  Example usage::
+    
+          @dataclass(frozen=True)
+          class C:
+              x: int
+              y: int
+    
+          c = C(1, 2)
+          c1 = replace(c, x=3)
+          assert c1.x == 3 and c1.y == 2
+        """
+    
+        # We're going to mutate 'changes', but that's okay because it's a
+        # new dict, even if called with 'replace(obj, **my_changes)'.
+    
+        if not _is_dataclass_instance(obj):
+            raise TypeError("replace() should be called on dataclass instances")
+    
+        # It's an error to have init=False fields in 'changes'.
+        # If a field is not in 'changes', read its value from the provided obj.
+    
+        for f in getattr(obj, _FIELDS).values():
+            # Only consider normal fields or InitVars.
+            if f._field_type is _FIELD_CLASSVAR:
+                continue
+    
+            if not f.init:
+                # Error if this field is specified in changes.
+                if f.name in changes:
+                    raise ValueError(f'field {f.name} is declared with '
+                                     'init=False, it cannot be specified with '
+                                     'replace()')
+                continue
+    
+            if f.name not in changes:
+                if f._field_type is _FIELD_INITVAR and f.default is MISSING:
+                    raise ValueError(f"InitVar {f.name!r} "
+                                     'must be specified with replace()')
+                changes[f.name] = getattr(obj, f.name)
+    
+        # Create the new object, which calls __init__() and
+        # __post_init__() (if defined), using all of the init fields we've
+        # added and/or left in 'changes'.  If there are values supplied in
+        # changes that aren't fields, this will correctly raise a
+        # TypeError.
+>       return obj.__class__(**changes)
+               ^^^^^^^^^^^^^^^^^^^^^^^^
+E       TypeError: Stage1V5Config.__init__() got an unexpected keyword argument 'lambda_tail_kl'
+
+/usr/lib/python3.11/dataclasses.py:1503: TypeError
+=========================== short test summary info ============================
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_kl_and_gradient_ignore_head_mass[10.0-1.0]
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_kl_and_gradient_ignore_head_mass[10.0-2.0]
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_kl_and_gradient_ignore_head_mass[10000.0-1.0]
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_kl_and_gradient_ignore_head_mass[10000.0-2.0]
+FAILED tests/stage1/v5/test_tail_kl.py::test_empty_and_singleton_tail_are_connected_zero_without_nan
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_objective_reuses_ragged_support_and_block_reduction[1-independent-supports0]
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_objective_reuses_ragged_support_and_block_reduction[1-sync_topk-supports1]
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_objective_reuses_ragged_support_and_block_reduction[128-independent-supports0]
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_objective_reuses_ragged_support_and_block_reduction[128-sync_topk-supports1]
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_uses_clean_token_selection_and_production_diagnostics_can_stay_off
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_default_is_off_and_has_independent_temperature
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_contract_roundtrip_and_drift_rejection[attention_mask]
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_contract_roundtrip_and_drift_rejection[cross_helper_reverse_topk_independent]
+FAILED tests/stage1/v5/test_tail_kl.py::test_tail_contract_roundtrip_and_drift_rejection[cross_helper_reverse_topk_cumulative]
+FAILED tests/stage1/v5/test_tail_kl.py::test_historical_contract_keeps_its_field_set_and_tail_off[2]
+FAILED tests/stage1/v5/test_tail_kl.py::test_historical_contract_keeps_its_field_set_and_tail_off[3]
+FAILED tests/stage1/v5/test_tail_kl.py::test_historical_contract_keeps_its_field_set_and_tail_off[4]
+FAILED tests/stage1/v5/test_tail_kl.py::test_real_v5_backward_logs_all_weighted_terms_without_diagnostics[0.0]
+FAILED tests/stage1/v5/test_tail_kl.py::test_real_v5_backward_logs_all_weighted_terms_without_diagnostics[0.1]
+19 failed, 6 passed in 8.92s

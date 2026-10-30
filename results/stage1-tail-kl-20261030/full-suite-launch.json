@@ -1,0 +1,7 @@
+{
+  "pid": 611317,
+  "started": "2026-10-30T17:17:15.995560+00:00",
+  "command": "env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=transformers/src:src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-tail-kl-dev-20261030/full",
+  "head": "cfd466cf58cac7596291cf9b1469cc8b3fcdc515",
+  "log": "/root/.codex/worktrees/4391/ILVR/logs/stage1-tail-kl-20261030/full.log"
+}
