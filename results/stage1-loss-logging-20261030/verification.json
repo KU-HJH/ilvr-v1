@@ -23,11 +23,11 @@
     "seconds": 1332.68,
     "warning": "existing TORCH_CUDA_ARCH_LIST unset in installed CPU Adam test",
     "command": "env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=transformers/src:src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-loss-logging-dev-20261030/full-retry; result=$?; printf \"%s\\n\" \"$result\" > logs/stage1-loss-logging-20261030/full.exit; exit \"$result\"",
-    "log": "logs/stage1-loss-logging-20261030/full.log",
+    "log": "/root/.codex/worktrees/4391/ILVR/logs/stage1-loss-logging-20261030/full.log",
     "log_sha256": "d897d9acddd570f904755404befb8cd684e048817ca8d66b7932c3e2be8f7832",
     "interrupted_attempt": "logs/stage1-loss-logging-20261030/full-interrupted.log"
   },
-  "deployment": "not applied to running training",
+  "deployment": "fast-forward merged into /root/.codex/worktrees/b226/ILVR; completed training history unchanged; remote runtime not changed in this local integration",
   "hashes": {
     "src/stage1/trainer.py": "dcad246d9f7e2745cf1c5ec678fa9b35ae1d8c65a610df5c09b18557a2aaaa74",
     "tests/stage1/test_loss_logging.py": "dbecb28f6d3ca9335fee486d908f6fdf92bef8942c7161e59bb2b192689f93b3"
@@ -37,9 +37,19 @@
     "GPU/NCCL overhead unmeasured",
     "nonfinite aggregate imputation equivalence excluded",
     "historical schedule and whole-run summary unchanged",
-    "active run deployment excluded",
-    "full suite pending"
+    "active run deployment excluded"
   ],
-  "completion": "implementation/review/verification complete; integration decision pending",
-  "handoff": "native externally managed detached worktree preserved; b226/remote active experiment sources unchanged"
+  "completion": "implementation, independent review, full verification and user-authorized local integration complete",
+  "handoff": "User approved integration and continuation with tail KL by 그렇게 해라. Externally managed source worktree4391 preserved.",
+  "integration": {
+    "authorized_by": "그렇게 해라 after explicit b226 integration question",
+    "revision": "87df252bf19d9521c6ae6260a72e82c40cc9c463",
+    "destination": "/root/.codex/worktrees/b226/ILVR",
+    "method": "git merge --ff-only",
+    "source_and_test_hashes": "exact match to reviewed/full-tested code",
+    "fresh_test_result": "6 passed in 21.20s",
+    "fresh_test_command": "env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=transformers/src:src ./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/test_loss_logging.py --basetemp=checkpoints/stage1-loss-logging-dev-20261030/integrated-b226",
+    "fresh_test_log": "logs/stage1-loss-logging-integrated-20261030.log",
+    "fresh_test_log_sha256": "300903bfdfe1cdb3cf7e0b79a11c4240b1be00887864ee42bf8360cf2b9de176"
+  }
 }
