@@ -1,6 +1,6 @@
 # Stage 1 EMA baseline — design commitment v1
 
-Status: approach selected by user `ㅇㅋ`; this concrete design awaits final approval. No requested implementation or training has started. Native implementation remains the user-selected method.
+Status: final design v1 approved by user `ㅇㅋ` after its linked presentation and implementation-through-analysis question. Native implementation remains the user-selected method. Approval evidence: results/stage1-ema-baseline-20261030/design-evidence-v1.json.
 
 ## Intent and approaches
 
