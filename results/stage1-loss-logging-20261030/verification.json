@@ -1,0 +1,45 @@
+{
+  "design_version": "v1",
+  "approval": {
+    "answer": "수정안 v1 승인, 진행",
+    "scope": "standard Stage1 CE/alignment raw+weighted+total interval logging; native implementation, independent review, verification; active training unchanged"
+  },
+  "base": "01518f4e2903f36256911bc7735c3430e762b922",
+  "implementation": "c5eb6b9c59545c0e22896368a50f583aceaec2f8",
+  "worktree": "/root/.codex/worktrees/4391/ILVR",
+  "native_creation_operation": "2d803f1a-aa8f-4ef5-ba48-924a152382e9",
+  "review_agent": "/root/stage1_loss_logging_review",
+  "review_status": "no Critical/Important/Minor; reviewed c5eb6b9",
+  "focused_tests": {
+    "result": "152 passed in 26.59s",
+    "log": "results/stage1-loss-logging-20261030/workflow-records/task-1-tests.log"
+  },
+  "full_verification": {
+    "status": "passed",
+    "exit_code": 0,
+    "passed": 5248,
+    "skipped": 11,
+    "warnings": 1,
+    "seconds": 1332.68,
+    "warning": "existing TORCH_CUDA_ARCH_LIST unset in installed CPU Adam test",
+    "command": "env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=transformers/src:src ./venv/ilvr-venv/bin/python -m pytest -q --basetemp=checkpoints/stage1-loss-logging-dev-20261030/full-retry; result=$?; printf \"%s\\n\" \"$result\" > logs/stage1-loss-logging-20261030/full.exit; exit \"$result\"",
+    "log": "logs/stage1-loss-logging-20261030/full.log",
+    "log_sha256": "d897d9acddd570f904755404befb8cd684e048817ca8d66b7932c3e2be8f7832",
+    "interrupted_attempt": "logs/stage1-loss-logging-20261030/full-interrupted.log"
+  },
+  "deployment": "not applied to running training",
+  "hashes": {
+    "src/stage1/trainer.py": "dcad246d9f7e2745cf1c5ec678fa9b35ae1d8c65a610df5c09b18557a2aaaa74",
+    "tests/stage1/test_loss_logging.py": "dbecb28f6d3ca9335fee486d908f6fdf92bef8942c7161e59bb2b192689f93b3"
+  },
+  "review_verified_scope": "actual MRO, parent logging/backward dispatch, finite GAS/rank/update reductions, resume starting step, V5 exclusion",
+  "review_limits": [
+    "GPU/NCCL overhead unmeasured",
+    "nonfinite aggregate imputation equivalence excluded",
+    "historical schedule and whole-run summary unchanged",
+    "active run deployment excluded",
+    "full suite pending"
+  ],
+  "completion": "implementation/review/verification complete; integration decision pending",
+  "handoff": "native externally managed detached worktree preserved; b226/remote active experiment sources unchanged"
+}
