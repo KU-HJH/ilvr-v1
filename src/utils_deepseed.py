@@ -38,6 +38,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--preference_topk_mode", choices=("independent", "sync_topk"))
     parser.add_argument("--topk_include_gt", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--lambda_topk_mass", type=float)
+    parser.add_argument("--lambda_tail_kl", type=float)
+    parser.add_argument("--tail_kl_temperature", type=float)
     parser.add_argument("--lambda_topk_chosen_mass", type=float)
     parser.add_argument("--preference_entropy_top_percent", type=float)
     parser.add_argument("--loss_chunk_positions", type=int)
@@ -404,6 +406,7 @@ def _resolve_stage1_v5_args(parser, args, raw_argv):
         'stage1_loss_type', 'lambda_preference', 'lambda_topk_entropy',
         'lambda_entropy', 'preference_topk_k', 'preference_topk_mode',
         'topk_include_gt', 'lambda_topk_mass', 'lambda_topk_chosen_mass',
+        'lambda_tail_kl', 'tail_kl_temperature',
         'preference_entropy_top_percent', 'loss_chunk_positions',
         'stage1_v5_selection', 'stage1_v5_text_kl_weight', 'stage1_v5_voff_mode',
     }

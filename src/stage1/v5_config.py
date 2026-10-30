@@ -41,6 +41,8 @@ class Stage1V5Config:
     preference_topk_mode: str = 'independent'
     topk_include_gt: bool = False
     lambda_topk_mass: float = 0.0
+    lambda_tail_kl: float = 0.0
+    tail_kl_temperature: float = 1.0
     lambda_topk_chosen_mass: float = 0.0
     lambda_entropy: float = 0.0
     selection: str = 'all'
@@ -67,7 +69,7 @@ class Stage1V5Config:
                 raise ValueError(f'Stage1-v5 requires {name}={expected}')
         if _finite('lambda_preference', self.lambda_preference) <= 0:
             raise ValueError('lambda_preference must be positive')
-        for name in ('lambda_topk_entropy', 'lambda_topk_mass', 'text_kl_weight'):
+        for name in ('lambda_topk_entropy', 'lambda_topk_mass', 'text_kl_weight', 'lambda_tail_kl'):
             if _finite(name, getattr(self, name)) < 0:
                 raise ValueError(f'{name} must be nonnegative')
         if self.preference_topk_k is not None and (
@@ -75,6 +77,10 @@ class Stage1V5Config:
             raise ValueError('preference_topk_k must be a positive integer')
         if self.lambda_topk_entropy > 0 and self.preference_topk_k is None:
             raise ValueError('positive entropy requires an explicit valid preference_topk_k')
+        if self.lambda_tail_kl > 0 and (self.preference_topk_k is None or self.preference_topk_k < 2):
+            raise ValueError('positive tail KL requires explicit preference_topk_k >= 2')
+        if _finite('tail_kl_temperature', self.tail_kl_temperature) <= 0:
+            raise ValueError('tail_kl_temperature must be positive')
         if self.lambda_topk_mass > 0 and self.lambda_topk_entropy <= 0:
             raise ValueError('positive mass requires active entropy')
         if self.preference_topk_mode not in ('independent', 'sync_topk'):
@@ -145,6 +151,10 @@ def validate_v5_training_config(config: Stage1V5Config) -> None:
 
 
 def v5_formula_id(config: Stage1V5Config) -> str:
+    if config.lambda_tail_kl > 0:
+        base = ('dil_bce_orig_token_ref_full_vocab_topk_gt_union' if config.topk_include_gt
+                else 'dil_bce_orig_token_ref_full_vocab_topk')
+        return base + ('_entropy' if config.lambda_topk_entropy > 0 else '') + '_tail_kl_v1'
     if config.lambda_topk_entropy == 0:
         return 'dil_bce_orig_token_ref_full_vocab_v1'
     if config.topk_include_gt:

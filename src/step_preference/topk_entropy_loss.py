@@ -1,6 +1,7 @@
 """Detached candidate selection, live OFF entropy and clean-to-OFF mass KL."""
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import Tensor
@@ -115,3 +116,31 @@ def entropy_support_mass_components(
     mask = counts > 0
     return MassTokenComponents(*_group_mass_terms(clean_logits.detach().float(), off_logits.float(), mask,
                                                  collect_diagnostics=collect_diagnostics))
+
+
+def entropy_support_tail_kl(
+    clean_logits: Tensor, off_logits: Tensor, support: CandidateSupport, *,
+    temperature: float = 1.0, validate: bool = True,
+) -> Tensor:
+    """Decoupled KL(clean.detach || OFF), normalized only outside the support."""
+    if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+            or not math.isfinite(temperature) or temperature <= 0):
+        raise ValueError('tail KL temperature must be finite and positive')
+    if clean_logits.shape != off_logits.shape or clean_logits.device != off_logits.device:
+        raise ValueError('clean and OFF logits must have matching shapes/devices')
+    if validate:
+        _validate_logits(clean_logits, 'clean logits')
+        _validate_support(off_logits, support)
+    counts = torch.zeros_like(off_logits, dtype=torch.long).scatter_add(
+        -1, support.ids.masked_fill(~support.valid, 0), support.valid.long())
+    tail = counts == 0
+    empty = ~tail.any(-1, keepdim=True)
+    # Empty supports get a benign temporary normalizer; masking below makes
+    # their loss and gradients zero. No host read or full-softmax subtraction.
+    target = (clean_logits.detach().float() / temperature).masked_fill(~tail, -torch.inf)
+    prediction = (off_logits.float() / temperature).masked_fill(~tail, -torch.inf)
+    logp = target.masked_fill(empty, 0.).log_softmax(-1)
+    logq = prediction.masked_fill(empty, 0.).log_softmax(-1)
+    p = logp.exp().masked_fill(~tail, 0.)
+    difference = torch.where(tail & (p > 0), logp - logq, 0.)
+    return temperature**2 * (p * difference).sum(-1)

@@ -1,6 +1,6 @@
 # Stage1 V5 conditional tail KL — design commitment v1
 
-Status: distribution direction approved by user `ok`; complete design v1 below awaits final implementation approval.
+Status: final complete design v1 approved by user `진행해` after its linked final presentation and approval question. Earlier `ok` approved the distribution direction. Native implementation, independent review and verification authorized; no training launch or merge/push implied.
 Base: 03aeb2d3dc0b39dbcab01bebae2c79ecd10b396b (standard loss logging already integrated and verified).
 
 ## Intent and chosen approach

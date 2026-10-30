@@ -198,6 +198,8 @@ while (( $# )); do
         --preference-topk-k) require_value "$@"; extra_worker_arguments+=(--preference_topk_k "$2"); shift 2 ;;
         --preference-topk-mode) require_value "$@"; extra_worker_arguments+=(--preference_topk_mode "$2"); shift 2 ;;
         --lambda-topk-mass) require_value "$@"; extra_worker_arguments+=(--lambda_topk_mass "$2"); shift 2 ;;
+        --lambda-tail-kl) require_value "$@"; extra_worker_arguments+=(--lambda_tail_kl "$2"); shift 2 ;;
+        --tail-kl-temperature) require_value "$@"; extra_worker_arguments+=(--tail_kl_temperature "$2"); shift 2 ;;
         --lambda-topk-chosen-mass) require_value "$@"; extra_worker_arguments+=(--lambda_topk_chosen_mass "$2"); shift 2 ;;
         --preference-entropy-top-percent) require_value "$@"; extra_worker_arguments+=(--preference_entropy_top_percent "$2"); shift 2 ;;
         --stage1-v5-selection) require_value "$@"; extra_worker_arguments+=(--stage1_v5_selection "$2"); shift 2 ;;

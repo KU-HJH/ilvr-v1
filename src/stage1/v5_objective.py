@@ -10,6 +10,7 @@ from torch.utils.checkpoint import checkpoint
 from step_preference.dil_bce_orig_loss import orig_components_chunked
 from step_preference.topk_entropy_loss import (
     build_entropy_support, topk_entropy_components, entropy_support_mass_components,
+    entropy_support_tail_kl,
 )
 from .v5_config import Stage1V5Config
 from .v5_metadata import V5BatchMetadata
@@ -24,6 +25,7 @@ class V5LossSums:
     text_kl: Tensor
     original_steps: int
     diagnostics: dict[str, Tensor]
+    tail_kl_sum: Tensor
 
 
 def _zero(logits: Tensor) -> Tensor:
@@ -70,9 +72,12 @@ def compute_v5_loss_sums(
         _validate_selected_logits(reference_logits, metadata, 'reference', like=clean_logits)
     active_u = config.lambda_topk_entropy > 0
     active_mass = config.lambda_topk_mass > 0
+    active_tail = config.lambda_tail_kl > 0
     keys = metadata.query_keys
     if active_u and voff_logits is None and keys:
         raise ValueError('V-off logits required for active conditional entropy')
+    if active_tail and voff_logits is None and keys:
+        raise ValueError('V-off logits required for active tail KL')
     if validate and voff_logits is not None:
         _validate_selected_logits(voff_logits, metadata, 'V-off', like=clean_logits)
     if config.text_kl_weight > 0 and textoff_logits is None and keys:
@@ -84,6 +89,7 @@ def compute_v5_loss_sums(
     off_zero = _zero(voff_logits) if voff_logits is not None else clean_zero
     chosen_sum, reference_sum = clean_zero, clean_zero
     entropy_sum, mass_sum, conditional_entropy_sum = off_zero, off_zero, off_zero
+    tail_sum = off_zero
     support_size_sum = clean_logits.new_zeros((), dtype=torch.float32) if collect_diagnostics else None
     support_tokens = 0
     gt_coverage_sum = clean_logits.new_zeros((), dtype=torch.float32) if collect_diagnostics else None
@@ -101,21 +107,24 @@ def compute_v5_loss_sums(
                                         validate=validate, collect_diagnostics=collect_diagnostics)
             chosen_sum = chosen_sum + d.chosen.sum()
             reference_sum = reference_sum + d.reference.sum()
-            if active_u:
+            if active_u or active_tail:
                 off = voff_logits[cursor:cursor+count][mask]
                 u_parts, mass_parts, h_parts = [], [], []
+                tail_parts = []
                 for start in range(0, len(targets), config.loss_chunk_positions):
                     stop = start + config.loss_chunk_positions
                     c, o, y = clean[start:stop], off[start:stop], targets[start:stop]
                     support = build_entropy_support(c, o, y, k=config.preference_topk_k,
                         mode=config.preference_topk_mode, include_gt=config.topk_include_gt,
                         validate=validate, collect_diagnostics=collect_diagnostics)
-                    u = topk_entropy_components(o, support, validate=validate,
-                                                collect_diagnostics=collect_diagnostics)
-                    u_parts.append(u.kl)
+                    if active_u:
+                        u = topk_entropy_components(o, support, validate=validate,
+                                                    collect_diagnostics=collect_diagnostics)
+                        u_parts.append(u.kl)
                     if collect_diagnostics:
-                        h_parts.append(u.entropy.detach())
-                        support_size_sum = support_size_sum + u.support_size.float().sum()
+                        if active_u:
+                            h_parts.append(u.entropy.detach())
+                        support_size_sum = support_size_sum + support.valid.sum(-1).float().sum()
                         support_tokens += len(y)
                         gt_coverage_sum = gt_coverage_sum + support.gt_coverage.float().sum()
                     if active_mass:
@@ -127,11 +136,22 @@ def compute_v5_loss_sums(
                             mass_parts.append(checkpoint(mass_terms, c.detach(), o, use_reentrant=False))
                         else:
                             mass_parts.append(mass_terms(c.detach(), o))
-                entropy_sum = entropy_sum + torch.cat(u_parts).mean()
-                if collect_diagnostics:
+                    if active_tail:
+                        def tail_terms(c: Tensor, o: Tensor, support=support) -> Tensor:
+                            return entropy_support_tail_kl(c, o, support,
+                                temperature=config.tail_kl_temperature, validate=validate)
+                        if torch.is_grad_enabled() and o.requires_grad:
+                            tail_parts.append(checkpoint(tail_terms, c.detach(), o, use_reentrant=False))
+                        else:
+                            tail_parts.append(tail_terms(c.detach(), o))
+                if active_u:
+                    entropy_sum = entropy_sum + torch.cat(u_parts).mean()
+                if collect_diagnostics and active_u:
                     conditional_entropy_sum = conditional_entropy_sum + torch.cat(h_parts).mean()
                 if active_mass:
                     mass_sum = mass_sum + torch.cat(mass_parts).mean()
+                if active_tail:
+                    tail_sum = tail_sum + torch.cat(tail_parts).mean()
         cursor += count
     dil_sum = chosen_sum + reference_sum
     text_kl = (_text_kl(clean_logits, textoff_logits, keys, config, validate=validate)
@@ -146,6 +166,8 @@ def compute_v5_loss_sums(
         'topk_entropy_weighted_sum': config.lambda_topk_entropy*entropy_sum.detach(),
         'topk_mass_raw_sum': mass_sum.detach(),
         'topk_mass_weighted_sum': config.lambda_topk_mass*mass_sum.detach(),
+        'tail_kl_raw_sum': tail_sum.detach(),
+        'tail_kl_weighted_sum': config.lambda_tail_kl*tail_sum.detach(),
         'text_kl_raw': text_kl.detach(), 'text_kl_weighted': config.text_kl_weight*text_kl.detach(),
         'conditional_entropy_sum': conditional_entropy_sum.detach(),
         'support_size_sum': support_size_sum.detach(), 'support_tokens': scalar(support_tokens),
@@ -156,4 +178,4 @@ def compute_v5_loss_sums(
         'text_kl_samples': scalar(len({k[0] for k in keys}) if config.text_kl_weight > 0 else 0),
     } if collect_diagnostics else {}
     return V5LossSums(dil_sum, entropy_sum, mass_sum, text_kl,
-                      metadata.original_step_count, diagnostics)
+                      metadata.original_step_count, diagnostics, tail_sum)

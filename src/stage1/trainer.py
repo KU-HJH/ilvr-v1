@@ -400,8 +400,9 @@ class CustomTrainerStage1(SFTTrainer):
         )
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        # V5 has its own loss components and remains on its existing path.
-        if hasattr(self, 'v5_config') and not getattr(self, 'stage1_match_v5_execution', False):
+        # Tail-enabled V5 supplies its own named components to this accumulator.
+        if (hasattr(self, 'v5_config') and not getattr(self, 'stage1_match_v5_execution', False)
+                and self.v5_config.lambda_tail_kl == 0):
             return self._stage1_training_step(model, inputs, num_items_in_batch)
         self._stage1_record_loss_terms = True
         self._stage1_pending_loss_terms = None
@@ -470,6 +471,8 @@ class CustomTrainerStage1(SFTTrainer):
                 (self.sim_weight * alignment_loss).detach().float(),
                 loss.detach().float(),
             ))
+            self._stage1_loss_term_names = ('ce_loss', 'alignment_loss', 'weighted_ce_loss',
+                                           'weighted_alignment_loss', 'total_loss')
         if self._stage1_checks_enabled() and not bool(torch.isfinite(loss.detach()).all().item()):
             raise FloatingPointError("Stage 1 loss is nonfinite")
 
@@ -1010,8 +1013,7 @@ class CustomTrainerStage1(SFTTrainer):
                 # average ranks and updates just like Trainer's ordinary loss.
                 values = (self._nested_gather(terms.unsqueeze(0)).mean(dim=0) / updates).tolist()
                 logs = dict(logs)
-                names = ('ce_loss', 'alignment_loss', 'weighted_ce_loss',
-                         'weighted_alignment_loss', 'total_loss')
+                names = self._stage1_loss_term_names
                 logs.update({f'stage1/{name}': value for name, value in zip(names, values)})
                 # Also disambiguates the final, possibly partial interval from
                 # the parent Trainer's whole-run train_loss summary.

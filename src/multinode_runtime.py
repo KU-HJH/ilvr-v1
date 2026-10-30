@@ -854,6 +854,8 @@ _STAGE1_VALUE_OPTIONS = {
     "--preference-topk-k",
     "--preference-topk-mode",
     "--lambda-topk-mass",
+    "--lambda-tail-kl",
+    "--tail-kl-temperature",
     "--lambda-topk-chosen-mass",
     "--preference-entropy-top-percent",
     "--stage1-v5-selection",

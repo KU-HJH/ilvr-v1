@@ -116,7 +116,8 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
         if not isinstance(window, V5Window) or not isinstance(metadata, V5BatchMetadata):
             raise ValueError('missing v5 metadata/window')
         working = {k:v for k,v in inputs.items() if k not in ('stage1_v5_window','stage1_v5_metadata')}
-        need_voff = self.v5_config.lambda_topk_entropy > 0 or self.v5_config.selection in ('voff','gap','intersection')
+        need_voff = (self.v5_config.lambda_topk_entropy > 0 or self.v5_config.lambda_tail_kl > 0
+                     or self.v5_config.selection in ('voff','gap','intersection'))
         need_textoff = self.v5_config.text_kl_weight > 0
         replacing = need_voff and bool(metadata.query_keys) and self.v5_config.voff_mode != 'attention_mask'
         model_inputs, source_metadata, targets = self._prepare_stage1_loss_inputs(working,
@@ -185,6 +186,23 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                 dil_scale*config.lambda_preference*sums.dil_sum +
                 block_scale*(config.lambda_topk_entropy*sums.entropy_sum +
                        config.lambda_topk_mass*sums.mass_sum))
+        if config.lambda_tail_kl > 0:
+            loss = loss + block_scale*config.lambda_tail_kl*sums.tail_kl_sum
+            if getattr(self, '_stage1_record_loss_terms', False):
+                components = (
+                    ('ce', ce, self.ce_weight), ('alignment', alignment, self.sim_weight),
+                    ('dil', dil_scale*sums.dil_sum, config.lambda_preference),
+                    ('topk_entropy', block_scale*sums.entropy_sum, config.lambda_topk_entropy),
+                    ('topk_mass', block_scale*sums.mass_sum, config.lambda_topk_mass),
+                    ('text_kl', sums.text_kl, config.text_kl_weight),
+                    ('tail_kl', block_scale*sums.tail_kl_sum, config.lambda_tail_kl),
+                )
+                metrics = {f'{name}_loss': value.detach().float() for name, value, _ in components}
+                metrics.update({f'weighted_{name}_loss': (weight*value).detach().float()
+                                for name, value, weight in components})
+                metrics['total_loss'] = loss.detach().float()
+                self._stage1_loss_term_names = tuple(metrics)
+                self._stage1_pending_loss_terms = torch.stack(tuple(metrics.values()))
         if self.stage1_v5_debug and not bool(torch.isfinite(loss.detach()).all()):
             raise FloatingPointError('Stage1-v5 loss is nonfinite')
         self._latest_stage1_diagnostics = {
@@ -339,6 +357,12 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                             ('history_teacher',HistoryPrefixAdapter),
                             ('v5_donors',select_reverse_topk_donors),
                             ('v5_replay',run_v5_packed_replay))}
+        if self.v5_config.lambda_tail_kl != 0 or self.v5_config.tail_kl_temperature != 1:
+            from step_preference.topk_entropy_loss import entropy_support_tail_kl
+            execution['source_sha256'].update({
+                key: hashlib.sha256(Path(inspect.getsourcefile(function)).read_bytes()).hexdigest()
+                for key, function in (('tail_kl', entropy_support_tail_kl),
+                                      ('v5_objective', compute_v5_loss_sums))})
         return build_v5_contract(self.v5_config,self.v5_reference_identity,
             ce_weight=self.ce_weight,sim_weight=self.sim_weight,schedule=schedule,execution=execution)
 

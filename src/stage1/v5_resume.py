@@ -46,12 +46,23 @@ _SEMANTICS_V4 = {
     'prefix': 'independent_clean_before_current_body_or_cumulative_before_first_body_v1',
     'textoff': 'independent_clean_prefix_previous_text_v1',
 }
-_SCHEMA_SEMANTICS = {1: _SEMANTICS_V1, 2: _SEMANTICS_V2, 3: _SEMANTICS_V3, 4: _SEMANTICS_V4}
+_SEMANTICS_V5 = {
+    **_SEMANTICS_V4,
+    'interventions': 'config_voff_mode_attention_or_replacement_v1',
+    'tail_target': 'detached_clean_to_voff_conditional_complement_kl_temperature_squared_v1',
+    'tail_support': 'complement_of_shared_valid_entropy_support_including_optional_gt_union_v1',
+    'tail_weighting': 'independent_coefficient_no_tail_mass_multiplier_v1',
+    'tail_empty': 'zero_loss_and_gradient_empty_or_singleton_keep_denominator_v1',
+}
+_SCHEMA_SEMANTICS = {1: _SEMANTICS_V1, 2: _SEMANTICS_V2, 3: _SEMANTICS_V3,
+                     4: _SEMANTICS_V4, 5: _SEMANTICS_V5}
 _HISTORICAL_CONFIG_KEYS = frozenset('''loss_type beta margin lambda_preference
     lambda_topk_entropy preference_topk_k preference_topk_mode topk_include_gt
     lambda_topk_mass lambda_topk_chosen_mass lambda_entropy selection
     preference_entropy_top_percent loss_chunk_positions text_kl_weight temperature
     rho_min rho_max text_cap low_attention_mass low_attention_fraction'''.split())
+_SCHEMA4_CONFIG_KEYS = _HISTORICAL_CONFIG_KEYS | {'voff_mode'}
+_TAIL_CONFIG_KEYS = frozenset(('lambda_tail_kl', 'tail_kl_temperature'))
 
 
 def _json_copy(value):
@@ -82,7 +93,8 @@ def build_v5_contract(config, reference: V5ReferenceIdentity, *, ce_weight: floa
     validate_v5_training_config(config)
     return _build_contract(config, reference, ce_weight=ce_weight, sim_weight=sim_weight,
                            schedule=schedule, execution=execution,
-                           schema_version=(4 if config.voff_mode != 'attention_mask'
+                           schema_version=(5 if config.lambda_tail_kl != 0 or config.tail_kl_temperature != 1
+                                           else 4 if config.voff_mode != 'attention_mask'
                                            else 3 if config.selection == 'clean' else 2))
 
 
@@ -98,6 +110,8 @@ def _build_contract(config, reference, *, ce_weight, sim_weight, schedule, execu
     if not isinstance(schedule, Mapping):
         raise ValueError('invalid v5 sampler schedule')
     _execution(execution)
+    if schema_version < 5 and (config.lambda_tail_kl != 0 or config.tail_kl_temperature != 1):
+        raise ValueError('historical v5 contracts require tail KL disabled with default temperature')
     if schema_version < 4 and config.voff_mode != 'attention_mask':
         raise ValueError('historical v5 contracts require attention_mask')
     if schema_version == 4:
@@ -105,6 +119,11 @@ def _build_contract(config, reference, *, ce_weight, sim_weight, schedule, execu
                     else 'actual_window_eligible_dil_tokens')
         if config.voff_mode == 'attention_mask' or schedule.get('dil_denominator') != expected:
             raise ValueError('schema-4 requires replacement V-off and matching DIL denominator')
+    if schema_version == 5:
+        expected = ('actual_window_selected_dil_tokens' if config.selection == 'clean'
+                    else 'actual_window_eligible_dil_tokens')
+        if schedule.get('dil_denominator') != expected:
+            raise ValueError('schema-5 requires matching DIL denominator')
     if schema_version == 2 and config.selection != 'all':
         raise ValueError('schema-2 v5 token mean requires selection=all; clean requires a fresh run')
     if schema_version == 3 and (config.selection != 'clean' or
@@ -113,6 +132,9 @@ def _build_contract(config, reference, *, ce_weight, sim_weight, schedule, execu
     payload = asdict(config)
     if schema_version < 4:
         payload.pop('voff_mode')
+    if schema_version < 5:
+        for name in _TAIL_CONFIG_KEYS:
+            payload.pop(name)
     return _json_copy({'schema_version': schema_version, 'variant': 'v5', 'formula_id': v5_formula_id(config),
                        'config': payload, 'coefficients': {'ce_weight': ce_weight, 'sim_weight': sim_weight},
                        'semantics': _SCHEMA_SEMANTICS[schema_version], 'reference': asdict(reference),
@@ -130,13 +152,13 @@ def _validate(saved: Mapping[str, object]) -> Stage1V5Config:
     if saved['variant'] != 'v5' or saved['semantics'] != _SCHEMA_SEMANTICS[version]:
         raise ValueError('saved v5 variant or formula semantics mismatch')
     config = saved['config']
-    expected_keys = (_HISTORICAL_CONFIG_KEYS if version < 4
+    expected_keys = (_HISTORICAL_CONFIG_KEYS if version < 4 else _SCHEMA4_CONFIG_KEYS if version == 4
                      else {f.name for f in fields(Stage1V5Config)})
     if not isinstance(config, Mapping) or set(config) != expected_keys:
         raise ValueError('incomplete saved v5 objective')
     try:
         result = Stage1V5Config(**config)
-        if version in (2, 3, 4):
+        if version in (2, 3, 4, 5):
             validate_v5_training_config(result)
         reference = V5ReferenceIdentity(**saved['reference'])
         rebuilt = _build_contract(result, reference, **saved['coefficients'],
