@@ -1,0 +1,13 @@
+# Bounded native task brief: standard Stage1 loss logging
+
+Spec: docs/superpowers/specs/2026-10-30-stage1-loss-term-logging-design.md
+Approval: user `수정안 v1 승인, 진행` to the exact design question. Native implementation persists. No separate architectural plan is triggered.
+Base: 01518f4e2903f36256911bc7735c3430e762b922.
+
+## Task 1: Record standard training loss terms independently of diagnostics
+
+Scope: src/stage1/trainer.py and tests/stage1/test_loss_logging.py. Keep V5/Stage2 objectives, optional checks and active runtime unchanged.
+1. Establish focused existing trainer test baseline. Write CPU witnesses exercising actual native compute_loss, parent backward and Trainer log/history: production-enabled metrics, unequal microbatch/rank means, gas normalization, incomplete tail, weighted sum, final tail interval, resume starting step, evaluation isolation, no extra calls and unchanged gradients. Expected RED: missing stage1 loss fields.
+2. Add detached interval accumulation only for standard training compute calls; log raw and weighted CE/alignment and total on existing events. Reset runtime-only buffer on train entry, start interval lazily at restored step, and preserve explicit interval metadata and existing diagnostics. Expected GREEN: new witnesses plus baseline pass.
+3. Commit code and tests. Run task-done with the focused test set; expected zero failures. Request one fresh independent whole-diff specification/quality review, including real Trainer dispatch, collective participation/shape, native tail normalization and unchanged V5 path. Fix critical/important findings with causal tests.
+4. Invoke verification-before-completion plus finishing-a-development-branch, run full project pytest -q once after review using repository venv, project PYTHONPATH and checkpoints basetemp. Preserve exact command/output and reviewed revision. Present branch handoff; no deployment into active process, restart, merge or push authorized.

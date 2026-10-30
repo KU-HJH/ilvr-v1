@@ -400,6 +400,30 @@ class CustomTrainerStage1(SFTTrainer):
         )
 
     def training_step(self, model, inputs, num_items_in_batch=None):
+        # V5 has its own loss components and remains on its existing path.
+        if hasattr(self, 'v5_config') and not getattr(self, 'stage1_match_v5_execution', False):
+            return self._stage1_training_step(model, inputs, num_items_in_batch)
+        self._stage1_record_loss_terms = True
+        self._stage1_pending_loss_terms = None
+        try:
+            loss = self._stage1_training_step(model, inputs, num_items_in_batch)
+            terms = self._stage1_pending_loss_terms
+        finally:
+            self._stage1_record_loss_terms = False
+            self._stage1_pending_loss_terms = None
+        if terms is not None:
+            # Match the installed Trainer.training_step reporting denominator,
+            # including the fixed GAS denominator at an incomplete epoch tail.
+            if not self.model_accepts_loss_kwargs and self.compute_loss_func is None:
+                terms = terms / self.args.gradient_accumulation_steps
+            if getattr(self, '_stage1_loss_terms_sum', None) is None:
+                self._stage1_loss_terms_sum = terms
+                self._stage1_loss_terms_start_step = self.state.global_step
+            else:
+                self._stage1_loss_terms_sum += terms
+        return loss
+
+    def _stage1_training_step(self, model, inputs, num_items_in_batch=None):
         # V5 owns its graph/replay context. Native PEFT retains the historical
         # sample-keyed context through both forward and checkpoint backward.
         if not getattr(self, 'stage1_match_v5_execution', False) and hasattr(self, 'v5_config'):
@@ -437,6 +461,15 @@ class CustomTrainerStage1(SFTTrainer):
         outputs = model(**forward_inputs)
         ce_loss, alignment_loss = self._stage1_native_losses(outputs, labels, targets)
         loss = self.ce_weight * ce_loss + self.sim_weight * alignment_loss
+        if getattr(self, '_stage1_record_loss_terms', False):
+            # Scalars only: no retained graph, extra forward, host read or
+            # collective in a microbatch. Diagnostic scans remain independent.
+            self._stage1_pending_loss_terms = torch.stack((
+                ce_loss.detach().float(), alignment_loss.detach().float(),
+                (self.ce_weight * ce_loss).detach().float(),
+                (self.sim_weight * alignment_loss).detach().float(),
+                loss.detach().float(),
+            ))
         if self._stage1_checks_enabled() and not bool(torch.isfinite(loss.detach()).all().item()):
             raise FloatingPointError("Stage 1 loss is nonfinite")
 
@@ -968,6 +1001,26 @@ class CustomTrainerStage1(SFTTrainer):
             for name, value in diagnostics.items():
                 if isinstance(value, torch.Tensor) and value.numel() == 1:
                     logs[f"stage1/{name}"] = float(value.item())
+        terms = getattr(self, '_stage1_loss_terms_sum', None)
+        if terms is not None and ('loss' in logs or 'train_loss' in logs):
+            start = self._stage1_loss_terms_start_step
+            updates = self.state.global_step - start
+            if updates > 0:
+                # All ranks enter Trainer.log. Gather a row per rank, then
+                # average ranks and updates just like Trainer's ordinary loss.
+                values = (self._nested_gather(terms.unsqueeze(0)).mean(dim=0) / updates).tolist()
+                logs = dict(logs)
+                names = ('ce_loss', 'alignment_loss', 'weighted_ce_loss',
+                         'weighted_alignment_loss', 'total_loss')
+                logs.update({f'stage1/{name}': value for name, value in zip(names, values)})
+                # Also disambiguates the final, possibly partial interval from
+                # the parent Trainer's whole-run train_loss summary.
+                logs.update({
+                    'stage1/loss_interval_start_step': start,
+                    'stage1/loss_interval_end_step': self.state.global_step,
+                    'stage1/loss_interval_updates': updates,
+                })
+                self._stage1_loss_terms_sum = None
         super().log(logs, start_time=start_time)
 
     def _save_stage1_ema_checkpoint(self, checkpoint_dir: str | Path) -> None:
@@ -1178,6 +1231,10 @@ class CustomTrainerStage1(SFTTrainer):
         **kwargs,
     ):
         """Require and defer compatible EMA state for Stage 1 resume."""
+
+        # Runtime-only statistics: begin lazily at the restored global step;
+        # historical term values cannot be reconstructed from aggregate loss.
+        self._stage1_loss_terms_sum = None
 
         requested = kwargs.get('model_path', resume_from_checkpoint)
         if requested is True:
