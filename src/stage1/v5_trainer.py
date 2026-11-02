@@ -188,21 +188,21 @@ class CustomTrainerStage1V5(CustomTrainerStage1):
                        config.lambda_topk_mass*sums.mass_sum))
         if config.lambda_tail_kl > 0:
             loss = loss + block_scale*config.lambda_tail_kl*sums.tail_kl_sum
-            if getattr(self, '_stage1_record_loss_terms', False):
-                components = (
-                    ('ce', ce, self.ce_weight), ('alignment', alignment, self.sim_weight),
-                    ('dil', dil_scale*sums.dil_sum, config.lambda_preference),
-                    ('topk_entropy', block_scale*sums.entropy_sum, config.lambda_topk_entropy),
-                    ('topk_mass', block_scale*sums.mass_sum, config.lambda_topk_mass),
-                    ('text_kl', sums.text_kl, config.text_kl_weight),
-                    ('tail_kl', block_scale*sums.tail_kl_sum, config.lambda_tail_kl),
-                )
-                metrics = {f'{name}_loss': value.detach().float() for name, value, _ in components}
-                metrics.update({f'weighted_{name}_loss': (weight*value).detach().float()
-                                for name, value, weight in components})
-                metrics['total_loss'] = loss.detach().float()
-                self._stage1_loss_term_names = tuple(metrics)
-                self._stage1_pending_loss_terms = torch.stack(tuple(metrics.values()))
+        if getattr(self, '_stage1_record_loss_terms', False):
+            components = (
+                ('ce', ce, self.ce_weight), ('alignment', alignment, self.sim_weight),
+                ('dil', dil_scale*sums.dil_sum, config.lambda_preference),
+                ('topk_entropy', block_scale*sums.entropy_sum, config.lambda_topk_entropy),
+                ('topk_mass', block_scale*sums.mass_sum, config.lambda_topk_mass),
+                ('text_kl', sums.text_kl, config.text_kl_weight),
+                ('tail_kl', block_scale*sums.tail_kl_sum, config.lambda_tail_kl),
+            )
+            metrics = {f'{name}_loss': value.detach().float() for name, value, _ in components}
+            metrics.update({f'weighted_{name}_loss': (weight*value).detach().float()
+                            for name, value, weight in components})
+            metrics['total_loss'] = loss.detach().float()
+            self._stage1_loss_term_names = tuple(metrics)
+            self._stage1_pending_loss_terms = torch.stack(tuple(metrics.values()))
         if self.stage1_v5_debug and not bool(torch.isfinite(loss.detach()).all()):
             raise FloatingPointError('Stage1-v5 loss is nonfinite')
         self._latest_stage1_diagnostics = {

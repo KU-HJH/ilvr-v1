@@ -1,0 +1,16 @@
+# V5 mandatory loss logging — bounded native task brief
+
+Approval: user stated “앞으로 loss는 term별로 모두 logging하도록 해라” after the controller proposed removing both tail-dependent logging restrictions, with unchanged loss/reduction, no extra forwards, and current training preserved. User additionally explicitly requested policy only in /root/workspace/ILVR/AGENTS.md. Native method retained from this session.
+Base: c2e761a4ffb77cd8fa1db16ca99b5b7ccc2dc36c (product base 5b02d84; unrelated pending CE-default proposal remains untouched).
+Scope: remove the parent training_step logging bypass and move V5 named metrics outside Tail-KL's condition. Emit all seven component raw/weighted values plus total; inactive components remain zero. Reuse interval accumulator and gather. Do not change objective, coefficients, forward/backward, resume contracts, debug behavior, current training or evaluation. Local policy edit applies only to canonical AGENTS.md, not global policies.
+Design commitment v1: the two existing guards are the root cause, witnessed in live 40-interval logs and traced through real parent training_step/log dispatch. The user's latest instruction accepts the preceding recovery proposal. Hate root: moving only metric construction leaves the parent bypass, so no log appears. First nail: actual tail-disabled production training_step-to-log test with loss/gradient equivalence. No costly premise experiment. Macrothink not applicable: bounded known defect with cheap causal tests.
+Workflow: using-superpowers/systematic-debugging/brainstorming reconciled with explicit corrective instruction; executing-plans native, using-git-worktrees existing4391, TDD, fresh independent review, verification and finishing. No unrelated plan or new approval loop. Existing running b226 is preserved.
+
+## Task 1: Unconditionally record V5 loss terms and verify local policy
+- Baseline: existing V5 tail and Stage1 logging tests must pass before changes.
+- RED: add actual V5 tail-off production logging test; test uneven intervals/resume start, raw/weighted reconstruction, no extra forward, unchanged gradient. Expected: missing stage1 term keys on old source.
+- GREEN: remove only both gating conditions, keep tail objective optional. Expected: same loss and exact gradients, all required fields at existing boundary. Exercise debug/tail combinations and zero terms.
+- Local policy: document all-term logging and real first-interval verification only in canonical AGENTS.md. Preserve unrelated canonical modifications; capture exact diff/hash separately.
+- Task-done: env OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=transformers/src:src ./venv/ilvr-venv/bin/python -m pytest -q tests/stage1/v5 tests/stage1/test_loss_logging.py --basetemp=checkpoints/v5-required-logging-dev-20261102/focused
+- Commit only task source/tests/control artifacts; independent specification/quality review of diff and exact canonical policy text. Final full pytest suite once per finishing gate; reuse fresh output for verification.
+- Runtime boundary: no source hot-reload, automatic restart, or historical metric reconstruction. Integration/deployment is a final human handoff decision; do not claim the running job now logs terms.

@@ -400,10 +400,7 @@ class CustomTrainerStage1(SFTTrainer):
         )
 
     def training_step(self, model, inputs, num_items_in_batch=None):
-        # Tail-enabled V5 supplies its own named components to this accumulator.
-        if (hasattr(self, 'v5_config') and not getattr(self, 'stage1_match_v5_execution', False)
-                and self.v5_config.lambda_tail_kl == 0):
-            return self._stage1_training_step(model, inputs, num_items_in_batch)
+        # Standard and V5 supply named components independently of optional losses.
         self._stage1_record_loss_terms = True
         self._stage1_pending_loss_terms = None
         try:
