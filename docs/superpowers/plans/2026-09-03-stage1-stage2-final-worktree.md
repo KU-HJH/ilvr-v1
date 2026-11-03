@@ -858,8 +858,8 @@ def _remote_host_repository_root(repository_root: Path) -> Path:
 
 Then make `ClusterSpec.default()` use `_REPOSITORY_ROOT` for
 `remote_repo_root` and `_remote_host_repository_root(_REPOSITORY_ROOT)` for
-`remote_host_repo_root`. The fixed host, container, `10.1.102.41`, and
-`bond1.102` values do not change.
+`remote_host_repo_root`. The fixed host, container, `172.16.11.41`, and
+`bond0.11` values do not change.
 
 - [ ] **Step 5: Derive every active Bash artifact root from its script root**
 
@@ -982,7 +982,7 @@ means routing/checkpoint-contract preservation, not 18 new full training runs.
 The Stage 1 examples must explicitly set `--method`, `--model`, `--data-path`,
 `--image-root`, `--output-dir`, `--learning-rate`, `--deepspeed-config`, and
 `--log-file`. The two-node example must set all six `ILVR_*` topology variables,
-use rank 0 on `korea@10.1.102.41` and rank 1 on this host, and use the same run ID,
+use rank 0 on `korea@172.16.11.41` and rank 1 on this host, and use the same run ID,
 port, final commit, and logical worktree path on both nodes. The single-node
 example must omit every `ILVR_*` variable and set `STAGE1_NUM_PROCESSES` to the
 number of visible local GPUs.
@@ -1033,15 +1033,15 @@ ATTENTION_IMPLEMENTATION=flash_attention_2 \
 ILVR_NUM_MACHINES=2 \
 ILVR_NUM_PROCESSES=4 \
 ILVR_MACHINE_RANK=0 \
-ILVR_MAIN_PROCESS_IP=10.1.102.41 \
+ILVR_MAIN_PROCESS_IP=172.16.11.41 \
 ILVR_MAIN_PROCESS_PORT=29520 \
-ILVR_SOCKET_IFNAME=bond1.102 \
+ILVR_SOCKET_IFNAME=bond0.11 \
 ./run_stage2_training.sh
 ```
 
 Document the local rank-1 command by repeating the complete block with only
 `ILVR_MACHINE_RANK=1`; do not replace the block with “same as above.” Label the
-rank-0 block for `korea@10.1.102.41` in container `llm_kd`, and label the rank-1
+rank-0 block for `korea@172.16.11.41` in container `llm_kd`, and label the rank-1
 block for this host. State that both hosts must check out the same final commit at
 the same logical container worktree path; this task does not deploy the remote
 checkout.
