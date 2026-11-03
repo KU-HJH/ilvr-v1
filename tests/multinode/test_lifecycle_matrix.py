@@ -82,7 +82,7 @@ def test_matrix_plans_exact_initial_and_resume_harness_jobs_per_cell(tmp_path):
                 assert child[child.index("--num_machines") + 1] == "2"
                 assert child[child.index("--num_processes") + 1] == "4"
                 assert child[child.index("--machine_rank") + 1] == str(machine_rank)
-                assert child[child.index("--main_process_ip") + 1] == "10.1.102.41"
+                assert child[child.index("--main_process_ip") + 1] == "172.16.11.41"
                 assert child[child.index("--main_process_port") + 1] == str(
                     plan.main_process_port
                 )
@@ -464,7 +464,7 @@ def test_remote_phase_evidence_uses_only_the_fixed_bounded_node_cli(tmp_path):
     assert runner.read_lifecycle_phase_evidence(0, "initial") == expected
     assert calls[0][0][:6] == (
         "/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-        "korea@10.1.102.41",
+        "korea@172.16.11.41",
     )
     assert len(calls[0][0]) == 7
     remote = shlex.split(calls[0][0][6])

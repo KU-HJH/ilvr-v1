@@ -623,7 +623,7 @@ def test_remote_result_pull_is_fixed_container_rsync_with_explicit_nul_list():
         "--rsync-path",
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "korea@10.1.102.41:/root/workspace/ILVR/results/eval-four-gpu/",
+        "korea@172.16.11.41:/root/workspace/ILVR/results/eval-four-gpu/",
         "/root/workspace/ILVR/results/eval-four-gpu/",
     )
     assert "--recursive" not in command
@@ -692,7 +692,7 @@ def test_prepared_inference_pull_has_exact_secluded_rsync_argv():
         "--rsync-path",
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
-        "korea@10.1.102.41:/root/workspace/ILVR/"
+        "korea@172.16.11.41:/root/workspace/ILVR/"
         "results/trained-model-run/inference/",
         "/root/workspace/ILVR/results/eval-four-gpu/inference-model/",
     )
@@ -721,7 +721,7 @@ def test_prepared_inference_push_has_exact_container_rsync_argv():
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync",
         "--",
         "/root/workspace/ILVR/results/trained-model-run/",
-        "korea@10.1.102.41:/root/workspace/ILVR/results/trained-model-run/",
+        "korea@172.16.11.41:/root/workspace/ILVR/results/trained-model-run/",
     )
 
 

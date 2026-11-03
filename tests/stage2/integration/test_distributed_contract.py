@@ -296,9 +296,9 @@ def four_gpu_env(rank):
         "ILVR_NUM_MACHINES": "2",
         "ILVR_NUM_PROCESSES": "4",
         "ILVR_MACHINE_RANK": str(rank),
-        "ILVR_MAIN_PROCESS_IP": "10.1.102.41",
+        "ILVR_MAIN_PROCESS_IP": "172.16.11.41",
         "ILVR_MAIN_PROCESS_PORT": "29623",
-        "ILVR_SOCKET_IFNAME": "bond1.102",
+        "ILVR_SOCKET_IFNAME": "bond0.11",
     }
 
 
