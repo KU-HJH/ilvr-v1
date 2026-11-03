@@ -13,9 +13,9 @@
 ## Global Constraints
 
 - Invoke Python, pytest, Accelerate, torchrun, DeepSpeed, training, and evaluation through `./venv/ilvr-venv`.
-- Use local H100 GPUs 0-1 and `korea@10.1.102.41` container `llm_kd` H100 GPUs 0-1.
+- Use local H100 GPUs 0-1 and `korea@172.16.11.41` container `llm_kd` H100 GPUs 0-1.
 - Use `/root/workspace/ILVR` on both nodes, remote rank 0, local rank 1, `num_machines=2`, and cluster-wide `num_processes=4`.
-- Set `MASTER_ADDR=10.1.102.41`, `GLOO_SOCKET_IFNAME=bond1.102`, and `NCCL_SOCKET_IFNAME=bond1.102`; require an explicit free `MASTER_PORT`.
+- Set `MASTER_ADDR=172.16.11.41`, `GLOO_SOCKET_IFNAME=bond0.11`, and `NCCL_SOCKET_IFNAME=bond0.11`; require an explicit free `MASTER_PORT`.
 - Select only `configs/deepspeed_zero1.json`, `configs/deepspeed_zero2.json`, or `configs/deepspeed_zero3.json`.
 - Store checkpoints, results, and logs below `/root/workspace/ILVR/checkpoints/`, `/root/workspace/ILVR/results/`, and `/root/workspace/ILVR/logs/` with one fresh run ID.
 - Do not automatically sync source, venv, dataset, or pretrained model during a launch. One-time remote provisioning is a separate task.
@@ -115,7 +115,7 @@ from src.multinode import ClusterSpec, build_launch_plan
 
 def test_default_cluster_is_fixed_two_node_four_process_topology():
     spec = ClusterSpec.default()
-    assert spec.remote_host == "korea@10.1.102.41"
+    assert spec.remote_host == "korea@172.16.11.41"
     assert spec.remote_container == "llm_kd"
     assert spec.remote_repo_root == Path("/root/workspace/ILVR")
     assert spec.remote_host_repo_root == Path(
@@ -123,8 +123,8 @@ def test_default_cluster_is_fixed_two_node_four_process_topology():
     )
     assert (spec.num_machines, spec.gpus_per_node, spec.num_processes) == (2, 2, 4)
     assert (spec.remote_rank, spec.local_rank) == (0, 1)
-    assert spec.master_addr == "10.1.102.41"
-    assert spec.socket_ifname == "bond1.102"
+    assert spec.master_addr == "172.16.11.41"
+    assert spec.socket_ifname == "bond0.11"
 
 
 @pytest.mark.parametrize("zero_stage", (1, 2, 3))
@@ -168,14 +168,14 @@ class ClusterSpec:
     @classmethod
     def default(cls) -> "ClusterSpec":
         return cls(
-            remote_host="korea@10.1.102.41",
+            remote_host="korea@172.16.11.41",
             remote_container="llm_kd",
             remote_repo_root=Path("/root/workspace/ILVR"),
             remote_host_repo_root=Path(
                 "/home/korea/Workspace/hjh/workspace/ILVR"
             ),
-            master_addr="10.1.102.41",
-            socket_ifname="bond1.102",
+            master_addr="172.16.11.41",
+            socket_ifname="bond0.11",
         )
 
 
@@ -232,7 +232,7 @@ def assert_four_rank_prefix(tokens, rank, port):
         "--num_machines": "2",
         "--num_processes": "4",
         "--machine_rank": str(rank),
-        "--main_process_ip": "10.1.102.41",
+        "--main_process_ip": "172.16.11.41",
         "--main_process_port": str(port),
     }
     for flag, value in expected.items():
@@ -243,8 +243,8 @@ def test_stage1_multinode_dry_run_emits_rank_one_four_process_command(tmp_path):
     env = os.environ.copy()
     env.update({
         "ILVR_NUM_MACHINES": "2", "ILVR_NUM_PROCESSES": "4",
-        "ILVR_MACHINE_RANK": "1", "ILVR_MAIN_PROCESS_IP": "10.1.102.41",
-        "ILVR_MAIN_PROCESS_PORT": "29621", "ILVR_SOCKET_IFNAME": "bond1.102",
+        "ILVR_MACHINE_RANK": "1", "ILVR_MAIN_PROCESS_IP": "172.16.11.41",
+        "ILVR_MAIN_PROCESS_PORT": "29621", "ILVR_SOCKET_IFNAME": "bond0.11",
     })
     completed = run_launcher(LAUNCHER, *base_args(tmp_path / "out"), env=env)
     assert completed.returncode == 0
@@ -258,8 +258,8 @@ def test_stage2_multinode_dry_run_emits_rank_zero_four_process_command(tmp_path)
     env = stage2_env(tmp_path)
     env.update({
         "ILVR_NUM_MACHINES": "2", "ILVR_NUM_PROCESSES": "4",
-        "ILVR_MACHINE_RANK": "0", "ILVR_MAIN_PROCESS_IP": "10.1.102.41",
-        "ILVR_MAIN_PROCESS_PORT": "29622", "ILVR_SOCKET_IFNAME": "bond1.102",
+        "ILVR_MACHINE_RANK": "0", "ILVR_MAIN_PROCESS_IP": "172.16.11.41",
+        "ILVR_MAIN_PROCESS_PORT": "29622", "ILVR_SOCKET_IFNAME": "bond0.11",
         "STAGE2_DRY_RUN": "true",
     })
     completed = run_stage2_launcher(env)
@@ -372,7 +372,7 @@ def snapshot(node, rank):
         accelerate_version="1.10.1", deepspeed_version="0.18.0",
         torchrun_ok=True,
         gpu_names=("NVIDIA H100 NVL", "NVIDIA H100 NVL"),
-        interface="bond1.102", input_paths_ok=True, artifact_roots_writable=True,
+        interface="bond0.11", input_paths_ok=True, artifact_roots_writable=True,
         artifact_free_bytes=500_000_000_000, run_paths_fresh=True,
         tmux_sessions_fresh=True, master_port_free=True,
     )
@@ -402,7 +402,7 @@ Cover every rejection with one parameterized test so each field names its own fa
         ({"torch_version": "2.7.0+cu126"}, "environment versions"),
         ({"gpu_names": ("NVIDIA H100 NVL",)}, "exactly two GPUs"),
         ({"gpu_names": ("NVIDIA A100", "NVIDIA A100")}, "H100"),
-        ({"interface": "eth0"}, "bond1.102"),
+        ({"interface": "eth0"}, "bond0.11"),
         ({"input_paths_ok": False}, "input paths"),
         ({"artifact_roots_writable": False}, "artifact roots"),
         ({"artifact_free_bytes": 1024}, "free space"),
@@ -430,12 +430,12 @@ Expected: `ModuleNotFoundError: No module named 'src.multinode_runtime'`.
 ```python
 [
     "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
-    "korea@10.1.102.41", "docker", "exec", "llm_kd",
+    "korea@172.16.11.41", "docker", "exec", "llm_kd",
     "bash", "-lc", shlex.join(argv),
 ]
 ```
 
-Implement `node-info` in `src.multinode.py` to emit one JSON object containing `git rev-parse HEAD`, `git status --porcelain --untracked-files=no`, executable checks, `torch.cuda.get_device_name()`, `ip -o link show bond1.102`, exact input existence, and artifact-root writability. Only remote rank 0 attempts `socket.bind(("10.1.102.41", port))` and closes the socket before returning.
+Implement `node-info` in `src.multinode.py` to emit one JSON object containing `git rev-parse HEAD`, `git status --porcelain --untracked-files=no`, executable checks, `torch.cuda.get_device_name()`, `ip -o link show bond0.11`, exact input existence, and artifact-root writability. Only remote rank 0 attempts `socket.bind(("172.16.11.41", port))` and closes the socket before returning.
 
 Extend that snapshot with the pinned Python, PyTorch, Accelerate, and DeepSpeed versions, `docker inspect` running state for `llm_kd`, `shutil.disk_usage()` free bytes, and fresh run-directory/tmux-name booleans. Reject less than the launch plan's explicit `required_free_bytes` estimate without scanning or hashing model weights.
 
@@ -1225,7 +1225,7 @@ git commit -m "docs: explain ILVR four-GPU multi-node operation"
 
 ```bash
 ps -eo pid,etimes,args | rg '/root/workspace/ILVR|src/main.py|eval.py' || true
-ssh -o BatchMode=yes -o ConnectTimeout=8 korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 korea@172.16.11.41 \
   "docker exec llm_kd bash -lc 'ps -eo pid,etimes,args | grep -E \"/root/workspace/ILVR|src/main.py|eval.py\" | grep -v grep || true; test ! -e /root/workspace/ILVR'"
 ```
 
@@ -1238,10 +1238,10 @@ implementation_commit=$(git rev-parse HEAD)
 git diff --exit-code
 git diff --cached --exit-code
 git bundle create /tmp/ilvr-multinode.bundle HEAD
-scp /tmp/ilvr-multinode.bundle korea@10.1.102.41:/home/korea/Workspace/hjh/ilvr-multinode.bundle
-ssh korea@10.1.102.41 \
+scp /tmp/ilvr-multinode.bundle korea@172.16.11.41:/home/korea/Workspace/hjh/ilvr-multinode.bundle
+ssh korea@172.16.11.41 \
   "docker exec llm_kd git clone /root/ilvr-multinode.bundle /root/workspace/ILVR"
-ssh korea@10.1.102.41 \
+ssh korea@172.16.11.41 \
   "docker exec llm_kd git -C /root/workspace/ILVR checkout --detach $implementation_commit"
 ```
 
@@ -1251,8 +1251,8 @@ Expected: remote `git rev-parse HEAD` equals `$implementation_commit`.
 
 ```bash
 rsync -a --ignore-existing /root/workspace/ILVR/venv/ilvr-venv/ \
-  korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/venv/ilvr-venv/
-ssh korea@10.1.102.41 "docker exec llm_kd bash -lc '
+  korea@172.16.11.41:/home/korea/Workspace/hjh/workspace/ILVR/venv/ilvr-venv/
+ssh korea@172.16.11.41 "docker exec llm_kd bash -lc '
   mkdir -p /raid/workspace/ILVR/checkpoints /root/workspace/ILVR/results /root/workspace/ILVR/logs
   test ! -e /root/workspace/ILVR/checkpoints
   ln -s /raid/workspace/ILVR/checkpoints /root/workspace/ILVR/checkpoints
@@ -1266,12 +1266,12 @@ Expected: one matching remote venv and writable artifact roots. This is provisio
 
 ```bash
 rsync -a --ignore-existing /root/workspace/ILVR/checkpoints/comt_ckpt/ \
-  korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/checkpoints/comt_ckpt/
+  korea@172.16.11.41:/home/korea/Workspace/hjh/workspace/ILVR/checkpoints/comt_ckpt/
 rsync -a --ignore-existing /root/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct/ \
-  korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct/
+  korea@172.16.11.41:/home/korea/Workspace/hjh/workspace/ILVR/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct/
 rsync -a --ignore-existing /root/workspace/ILVR/data/TEST.jsonl \
   /root/workspace/ILVR/data/TRAIN.jsonl \
-  korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/data/
+  korea@172.16.11.41:/home/korea/Workspace/hjh/workspace/ILVR/data/
 ```
 
 Materialize four evaluation rows, 32 capacity rows, and the exact referenced-image list:
@@ -1322,10 +1322,10 @@ PY
 rsync -a --ignore-existing \
   /root/workspace/ILVR/data/multinode-eval-subset.jsonl \
   /root/workspace/ILVR/data/multinode-capacity-subset.jsonl \
-  korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/data/
+  korea@172.16.11.41:/home/korea/Workspace/hjh/workspace/ILVR/data/
 rsync -a --ignore-existing --files-from=/tmp/ilvr-input-images.files \
   /root/workspace/ILVR/data/ \
-  korea@10.1.102.41:/home/korea/Workspace/hjh/workspace/ILVR/data/
+  korea@172.16.11.41:/home/korea/Workspace/hjh/workspace/ILVR/data/
 
 ./venv/ilvr-venv/bin/python - <<'PY'
 import json
@@ -1334,7 +1334,7 @@ root = Path("/root/workspace/ILVR/data")
 row = json.loads((root / "multinode-eval-subset.jsonl").open().readline())
 assert all((root / image).is_file() for image in row["image_input"])
 PY
-ssh korea@10.1.102.41 "docker exec llm_kd /root/workspace/ILVR/venv/ilvr-venv/bin/python -c '
+ssh korea@172.16.11.41 "docker exec llm_kd /root/workspace/ILVR/venv/ilvr-venv/bin/python -c '
 import json
 from pathlib import Path
 root = Path(\"/root/workspace/ILVR/data\")

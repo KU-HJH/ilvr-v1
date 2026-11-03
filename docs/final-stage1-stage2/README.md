@@ -112,7 +112,7 @@ git rev-parse HEAD
 git status --short --untracked-files=no
 ```
 
-Rank 0 — `korea@10.1.102.41`, container `llm_kd`:
+Rank 0 — `korea@172.16.11.41`, container `llm_kd`:
 
 ```bash
 cd /root/workspace/ILVR/.worktrees/stage1-stage2-final
@@ -120,9 +120,9 @@ run_id="stage1-dora-z1-REPLACE_WITH_SHARED_RUN_ID"
 ILVR_NUM_MACHINES=2 \
 ILVR_NUM_PROCESSES=4 \
 ILVR_MACHINE_RANK=0 \
-ILVR_MAIN_PROCESS_IP=10.1.102.41 \
+ILVR_MAIN_PROCESS_IP=172.16.11.41 \
 ILVR_MAIN_PROCESS_PORT=29520 \
-ILVR_SOCKET_IFNAME=bond1.102 \
+ILVR_SOCKET_IFNAME=bond0.11 \
 STAGE1_NUM_PROCESSES=4 ./run_stage1_training.sh \
   --method dora \
   --model "$PWD/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct" \
@@ -142,9 +142,9 @@ run_id="stage1-dora-z1-REPLACE_WITH_SHARED_RUN_ID"
 ILVR_NUM_MACHINES=2 \
 ILVR_NUM_PROCESSES=4 \
 ILVR_MACHINE_RANK=1 \
-ILVR_MAIN_PROCESS_IP=10.1.102.41 \
+ILVR_MAIN_PROCESS_IP=172.16.11.41 \
 ILVR_MAIN_PROCESS_PORT=29520 \
-ILVR_SOCKET_IFNAME=bond1.102 \
+ILVR_SOCKET_IFNAME=bond0.11 \
 STAGE1_NUM_PROCESSES=4 ./run_stage1_training.sh \
   --method dora \
   --model "$PWD/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct" \
@@ -217,7 +217,7 @@ git rev-parse HEAD
 git status --short --untracked-files=no
 ```
 
-Rank 0 — `korea@10.1.102.41`, container `llm_kd`:
+Rank 0 — `korea@172.16.11.41`, container `llm_kd`:
 
 ```bash
 cd /root/workspace/ILVR/.worktrees/stage1-stage2-final
@@ -236,9 +236,9 @@ ATTENTION_IMPLEMENTATION=flash_attention_2 \
 ILVR_NUM_MACHINES=2 \
 ILVR_NUM_PROCESSES=4 \
 ILVR_MACHINE_RANK=0 \
-ILVR_MAIN_PROCESS_IP=10.1.102.41 \
+ILVR_MAIN_PROCESS_IP=172.16.11.41 \
 ILVR_MAIN_PROCESS_PORT=29520 \
-ILVR_SOCKET_IFNAME=bond1.102 \
+ILVR_SOCKET_IFNAME=bond0.11 \
 ./run_stage2_training.sh
 ```
 
@@ -261,9 +261,9 @@ ATTENTION_IMPLEMENTATION=flash_attention_2 \
 ILVR_NUM_MACHINES=2 \
 ILVR_NUM_PROCESSES=4 \
 ILVR_MACHINE_RANK=1 \
-ILVR_MAIN_PROCESS_IP=10.1.102.41 \
+ILVR_MAIN_PROCESS_IP=172.16.11.41 \
 ILVR_MAIN_PROCESS_PORT=29520 \
-ILVR_SOCKET_IFNAME=bond1.102 \
+ILVR_SOCKET_IFNAME=bond0.11 \
 ./run_stage2_training.sh
 ```
 
