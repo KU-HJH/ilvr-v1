@@ -1302,7 +1302,7 @@ def _build_artifact_manifest(
     """Capture a small topology/stat witness; never read or hash weight contents."""
 
     method = _validated_method(method)
-    output_dir = output_dir.resolve()
+    output_dir = output_dir.absolute()
     if not final_save:
         entries: list[dict[str, object]] = []
         artifact_kind = "none"
@@ -1461,7 +1461,7 @@ def validate_stage1_runtime_args(
         ),
         "data_path": str(Path(getattr(args, "data_path", "")).resolve()),
         "image_root": str(Path(getattr(args, "image_root", "")).resolve()),
-        "output_dir": str(Path(getattr(args, "save_model_path", "")).resolve()),
+        "output_dir": str(Path(getattr(args, "save_model_path", "")).absolute()),
         "micro_batch": getattr(args, "per_device_train_batch_size", None),
         "gradient_accumulation_steps": getattr(
             args, "gradient_accumulation_steps", None
@@ -1782,7 +1782,7 @@ def _prepare_probe_run(args: argparse.Namespace) -> str:
         "data_path": str(train_data),
         "data_stat": audit["input_stat"],
         "image_root": str(image_root),
-        "output_dir": str(Path(args.output_dir).resolve()),
+        "output_dir": str(Path(args.output_dir).absolute()),
         "micro_batch": micro_batch,
         "world_size": world_size,
         "gradient_accumulation_steps": accumulation,
@@ -2701,7 +2701,7 @@ def _record_probe_attempt(args: argparse.Namespace) -> dict[str, object]:
         "model": _require_string("model", args.model),
         "source_data_path": str(source_data_path),
         "image_root": str(image_root),
-        "output_dir": str(Path(args.output_dir).resolve()),
+        "output_dir": str(Path(args.output_dir).absolute()),
         "deepspeed_config": str(Path(args.deepspeed_config).resolve()),
         "attention_implementation": _require_string(
             "attention_implementation", args.attention_implementation
@@ -2757,9 +2757,9 @@ def _record_probe_attempt(args: argparse.Namespace) -> dict[str, object]:
         "process_id": process_id,
         "exit_code": exit_code,
         "requires_oom_classification": exit_code != 0,
-        "output_dir": str(Path(args.output_dir).resolve()),
-        "stdout_path": str(Path(args.stdout_path).resolve()),
-        "stderr_path": str(Path(args.stderr_path).resolve()),
+        "output_dir": str(Path(args.output_dir).absolute()),
+        "stdout_path": str(Path(args.stdout_path).absolute()),
+        "stderr_path": str(Path(args.stderr_path).absolute()),
         "probe_rows": str(Path(args.probe_rows).resolve()),
         "probe_row_indices": probe_indices,
         "audit_digest": audit["audit_digest"],
@@ -4517,7 +4517,7 @@ def _prepare_timed_run(args: argparse.Namespace) -> str:
     if args.gradient_accumulation != 2 or args.world_size != 2:
         raise ValueError("timed runs require gradient accumulation 2 and world size 2")
     source_config = maximum["launch_config"]
-    output_dir = Path(args.output_dir).resolve()
+    output_dir = Path(args.output_dir).absolute()
     launch_config = {
         "schema_version": _SCHEMA_VERSION,
         "kind": "stage1-timed-launch-manifest",

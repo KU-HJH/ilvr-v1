@@ -999,8 +999,25 @@ def validate_stage2_peft_compatibility(
             raise ValueError(f"missing resolved target: {target}")
         if not isinstance(modules[target], nn.Linear):
             raise ValueError(f"resolved target is not linear: {target}")
-    target_modules = tuple(getattr(adapter_config, "target_modules", ()) or ())
-    if set(target_modules) != set(metadata.resolved_target_module_names):
+    configured_targets = getattr(adapter_config, "target_modules", ()) or ()
+    if isinstance(configured_targets, str) or not isinstance(
+        configured_targets, (list, set, tuple)
+    ):
+        raise ValueError("adapter resolved targets do not match metadata")
+    target_modules = tuple(configured_targets)
+    if not target_modules or any(
+        not isinstance(target, str) or not target for target in target_modules
+    ):
+        raise ValueError("adapter resolved targets do not match metadata")
+    resolved_adapter_targets = {
+        name
+        for name in modules
+        if any(
+            name == target or name.endswith(f".{target}")
+            for target in target_modules
+        )
+    }
+    if resolved_adapter_targets != set(metadata.resolved_target_module_names):
         raise ValueError("adapter resolved targets do not match metadata")
     suffixes = tuple(
         dict.fromkeys(name.rsplit(".", 1)[-1] for name in target_modules)

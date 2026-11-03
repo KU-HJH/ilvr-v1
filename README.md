@@ -139,8 +139,8 @@ the commands below in order; do not launch a three-epoch run with a batch size
 copied by hand. On this host the complete CoMT inputs are:
 
 ```text
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data
+/root/workspace/ILVR/data/TRAIN.jsonl
+/root/workspace/ILVR/data
 ```
 
 First create or reuse the Task 15 two-rank, `B=2`, step-3-to-step-4
@@ -212,14 +212,14 @@ then create or reuse the Task 16 high-cost-row audit. `require-evidence` writes
   outputs/stage1-smoke/dora/evidence.json
 
 ./venv/ilvr-venv/bin/python -m src.stage1.benchmark audit \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
   --output outputs/stage1-probes/high-cost-rows.json --count 64
 
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --method full --model Qwen/Qwen2.5-VL-3B-Instruct \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
   --output-root outputs/stage1-probes/full \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
@@ -227,8 +227,8 @@ CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
 
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --method dora --model Qwen/Qwen2.5-VL-3B-Instruct \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
   --output-root outputs/stage1-probes/dora \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
@@ -269,8 +269,8 @@ The full fallback command is:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --method full --model Qwen/Qwen2.5-VL-3B-Instruct \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
   --output-root outputs/stage1-probes/full \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
@@ -283,8 +283,8 @@ The DoRA fallback uses its independent output and fixed topology:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_batch_probe.sh \
   --method dora --model Qwen/Qwen2.5-VL-3B-Instruct \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
   --output-root outputs/stage1-probes/dora \
   --probe-rows outputs/stage1-probes/high-cost-rows.json \
   --prerequisite-chain outputs/stage1-smoke/prerequisite-chain.json \
@@ -365,8 +365,8 @@ uses a namespace distinct from smoke, probe, and timed evidence:
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 ./run_stage1_training.sh \
   --method dora --model Qwen/Qwen2.5-VL-3B-Instruct \
-  --data-path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image-root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data-path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image-root /root/workspace/ILVR/data \
   --output-dir outputs/stage1-resume-example/dora \
   --resume outputs/stage1-resume-example/dora/checkpoint-100 \
   --micro-batch 2 --epochs 3 --learning-rate 1e-5 \
@@ -390,8 +390,8 @@ PYTHONPATH="$PWD/transformers/src:$PWD/src" \
   --tuning_method dora \
   --lora_r 32 --lora_alpha 64 --lora_dropout 0.05 \
   --lora_target_modules q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj \
-  --data_path /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data/TRAIN.jsonl \
-  --image_root /NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/data \
+  --data_path /root/workspace/ILVR/data/TRAIN.jsonl \
+  --image_root /root/workspace/ILVR/data \
   --save_model_path /path/to/stage2-dora-output \
   --per_device_train_batch_size 1 --learning_rate 1e-5
 ```

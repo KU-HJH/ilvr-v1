@@ -29,9 +29,9 @@ there is no Stage 2 batch sweep.
 Every newly generated artifact belongs beneath one of these exact roots:
 
 ```text
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+/root/workspace/ILVR/results/zero-stage-compatibility
+/root/workspace/ILVR/logs/zero-stage-compatibility
 ```
 
 Use one lowercase, collision-resistant experiment ID beneath all three roots
@@ -65,8 +65,8 @@ prevents a fresh attempt from colliding with another independent experiment.
 ### Stage 1 DoRA
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-dora-fresh-example-$run_suffix"
 
@@ -108,8 +108,8 @@ only on the existing legacy path and is not a new ZeRO compatibility method.
 ### Stage 2 DoRA
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero2-dora-fresh-example-$run_suffix"
 
@@ -154,7 +154,7 @@ non-finite, contract, missing-evidence, and other nonzero failures are
 The aggregate Stage 1 matrix report is:
 
 ```text
-/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json
+/root/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json
 ```
 
 Each Stage 2 rank-skew witness is written below the same canonical result root

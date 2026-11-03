@@ -128,11 +128,11 @@ primary checkout과 모든 linked worktree에서 생성되는 산출물은 workt
 `outputs/`에 저장하지 않고 다음 canonical root를 사용한다.
 
 - weight, final model 및 numbered checkpoint:
-  `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/`
+  `/root/workspace/ILVR/checkpoints/zero-stage-compatibility/`
 - evidence, witness, manifest, audit, report 및 표:
-  `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/`
+  `/root/workspace/ILVR/results/zero-stage-compatibility/`
 - training log, stdout 및 stderr:
-  `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/`
+  `/root/workspace/ILVR/logs/zero-stage-compatibility/`
 
 각 독립 training attempt와 standalone probe는 고유한 experiment ID를 사용한다.
 같은 실행의 checkpoint, result 및 log 디렉터리는 세 root 아래에서 동일한

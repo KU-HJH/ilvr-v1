@@ -1,0 +1,11 @@
+/venv/
+/ilvr-venv/
+/.worktrees/
+
+# Runtime artifacts are centralized outside Git.
+/cache
+/checkpoints
+/logs
+/models
+/outputs
+/results

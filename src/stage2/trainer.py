@@ -5,7 +5,9 @@ import tempfile
 from pathlib import Path
 
 import torch
+from peft import PeftModel
 from transformers import Trainer
+from transformers.trainer import TRAINING_ARGS_NAME
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR, get_last_checkpoint
 
 from deepspeed_runtime import (
@@ -66,6 +68,23 @@ class Stage2Trainer(Trainer):
         self.stage2_diagnostics_interval = stage2_diagnostics_interval
         self._stage2_microbatch_index = 0
         super().__init__(*args, **kwargs)
+
+    def _save(self, output_dir=None, state_dict=None):
+        model = self.accelerator.unwrap_model(self.model)
+        if not isinstance(model, PeftModel):
+            return super()._save(output_dir, state_dict=state_dict)
+
+        output_dir = output_dir or self.args.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+        model.save_pretrained(
+            output_dir,
+            state_dict=state_dict,
+            safe_serialization=self.args.save_safetensors,
+            save_embedding_layers=False,
+        )
+        if self.processing_class is not None:
+            self.processing_class.save_pretrained(output_dir)
+        torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
 
     def _publish_deepspeed_runtime_identity(
         self, directory: Path, *, label: str

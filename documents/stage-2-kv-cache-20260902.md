@@ -647,9 +647,9 @@ The distributed adoption geometry is fixed:
 
 | Setting | Value |
 |---|---|
-| Rank-0/master node | `10.1.102.41`, machine rank 0 |
-| Worker node | `10.1.102.40`, machine rank 1 |
-| Interface | `bond1.102` |
+| Rank-0/master node | `172.16.11.41`, machine rank 0 |
+| Worker node | `172.16.11.40`, machine rank 1 |
+| Interface | `bond0.11` |
 | GPUs | 2 H100 NVL per node, 4 global processes |
 | Per-device batch | 1 |
 | Gradient accumulation | 2 |
@@ -685,9 +685,9 @@ export LATENT_SIZE=8 SUPERVISE_LATENT_BOUNDARIES=true
 export ATTENTION_IMPLEMENTATION=flash_attention_2
 export GRADIENT_ACCUMULATION_STEPS=2
 export STAGE2_DIAGNOSTICS_INTERVAL=0
-export MASTER_ADDR=10.1.102.41 MASTER_PORT=29520
-export NCCL_SOCKET_IFNAME='=bond1.102'
-export GLOO_SOCKET_IFNAME=bond1.102
+export MASTER_ADDR=172.16.11.41 MASTER_PORT=29520
+export NCCL_SOCKET_IFNAME='=bond0.11'
+export GLOO_SOCKET_IFNAME=bond0.11
 export NCCL_SOCKET_FAMILY=AF_INET
 export CUDA_VISIBLE_DEVICES=0,1
 ```
@@ -703,7 +703,7 @@ only permitted cross-control differences. Launch the target wrapper on `.41`:
 ```bash
 STAGE2_DISTRIBUTED_MODE=ddp \
 STAGE2_NUM_MACHINES=2 STAGE2_NUM_PROCESSES=4 \
-STAGE2_MACHINE_RANK=0 STAGE2_MAIN_PROCESS_IP=10.1.102.41 \
+STAGE2_MACHINE_RANK=0 STAGE2_MAIN_PROCESS_IP=172.16.11.41 \
 STAGE2_MAIN_PROCESS_PORT=29520 \
 ./run_stage2_training.sh
 ```
@@ -713,7 +713,7 @@ Launch it on `.40` with only the machine rank changed:
 ```bash
 STAGE2_DISTRIBUTED_MODE=ddp \
 STAGE2_NUM_MACHINES=2 STAGE2_NUM_PROCESSES=4 \
-STAGE2_MACHINE_RANK=1 STAGE2_MAIN_PROCESS_IP=10.1.102.41 \
+STAGE2_MACHINE_RANK=1 STAGE2_MAIN_PROCESS_IP=172.16.11.41 \
 STAGE2_MAIN_PROCESS_PORT=29520 \
 ./run_stage2_training.sh
 ```

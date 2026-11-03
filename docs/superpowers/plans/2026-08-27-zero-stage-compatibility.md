@@ -31,9 +31,9 @@
 - A config file is hashed once when its runtime profile is created; every downstream manifest, checkpoint sidecar, and report passes that digest forward.
 - Follow `superpowers:test-driven-development` for each production behavior change and `superpowers:systematic-debugging` for any unexpected test, numerical, OOM, DeepSpeed, NCCL, or timeout failure.
 - Do not push, merge, publish, or create a PR without explicit user permission.
-- Store every generated weight, final model, and numbered checkpoint under `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/`; never use a linked-worktree-local checkpoint directory.
-- Store every generated evidence, witness, manifest, audit, report, table, or plot under `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/`.
-- Store every training log, execution log, stdout, and stderr under `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/`.
+- Store every generated weight, final model, and numbered checkpoint under `/root/workspace/ILVR/checkpoints/zero-stage-compatibility/`; never use a linked-worktree-local checkpoint directory.
+- Store every generated evidence, witness, manifest, audit, report, table, or plot under `/root/workspace/ILVR/results/zero-stage-compatibility/`.
+- Store every training log, execution log, stdout, and stderr under `/root/workspace/ILVR/logs/zero-stage-compatibility/`.
 - Give every independent training attempt and standalone probe a distinct experiment ID and reuse that exact ID under checkpoint, result, and log roots. A two-phase checkpoint→same-identity-resume lifecycle keeps one ID because it is one logical experiment; independently reusable selected-save and selected-resume producers use different IDs.
 - Unit tests that do not perform real training may use pytest `tmp_path`; every distributed integration harness uses the canonical roots even when its checkpoint is tiny.
 - Treat pre-policy `outputs/` artifacts as read-only legacy provenance: never move, rename, overwrite, revalidate, or add new files to them. Reuse only exact identity-matching witnesses at their original absolute paths.
@@ -116,7 +116,7 @@ Task 1 defines canonical artifact ownership and the shared runtime identity cons
 def test_run_paths_share_one_experiment_identifier():
     paths = resolve_run_artifact_paths("stage1-zero2-dora-mb4-ga2-candidate")
     assert paths.checkpoint_dir == Path(
-        "/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/"
+        "/root/workspace/ILVR/"
         "checkpoints/zero-stage-compatibility/stage1-zero2-dora-mb4-ga2-candidate"
     )
     assert paths.result_dir.name == paths.checkpoint_dir.name
@@ -161,7 +161,7 @@ Expected: collection fails because `src.artifact_paths` does not exist.
 
 ```python
 CANONICAL_REPOSITORY_ROOT = Path(
-    "/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR"
+    "/root/workspace/ILVR"
 )
 CANONICAL_CHECKPOINT_ROOT = (
     CANONICAL_REPOSITORY_ROOT / "checkpoints" / "zero-stage-compatibility"
@@ -1560,7 +1560,7 @@ def select_fastest_success(rows: Sequence[ZeroMatrixAttempt]) -> ZeroMatrixAttem
 - [ ] **Step 4: Implement the coordinator CLI without model/checkpoint hashing**
 
 ```bash
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 ./venv/ilvr-venv/bin/python -m src.stage1.zero_matrix reuse-status \
   --matrix-result-dir "$zero_result_root/stage1-zero-matrix" \
   --method dora \
@@ -1578,9 +1578,9 @@ For a full-matrix CLI invocation, load each of the three canonical runtime profi
 The launcher loops stages `3 2 1`, methods `full dora`, and the four fixed candidates. Before each producer it runs `reuse-status`; reusable success/failure rows are not relaunched. For each actual launch it creates a collision-resistant run suffix and resolves three distinct directories from one experiment ID:
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-$counter"
 experiment_id="stage1-zero${zero_stage}-${method}-mb${micro_batch}-ga${gradient_accumulation}-candidate-$run_suffix"
 checkpoint_dir="$zero_checkpoint_root/$experiment_id"
@@ -1812,8 +1812,8 @@ Add an artifact-ownership section containing the three exact canonical roots, th
 Use these exact ZeRO-2 examples in the guide; changing only the canonical config filename selects another stage:
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-dora-fresh-example-$run_suffix"
 
@@ -1850,8 +1850,8 @@ experiment_id="stage1-zero2-dora-fresh-example-$run_suffix"
 ```
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero2-dora-fresh-example-$run_suffix"
 
@@ -1890,7 +1890,7 @@ Use explicit status rows instead of numeric filler:
 | 3 | Full | recorded by Task 10 | not recorded in this document yet | not recorded in this document yet | pending Task 10 |
 ```
 
-Explain that the matrix report lives at `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json` and each Stage 2 rank-skew witness lives below the same canonical result root in its experiment-ID directory; do not claim hardware success before Tasks 9–10.
+Explain that the matrix report lives at `/root/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json` and each Stage 2 rank-skew witness lives below the same canonical result root in its experiment-ID directory; do not claim hardware success before Tasks 9–10.
 
 - [ ] **Step 3: Run one focused CPU suite**
 
@@ -1938,9 +1938,9 @@ git commit -m "docs: describe ZeRO stage training and resume"
 ### Task 9: Run Only Missing Distributed Compatibility Gates
 
 **Files:**
-- Record checkpoints: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/<experiment-id>/`
-- Record witnesses: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/<experiment-id>/*.json`
-- Record logs: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/<experiment-id>/{stdout,stderr}.log`
+- Record checkpoints: `/root/workspace/ILVR/checkpoints/zero-stage-compatibility/<experiment-id>/`
+- Record witnesses: `/root/workspace/ILVR/results/zero-stage-compatibility/<experiment-id>/*.json`
+- Record logs: `/root/workspace/ILVR/logs/zero-stage-compatibility/<experiment-id>/{stdout,stderr}.log`
 - Reuse: existing Stage 2 ZeRO-1/2 DoRA save/resume feasibility evidence
 
 **Interfaces:**
@@ -1952,7 +1952,7 @@ git commit -m "docs: describe ZeRO stage training and resume"
 Run:
 
 ```bash
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 for evidence_root in "$zero_result_root" "$PWD/outputs"; do
   if [[ -d "$evidence_root" ]]; then
     rg --files "$evidence_root" | rg '(evidence|witness|rank-skew|resume).*\.json$'
@@ -1967,9 +1967,9 @@ The second root is legacy read-only provenance. Open only candidate JSON files s
 Run each missing method once:
 
 ```bash
-zero_checkpoint_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_checkpoint_root=/root/workspace/ILVR/checkpoints/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero1-full-tiny-lifecycle-$run_suffix"
@@ -2000,7 +2000,7 @@ Expected: each command exits 0; its checkpoint, witness, and logs share the expe
 - [ ] **Step 3: Run missing Stage 1 ZeRO-2 Full/DoRA tiny lifecycles**
 
 ```bash
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage1-zero2-full-tiny-lifecycle-$run_suffix"
 mkdir -p -- "$zero_log_root"
@@ -2032,7 +2032,7 @@ Expected: each command exits 0 with the same bounded witness contract. If any ru
 Verify only their small recorded identity/result documents. If they lack the new sidecar schema because Task 3 changed the checkpoint contract, run the tiny Stage 2 harness exactly once for the affected ZeRO stage; otherwise do not repeat those save/resume jobs.
 
 ```bash
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 experiment_id="stage2-zero1-dora-tiny-lifecycle-$run_suffix"
 mkdir -p -- "$zero_log_root"
@@ -2067,7 +2067,7 @@ Run exactly these three commands, skipping an exact successful witness found in 
 
 ```bash
 : "${STAGE1_CHECKPOINT:?set STAGE1_CHECKPOINT to the validated Stage 1 DoRA handoff}"
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 for zero_stage in 1 2 3; do
   run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
   experiment_id="stage2-zero${zero_stage}-dora-mb1-ga8-rank-skew-$run_suffix"
@@ -2101,7 +2101,7 @@ Run:
 import json
 from pathlib import Path
 root = Path(
-    "/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/"
+    "/root/workspace/ILVR/"
     "results/zero-stage-compatibility"
 )
 for path in sorted(root.glob("stage*-zero*/**/*.json")):
@@ -2116,10 +2116,10 @@ Expected: each required identity has one successful witness. Do not run a second
 ### Task 10: Run the Missing Stage 1 Batch Matrix in Reverse Order
 
 **Files:**
-- Record candidate/selected checkpoints: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/checkpoints/zero-stage-compatibility/<experiment-id>/`
-- Record per-run evidence: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/<experiment-id>/producer-evidence.json`
-- Record aggregate report: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json`
-- Record per-run logs: `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility/<experiment-id>/`
+- Record candidate/selected checkpoints: `/root/workspace/ILVR/checkpoints/zero-stage-compatibility/<experiment-id>/`
+- Record per-run evidence: `/root/workspace/ILVR/results/zero-stage-compatibility/<experiment-id>/producer-evidence.json`
+- Record aggregate report: `/root/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json`
+- Record per-run logs: `/root/workspace/ILVR/logs/zero-stage-compatibility/<experiment-id>/`
 
 **Interfaces:**
 - Consumes: Task 6 coordinator, Task 9 compatibility success, existing exact ZeRO-3 evidence, and one authenticated sample-audit digest.
@@ -2130,7 +2130,7 @@ Expected: each required identity has one successful witness. Do not run a second
 If no valid sample-audit witness exists, run the benchmark's existing bounded audit command once against `data/TRAIN.jsonl` and `data/`, then pass its digest to every matrix producer. If it exists and matches model, dataset path/stat identity, seed 42, and row selection, do not rerun or rehash the dataset.
 
 ```bash
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 canonical_audit="$zero_result_root/stage1-zero-matrix/sample-audit.json"
 legacy_audit="$PWD/outputs/stage1-zero-matrix/sample-audit.json"
 mkdir -p -- "$zero_result_root/stage1-zero-matrix"
@@ -2159,7 +2159,7 @@ Expected: an exact canonical or legacy audit path is printed and left untouched,
 Run:
 
 ```bash
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 canonical_audit="$zero_result_root/stage1-zero-matrix/sample-audit.json"
 legacy_audit="$PWD/outputs/stage1-zero-matrix/sample-audit.json"
 sample_audit=$(PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
@@ -2184,8 +2184,8 @@ Expected: JSON lists stages 3→2→1, methods Full/DoRA, candidates 8→4→2�
 Run:
 
 ```bash
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
-zero_log_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/logs/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
+zero_log_root=/root/workspace/ILVR/logs/zero-stage-compatibility
 matrix_result_id=stage1-zero-matrix
 run_suffix="$(date -u +%Y%m%dt%H%M%S)-$$-${RANDOM}"
 controller_log_id="stage1-zero-matrix-controller-$run_suffix"
@@ -2207,14 +2207,14 @@ Expected: the controller runs only missing candidates, each for exactly three op
 
 - [ ] **Step 4: Confirm selected-only resume witnesses**
 
-Inspect `/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json`. For each successful `(zero_stage, method)`, confirm exactly one selected candidate and exactly one same-identity checkpoint→one-step-resume witness. Confirm every recorded checkpoint/result/log path belongs to its canonical root and uses the same experiment ID. If the controller stopped before selected resume, run its printed exact canonical-path resume command once; do not save/resume losing candidates.
+Inspect `/root/workspace/ILVR/results/zero-stage-compatibility/stage1-zero-matrix/zero-matrix-report.json`. For each successful `(zero_stage, method)`, confirm exactly one selected candidate and exactly one same-identity checkpoint→one-step-resume witness. Confirm every recorded checkpoint/result/log path belongs to its canonical root and uses the same experiment ID. If the controller stopped before selected resume, run its printed exact canonical-path resume command once; do not save/resume losing candidates.
 
 - [ ] **Step 5: Stop compute after the report is complete**
 
 Run the coordinator's small report validator once:
 
 ```bash
-zero_result_root=/NHNHOME/WORKSPACE/26msit001_A/PRML_Lab/hjh/workspace/ILVR/results/zero-stage-compatibility
+zero_result_root=/root/workspace/ILVR/results/zero-stage-compatibility
 PYTHONPATH="$PWD:$PWD/transformers/src:$PWD/src" \
 ./venv/ilvr-venv/bin/python -m src.stage1.zero_matrix select \
   --matrix-result-dir "$zero_result_root/stage1-zero-matrix" \
