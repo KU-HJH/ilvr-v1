@@ -574,7 +574,7 @@ def test_subprocess_runner_rejects_remote_evidence_outside_exact_child(tmp_path)
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=8",
-            "korea@10.1.102.41",
+            "korea@172.16.11.41",
         )
         remote_argv = shlex.split(command[6])
         assert remote_argv[:5] == [
