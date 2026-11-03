@@ -14,7 +14,7 @@
 
 - Worktree `/root/workspace/ILVR/.worktrees/voff-reproduction-20260917`, base commit `44b2967cd767fb2fd4c3465167b2ba511695d2c2`; preserve other worktrees.
 - Use `./venv/ilvr-venv/bin/python`; results in `results/`, logs in `logs/`, every model-bearing artifact in `checkpoints/`, prepared models only in `checkpoints/evaluation-staging/`.
-- Every real training/probe uses existing two-node/four-rank coordinator; remote `korea@10.1.102.41`, container `llm_kd`, rank0; local rank1; master10.1.102.41, interfacebond1.102.
+- Every real training/probe uses existing two-node/four-rank coordinator; remote `korea@172.16.11.41`, container `llm_kd`, rank0; local rank1; master172.16.11.41, interfacebond0.11.
 - Reproduction only: microbatch1, accumulation4, global16, max_steps212, LR5e-5, warmup10, seed42, DoRA r32/alpha64/dropout0.05, beta0.1, preference weight1, entropy0, until_next_latent, clean_prefix, latent-body masking, START/END kept, direct Stage1 initialization.
 - Initializer: canonical `checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431`. Fresh optimizer, no resume of cancelled run.
 - Global gradient checkpointing OFF; selective latent-prefix activation checkpointing ON; no-cache recurrence, languageSDPA/visionFA2/sidecarFlex.
