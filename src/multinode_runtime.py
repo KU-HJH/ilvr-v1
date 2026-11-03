@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from src.multinode import LaunchPlan
 
 
-_REMOTE_HOST = "korea@10.1.102.41"
+_REMOTE_HOST = "korea@172.16.11.41"
 _REMOTE_CONTAINER = "llm_kd"
 _REQUIRED_FREE_BYTES = 100 * 1024**3
 _REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -601,7 +601,7 @@ def owned_listener_is_ready(
     expected_owner_start_ticks: int | None = None,
 ) -> bool:
     """Prove that the requested LISTEN socket belongs to the owned process tree."""
-    if master_addr != "10.1.102.41":
+    if master_addr != "172.16.11.41":
         raise ValueError("readiness master address must match the fixed topology")
     listening = _listening_socket_inodes(
         master_addr=master_addr, port=port, proc_root=proc_root
@@ -3871,8 +3871,8 @@ def _validate_snapshot(node: NodeSnapshot) -> None:
         raise ValueError(f"{node.node}: exactly two GPUs are required")
     if any("H100" not in name for name in node.gpu_names):
         raise ValueError(f"{node.node}: H100 GPUs are required")
-    if node.interface != "bond1.102":
-        raise ValueError(f"{node.node}: bond1.102 interface is required")
+    if node.interface != "bond0.11":
+        raise ValueError(f"{node.node}: bond0.11 interface is required")
     if not node.input_paths_ok:
         raise ValueError(f"{node.node}: input paths are missing")
     if not node.artifact_roots_writable:

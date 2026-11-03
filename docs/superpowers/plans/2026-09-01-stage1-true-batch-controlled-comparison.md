@@ -22,7 +22,7 @@
 - Do not place model-bearing compatibility copies or symlinks under `results/`, and do not grow the repository filesystem with checkpoints.
 - The only production model is `checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct`; the only training and evaluation inputs are `data/TRAIN.jsonl`, `data/images_comt`, and `data/TEST.jsonl` with the digests frozen by the spec.
 - Fix the production experiment to DoRA `r=32`, `alpha=64`, dropout `0.05`, targets `q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj`, EMA tau `0.999`, LR `1e-5`, BF16, FlashAttention 2, non-reentrant gradient checkpointing, and `configs/deepspeed_zero1.json`.
-- Fix world size to four, remote `korea@10.1.102.41` container `llm_kd` as rank-0/master, local as rank 1, two GPUs per node, `MASTER_ADDR=10.1.102.41`, and NCCL/GLOO interface `bond1.102`.
+- Fix world size to four, remote `korea@172.16.11.41` container `llm_kd` as rank-0/master, local as rank 1, two GPUs per node, `MASTER_ADDR=172.16.11.41`, and NCCL/GLOO interface `bond0.11`.
 - The remote host checkout `/home/korea/Workspace/hjh/workspace/ILVR` is mounted as `/root/workspace/ILVR` inside `llm_kd`; all commands inside the container use only the `/root` path.
 - Execute exactly one capacity smoke, two one-step replays, two 648-step mains, and two official evaluations in the order approved by the spec. Do not add full-horizon A/A, extra seeds, historical reproduction, or retry at relaxed thresholds.
 - The fixed first-step gates are normative and immutable: same-arm `rtol=1e-6, atol=1e-7`; cross-arm symmetric relative L2 `<=0.02`, cosine `>=0.9998`; global CE/alignment/total absolute difference `<=0.01`; samplewise visual/teacher tolerance `rtol=1e-6, atol=1e-6`.
@@ -1185,7 +1185,7 @@ git status --porcelain --untracked-files=no
   --equivalence-capacity-cache /root/workspace/ILVR/cache/stage1-equivalence-v1
 ```
 
-Expected: tracked tree is clean and dry-run shows remote rank 0 in `llm_kd`, local rank 1, four processes, ZeRO-1, master `10.1.102.41`, and interface `bond1.102`, without creating a run directory.
+Expected: tracked tree is clean and dry-run shows remote rank 0 in `llm_kd`, local rank 1, four processes, ZeRO-1, master `172.16.11.41`, and interface `bond0.11`, without creating a run directory.
 
 - [ ] **Step 2: Update the already-provisioned remote checkout to the exact commit**
 
@@ -1194,14 +1194,14 @@ First verify the remote tracked tree is clean; stop rather than overwrite if it 
 ```bash
 implementation_commit=$(git rev-parse HEAD)
 bundle_name="ilvr-stage1-equivalence-${implementation_commit}.bundle"
-ssh -o BatchMode=yes -o ConnectTimeout=8 korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd git status --porcelain --untracked-files=no"
 git bundle create "/tmp/$bundle_name" HEAD
 rsync -a --ignore-existing "/tmp/$bundle_name" \
-  "korea@10.1.102.41:/home/korea/Workspace/hjh/$bundle_name"
-ssh -o BatchMode=yes -o ConnectTimeout=8 korea@10.1.102.41 \
+  "korea@172.16.11.41:/home/korea/Workspace/hjh/$bundle_name"
+ssh -o BatchMode=yes -o ConnectTimeout=8 korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd git fetch '/root/$bundle_name' HEAD"
-ssh -o BatchMode=yes -o ConnectTimeout=8 korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd git checkout --detach '$implementation_commit'"
 ```
 
