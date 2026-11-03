@@ -1,24 +1,147 @@
 # Four-GPU multi-node operation
 
 This is the operator contract for ILVR's fixed two-node, four-process
-training and evaluation launchers. Run every coordinator command from
-`/root/workspace/ILVR` with the repository virtual environment. Do not adapt
-these commands to a discovered host, interface, container, rank order, or
-Python installation.
+training and evaluation launchers. The canonical examples below run from
+`/root/workspace/ILVR` with the repository virtual environment. For Stage 2
+InfiniBand execution, use the explicitly validated runtime in the next section.
+Keep each path's specified host, interface, container, rank order and Python.
 
-## Fixed topology and one-time provisioning
+## Verified Stage 2 InfiniBand execution
+
+This records the approved, observed Stage 2 IB path as of 2026-10-22. Reuse
+the existing runtime for Stage 2 IB work; this section takes precedence over
+the canonical `llm_kd`/repository examples below for that path. It does not
+establish IB support for Stage 1, evaluation, or other projects.
+
+| Item | Verified Stage 2 IB value |
+| --- | --- |
+| Remote node / machine rank / global ranks | `korea@172.16.11.41` / 0 / 0,1 |
+| Local node / machine rank / global ranks | `korea@172.16.11.40` / 1 / 2,3 |
+| Container on both nodes | `llm_kd_rdma`; preserve original `llm_kd` |
+| Runtime on both nodes | `/root/workspace/ILVR/.worktrees/rdma-stage2-20261022` |
+| Validated revision | `a39fe86774c965022c058f2cec4cc8dd311bab7a`, or a reviewed compatible descendant |
+| Coordinator | Existing `run_multinode_stage2_training.sh`, inside local `llm_kd_rdma` |
+| Rendezvous / socket interface | `172.16.11.41` / `bond0.11` |
+| GPU / HCA | Two H100 NVL per node; active `mlx5_0`, port 1 |
+
+The validated runtime descends from corrected-loss baseline
+`2f48c51985c395c16bea80a89847d7586728f9cd`. Its remote exec, stdin and rsync
+boundaries consistently target `llm_kd_rdma`; its sanitized Stage 2 worker
+environment explicitly carries the IB settings. An unmodified canonical
+coordinator still targets `llm_kd`. Changing a shell variable or copying only
+the launcher is insufficient. Verify a compatible descendant on both nodes
+before using another checkout; matching headline hyperparameters alone does
+not prove algorithm or runtime compatibility.
+
+The existing RDMA containers were provisioned additively from
+`llm/cu128:codex_3` with host networking, both GPUs,
+`--device /dev/infiniband/uverbs0:/dev/infiniband/uverbs0:rw`,
+`--ulimit memlock=-1:-1`, `--cap-add IPC_LOCK`, `--shm-size 1g`, and the
+`ibverbs-utils` / `ibverbs-providers` userspace packages. Their `/root` bind
+sources are `/home/korea/Workspace/hjh2` on local .40 and
+`/home/korea/Workspace/hjh` on remote .41; `/raid` is also bound at `/raid`.
+Preserve the existing data/venv/checkpoints symlinks, which depend on these
+mounts. Reuse the containers after checking their actual state and device
+access; creating a new container for every run is unnecessary. Keep original
+session containers and host drivers/modules intact. Earlier verify-only
+`rdma-verify-*` containers are not this training environment.
+
+From inside local `llm_kd_rdma`, start with:
+
+```bash
+cd /root/workspace/ILVR/.worktrees/rdma-stage2-20261022
+source ./venv/ilvr-venv/bin/activate
+```
+
+Activation must put this venv's `bin` directory on the coordinator's `PATH`
+so preflight can find `torchrun`; invoking the venv Python alone does not
+guarantee this. Source any experiment settings, then explicitly enforce the
+whole applicable profile in [training-defaults.md](../documents/training-defaults.md).
+Use original Qwen2.5-VL-3B plus reproduced Stage 1 checkpoint-431, the existing
+four-rank/global-16 profile, CE0.1 and ordinary beta10/margin0.5 outside beta
+(DIL beta1/margin0), and preserve stage/resume semantics. Do not use the
+historical 54% Stage 2 weights as a fresh-run initializer.
+
+Both actual worker environments must resolve:
+
+```text
+MASTER_ADDR=172.16.11.41
+NCCL_NET=IB
+NCCL_IB_DISABLE=0
+NCCL_IB_HCA=mlx5_0:1
+NCCL_SOCKET_IFNAME=bond0.11
+GLOO_SOCKET_IFNAME=bond0.11
+NCCL_DEBUG=INFO
+NCCL_DEBUG_SUBSYS=INIT,NET
+```
+
+The coordinator sanitizes the worker environment with `env -i`. Confirm the
+above values in its resolved remote/local commands, not just the invoking
+shell. When IB is requested, resolve an IB failure before launch rather than
+silently falling back to socket transport. Run the existing dry-run and live
+preflight, checking matching code, compatible venvs, readable model/data/images,
+active HCA/device/verbs access, both GPUs per node, a free explicit port and
+fresh run destinations. Do not start ranks manually. Launch the existing
+coordinator detached and retain its normal per-run logs/results.
+
+For the approved same-budget fresh Stage 2B smoke, preserve the full
+`STAGE2_TOTAL_STEPS=212` / `--max_steps 212`, `--save_steps 212`, warmup 10,
+ZeRO-2 and all other standing defaults, and add
+`--stage2_stop_after_checkpoint 2`. The final validated revision admits
+ordinary `dpo` context-preference Stage 2B through the existing full-save-then-stop
+callback. Older revisions may admit only DIL. This stop option is fresh-run
+only and must be below the full budget; omit it for full training or resume.
+Do not set `max_steps=2`, which would change the schedule. Recalculate the
+full budget if retained data or stage protocol changes.
+
+Accept IB/training success only with runtime evidence: all four initialized
+global ranks, inter-node `NET/IB` channels on both nodes, finite loss and
+gradients, the expected saved optimizer step, complete checkpoint contents,
+and successful node/coordinator exits. The verified run completed two updates
+with `global_samples=32`, `world_size=4` and all four GPUs idle afterward.
+Shutdown process-group warnings appeared despite exit 0; this was not a
+warning-free run.
+
+The existing coordinator assembles the complete checkpoint on **remote
+machine rank 0**, in `./checkpoints/<run-id>/checkpoint-<step>` on .41.
+For the verified run, this resolved to
+`/raid/workspace/ILVR/checkpoints/rdma-stage2-smoke-20261022-062054/checkpoint-2`.
+Local rank-2/3 optimizer and RNG shards alone are incomplete. Before resume,
+verify remote trainer/model/adapter state, all four optimizer/RNG shards,
+sampler/runtime sidecars and the separate `scheduler.pt`; the DeepSpeed model
+state's `lr_scheduler` field was `None`. Preserve existing checkpoint symlinks
+and store weights only under `checkpoints`, metadata under `results`, logs
+under `logs`.
+
+**GPUDirect RDMA was disabled in the observed NCCL logs.** IB worked with
+host staging; an installed `nvidia-peermem` module file does not mean it is
+loaded or GDR is usable. Do not claim GPU-memory RDMA or enable host modules
+as part of ordinary reuse. The earlier CPU perftest measured 373.48 Gb/s;
+it is not a GPU-memory or model-training throughput measurement. The
+two-update smoke establishes transport/training/save operation, not full-run
+convergence, accuracy or a reproduction of the historical 54% result.
+
+Controller-side evidence is retained at:
+
+- `/root/workspace/ILVR/.worktrees/rdma-stage2-20261022/results/rdma-stage2-smoke-20261022-062054/summary.json`
+- `/root/workspace/docs/superpowers/records/2026-10-22-ilvr-rdma-stage2-runtime.json`
+  (exact effective profile and container provisioning argv).
+- `/root/workspace/docs/superpowers/records/2026-10-22-ilvr-rdma-stage2-intake.json`
+  (approvals, independent review finding, native fix and verification).
+
+## Canonical topology and one-time provisioning
 
 | Item | Required value |
 | --- | --- |
-| Remote SSH target | `korea@10.1.102.41` |
+| Remote SSH target | `korea@172.16.11.41` |
 | Remote container | `llm_kd` |
 | Repository inside both containers | `/root/workspace/ILVR` |
 | Remote host repository | `/home/korea/Workspace/hjh/workspace/ILVR` |
 | Python on both nodes | `/root/workspace/ILVR/venv/ilvr-venv/bin/python` |
-| Rendezvous/master | `10.1.102.41`, remote machine rank 0 |
+| Rendezvous/master | `172.16.11.41`, remote machine rank 0 |
 | Local machine rank | 1 |
 | Processes | 2 GPUs per node, 4 processes total |
-| Distributed interface | `bond1.102` for Gloo and NCCL |
+| Distributed interface | `bond0.11` for Gloo and NCCL |
 
 Provisioning is a one-time administrator action, not a launcher-time sync.
 Before the first run, the `llm_kd` container must be running; the same clean,
@@ -78,7 +201,7 @@ preflight_id="preflight-stage1-lora-zero3-$(date -u +%Y%m%d-%H%M%S)-$$"
 ```
 
 A live preflight must report matching commit, Python, PyTorch, Accelerate,
-DeepSpeed, two GPUs per node, `bond1.102`, fresh paths/sessions, readable
+DeepSpeed, two GPUs per node, `bond0.11`, fresh paths/sessions, readable
 inputs, writable roots, and the required free space. The subsequent launcher
 is still the authoritative final preflight.
 
@@ -206,7 +329,7 @@ TUNING_METHOD=dora \
 
 The opt-in entropy/Vision auxiliaries use the existing coordinator with
 explicit `--backend ddp`; they do not run through DeepSpeed/ZeRO. The fixed
-topology remains remote rank 0 at `10.1.102.41`, local rank 1, two GPUs per
+topology remains remote rank 0 at `172.16.11.41`, local rank 1, two GPUs per
 node, and four ranks. Native workers use Accelerate `--multi_gpu` and reject an
 active DeepSpeed, FSDP, Megatron, CPU, or Dynamo mode inherited from the
 environment. Do not start ranks manually or replace the coordinator.
@@ -233,7 +356,7 @@ both hosts. First integrate the feature delivery so both canonical repositories
 contain the same committed implementation; a worktree dry-run does not deploy
 it. Confirm identical committed code and environments, readable
 Stage1/data/image inputs at the same absolute paths, all four required GPUs and
-memory, `bond1.102`, the selected free port, and fresh destinations. The default
+memory, `bond0.11`, the selected free port, and fresh destinations. The default
 fresh Stage 2 DoRA source is the reproduced
 `checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431`,
 not `comt_ckpt` or checkpoint-215. Derive the Stage 2 step budget from retained
@@ -282,7 +405,7 @@ prepared_model_dir="/root/workspace/ILVR/checkpoints/evaluation-staging/$source_
 
 ./venv/ilvr-venv/bin/python -m src.multinode prepared-inference-show \
   --model-dir "$prepared_model_dir"
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/env PYTHONPATH=/root/workspace/ILVR /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode prepared-inference-show --model-dir '$prepared_model_dir'"
 ```
 
@@ -444,14 +567,14 @@ each node and decode ownership records through the bounded reader:
 
 ```bash
 tmux list-sessions -F '#{session_name} #{session_windows} #{session_attached}'
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec llm_kd /usr/bin/tmux list-sessions -F '#{session_name} #{session_windows} #{session_attached}'"
 
 run_id=RUN_ID
 attempt_id=initial
 ./venv/ilvr-venv/bin/python -m src.multinode ownership-show \
   --ownership-path "/root/workspace/ILVR/logs/multinode/$run_id/$attempt_id/ownership-rank1.json"
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/env PYTHONPATH=/root/workspace/ILVR /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode ownership-show --ownership-path '/root/workspace/ILVR/logs/multinode/$run_id/$attempt_id/ownership-rank0.json'"
 ```
 
@@ -462,7 +585,7 @@ start time, argv/environment digest, commit, run, attempt, and rank, then sends
 SIGTERM through a pidfd only:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/env PYTHONPATH=/root/workspace/ILVR /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode stop-owned --run-id '$run_id' --machine-rank 0"
 ./venv/ilvr-venv/bin/python -m src.multinode stop-owned \
   --run-id "$run_id" --machine-rank 1

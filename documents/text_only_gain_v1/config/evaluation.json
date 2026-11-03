@@ -1,0 +1,36 @@
+{
+  "artifact_stage": "stage1",
+  "samples": 400,
+  "shards": 2,
+  "samples_per_shard": 200,
+  "seed": 42,
+  "max_new_tokens": 4096,
+  "temperature": 0,
+  "top_p": 1,
+  "metric": "normalized_exact_match",
+  "generations_per_sample": 1,
+  "document_kind": "evaluation_protocol_not_an_executable_command",
+  "dataset": "data/TEST.jsonl",
+  "task_name": "comt",
+  "checkpoint_selection": "final_checkpoint_of_current_run",
+  "decoding": "greedy",
+  "generation": "ordinary_clean_generation_with_existing_latent_generation",
+  "error_policy": "record_errors_and_recover_within_same_protocol",
+  "execution": {
+    "working_directory": "data",
+    "path_base": "new_workspace_root",
+    "pythonpath": [
+      ".",
+      "src",
+      "transformers/src"
+    ],
+    "image_resolution": "eval.py resolves relative image paths against cwd; it has no image-root CLI argument",
+    "rng_initialization_per_worker": {
+      "python_random_seed": 42,
+      "numpy_random_seed": 42,
+      "torch_manual_seed": 42
+    },
+    "sharding": "original_index_modulo_2; preserve original indices when merging",
+    "gpu_assignment": "one shard per GPU process"
+  }
+}

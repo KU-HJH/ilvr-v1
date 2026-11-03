@@ -1,0 +1,479 @@
+# evaluate_deepseed.py
+import os
+import re
+import json
+import argparse
+import logging
+from functools import partial
+from typing import List, Dict, Any, Union
+
+import torch
+from PIL import Image
+from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+
+from stage2.checkpointing import (
+    Stage2ArtifactKind,
+    inspect_stage2_artifact,
+    resolve_latent_token_ids,
+)
+from stage2.backend_fallback import is_flash_attention_initialization_error
+from stage2.inference import (
+    Stage2InferenceController,
+    build_stage2_generation_config,
+)
+from stage2.peft import (
+    load_stage2_model_for_inference,
+    resolve_stage2_qwen_model,
+)
+
+try:
+    from mathruler.grader import extract_boxed_content
+except Exception:
+    extract_boxed_content = None
+import re
+
+ACTION_MAP = {
+    "LEFT": (0,-1), "DOWN": (1,0), "RIGHT": (0,1), "UP": (-1,0),
+    "L": (0,-1), "D": (1,0), "R": (0,1), "U": (-1,0),
+}
+
+
+BASE_MODEL_ID = "Qwen/Qwen2.5-VL-7B-Instruct"  
+BASE_DATASET_DIR = ''
+
+
+def get_eval_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model_dir", type=str, required=True, help="Path to the trained model directory.")
+    parser.add_argument("--base_model_dir", type=str, help="Stage 1 base directory for a Stage 2 PEFT artifact.")
+    parser.add_argument("--test_data_path", type=str, required=True, help="Path to the test data jsonl file.")
+    parser.add_argument("--task_name", type=str, required=True, help="Task name for bookkeeping.")
+    parser.add_argument("--output_json_path", type=str, default="evaluation_results.jsonl", help="Where to save per-sample results.")
+    parser.add_argument("--cache_dir", type=str, default="./cache", help="HF cache dir.")
+    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    parser.add_argument("--stage2_split_attention", action=argparse.BooleanOptionalAction,
+                        default=False, help="Stage 2 language SDPA / vision FA2 (no inference sidecars).")
+    return parser.parse_args()
+
+
+def load_processor(model_dir: str, cache_dir: str):
+
+    try:
+        return AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
+    except Exception:
+        logging.warning("Failed to load processor from model_dir, falling back to base model id.")
+        return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
+
+def load_model(model_dir: str, cache_dir: str, *, stage2_split_attention: bool = False):
+
+    if stage2_split_attention:
+        logging.info("Stage 2 evaluation attention: language=sdpa vision=flash_attention_2")
+        # Explicit opt-in must fail visibly if unavailable, not silently select eager.
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_dir, device_map="auto", torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir, attn_implementation="sdpa", stage2_split_attention=True,
+        )
+        model.eval()
+        torch.backends.cuda.matmul.allow_tf32 = True
+        return model
+    try:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_dir,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+            attn_implementation="flash_attention_2"
+        )
+    except Exception as e:
+        if not is_flash_attention_initialization_error(e):
+            raise
+        logging.warning(f"flash_attention_2 initialization failed ({e}), falling back to eager.")
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_dir,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+            attn_implementation="eager"
+        )
+    model.eval()
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        pass
+    return model
+
+
+def load_evaluation_artifacts(
+    *, model_dir: str, base_model_dir: str | None, cache_dir: str,
+    stage2_split_attention: bool = False,
+):
+    """Load either one full Stage 2 artifact or a Stage 1 base plus adapter."""
+    selected_loader = partial(load_model, stage2_split_attention=True) if stage2_split_attention else load_model
+    artifact_inspection = inspect_stage2_artifact(model_dir)
+    if artifact_inspection.artifact_kind is Stage2ArtifactKind.FULL:
+        if base_model_dir is not None:
+            raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
+        return selected_loader(model_dir, cache_dir), load_processor(model_dir, cache_dir)
+
+    if base_model_dir is None:
+        raise ValueError("base_model_dir is required for a Stage 2 PEFT artifact")
+    processor = AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
+    model = load_stage2_model_for_inference(
+        base_model_dir,
+        model_dir,
+        processor,
+        source_provenance_kwargs={"cache_dir": cache_dir},
+        load_model=lambda source, **selectors: selected_loader(
+            source, selectors["cache_dir"]
+        ),
+        artifact_inspection=artifact_inspection,
+    )
+    return model, processor
+
+def _resolve_image_paths(image_input: Union[str, List[str]]) -> List[str]:
+
+    if image_input is None:
+        return []
+    if isinstance(image_input, str):
+        p = image_input
+        if not os.path.isabs(p):
+            p = os.path.join(BASE_DATASET_DIR, p)
+        return [p]
+    if isinstance(image_input, list):
+        outs = []
+        for p in image_input:
+            if not os.path.isabs(p):
+                p = os.path.join(BASE_DATASET_DIR, p)
+            outs.append(p)
+        return outs
+    return []
+
+def open_images(paths: List[str]) -> List[Image.Image]:
+    imgs = []
+    for p in paths:
+        # Raise error immediately for directories, be explicit
+        if os.path.isdir(p):
+            raise IsADirectoryError(f"Expected image file, but received directory path: {p}")
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Image not found: {p}")
+        imgs.append(Image.open(p).convert("RGB"))
+    return imgs
+
+
+# ---- Several fallback rules for parsing the final answer ----
+_yes_set = {"yes", "true", "a"}
+_no_set  = {"no", "false", "b"}
+
+def _clean_answer_span(cand: str) -> str:
+    # Keep only the first line, drop special tokens, then peel surrounding
+    # markdown/quotes/brackets and trailing punctuation (e.g. "**2**", "2.")
+    cand = re.split(r"[\n\r]", (cand or "").strip())[0]
+    cand = _strip_special_tokens(cand)
+    cand = re.sub(r"^[\s\*_`'\"“‘(\[{【]+", "", cand)
+    cand = re.sub(r"[\s\*_`'\"”’)\]}】.。,，!！?？;；:：]+$", "", cand)
+    return cand.strip()
+
+def extract_final_answer(text: str) -> str:
+
+    s = _strip_special_tokens(text or "").strip()
+
+    # 1) \boxed{...} (take the last one)
+    boxed = re.findall(r"\\boxed\{([^{}]*)\}", s)
+    if boxed:
+        return _clean_answer_span(boxed[-1])
+
+    # 2) "final answer (is)(:) XXX" / "answer (is)(:) XXX" — take the LAST
+    #    occurrence, since the conclusion appears at the end of the response
+    patterns = [
+        r"final\s*answer\s*(?:is)?\s*[:：]?\s*(.+)",
+        r"answer\s*(?:is)?\s*[:：]\s*(.+)"
+    ]
+    for pat in patterns:
+        matches = list(re.finditer(pat, s, flags=re.IGNORECASE))
+        if matches:
+            cand = _clean_answer_span(matches[-1].group(1))
+            if cand:
+                return cand
+    tokens = re.findall(r"[A-Za-z]+", s.lower())
+    only = [t for t in tokens if t in (_yes_set | _no_set)]
+    if len(only) == 1:
+        return only[0].capitalize() if only[0] in {"yes", "no"} else only[0]
+    return _clean_answer_span(s)
+
+def _strip_special_tokens(s: str) -> str:
+    # Common end/special tokens, extend if necessary
+    end_markers = [
+        "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end|>",
+        "</s>", "<s>", "[/INST]", "[INST]",
+        "<|latent_start|>", "<|latent_end|>", "<|latent_pad|>",
+    ]
+    for m in end_markers:
+        s = s.replace(m, "")
+    return s.strip()
+
+def extract_assistant_content(text: str) -> str:
+
+    s = text or ""
+
+
+    m = re.search(r"<\|im_start\|>\s*assistant\s*(.*?)(?:<\|im_end\|>|$)", s, flags=re.S|re.I)
+    if m:
+        return _strip_special_tokens(m.group(1))
+
+
+    m = re.search(
+        r"<\|assistant\|>\s*(.*?)(?:<\|im_end\|>|<\|endoftext\|>|<\|eot_id\|>|<\|end\|>|$)",
+        s, flags=re.S|re.I
+    )
+    if m:
+        return _strip_special_tokens(m.group(1))
+
+
+    m = re.search(r"(?:^|\n|\r)assistant\s*[:：]?\s*(.*)$", s, flags=re.S|re.I)
+    if m:
+        return _strip_special_tokens(m.group(1))
+
+
+    return _strip_special_tokens(s)
+
+
+def normalize_for_match(ans: str) -> str:
+    a = _clean_answer_span(ans)
+    low = a.lower()
+    if low in _yes_set:
+        return "Yes"
+    if low in _no_set:
+        return "No"
+    # Numeric tolerance: "2", "2.0", " 2 " all normalize to the same value
+    try:
+        f = float(a.replace(",", ""))
+        if f == int(f):
+            return str(int(f))
+        return str(f)
+    except (ValueError, OverflowError):
+        pass
+    return low
+
+def run_one_example(model, processor, sample: Dict[str, Any], gen_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    text_input = sample.get("text_input", "")
+    img_list = _resolve_image_paths(sample.get("image_input", []))
+    images = open_images(img_list) if img_list else None
+
+
+    content = []
+    if images:
+        for _ in images:
+            content.append({"type": "image"})
+    content.append({"type": "text", "text": text_input})
+    conversations = [
+        {"role": "user",   "content": content}
+    ]
+
+    prompt = processor.apply_chat_template(
+        conversations, tokenize=False, add_generation_prompt=True
+    )
+
+    inputs = processor(
+        text=[prompt],
+        images=images,   
+        return_tensors="pt",
+        padding=True
+    )
+
+    stage2_model = resolve_stage2_qwen_model(model)
+    effective_device = getattr(model, "device", None)
+    if effective_device is None:
+        effective_device = getattr(stage2_model, "device", None)
+    if effective_device is None:
+        raise ValueError("Unable to determine the Stage 2 evaluation device")
+    inputs = {
+        k: v.to(effective_device)
+        for k, v in inputs.items()
+        if isinstance(v, torch.Tensor)
+    }
+
+    input_ids = inputs["input_ids"]
+    if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+        raise NotImplementedError("Stage 2 evaluation currently supports batch_size=1 only")
+    attention_mask = inputs.get("attention_mask")
+    if attention_mask is None:
+        attention_mask = torch.ones_like(input_ids)
+    latent_size = getattr(stage2_model.config, "latent_size", None)
+    if not isinstance(latent_size, int) or isinstance(latent_size, bool) or latent_size <= 0:
+        raise ValueError("Stage 2 checkpoint config must contain a positive latent_size")
+    token_ids = resolve_latent_token_ids(processor.tokenizer, stage2_model.config)
+    generation_config = build_stage2_generation_config(
+        model_config=stage2_model.config,
+        model_generation_config=getattr(stage2_model, "generation_config", None),
+        tokenizer=processor.tokenizer,
+        generation_kwargs=gen_kwargs,
+    )
+
+    with torch.inference_mode():
+        generation_result = Stage2InferenceController().generate(
+            model=stage2_model,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            token_ids=token_ids,
+            generation_config=generation_config,
+            pixel_values=inputs.get("pixel_values"),
+            image_grid_thw=inputs.get("image_grid_thw"),
+            return_latent_states=False,
+        )
+    out_ids = generation_result.sequences
+    out_text = processor.batch_decode(out_ids, skip_special_tokens=False)[0].strip()
+
+    # Extract the answer from the assistant's segment only — running the
+    # regex over the full decoded text (prompt included) can match text in
+    # the user prompt and keeps trailing special tokens like <|im_end|>.
+    assistant_only = extract_assistant_content(out_text)
+    extracted = extract_final_answer(assistant_only)
+    return {"raw_output": out_text, "assistant_only": assistant_only, "extracted_final_answer": extracted}
+
+def main():
+    args = get_eval_args()
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+    logging.info(f"Loading model: {args.model_dir}")
+    model, processor = load_evaluation_artifacts(
+        model_dir=args.model_dir,
+        base_model_dir=args.base_model_dir,
+        cache_dir=args.cache_dir,
+        **({"stage2_split_attention": True} if getattr(args, "stage2_split_attention", False) else {}),
+    )
+
+
+    data = []
+    with open(args.test_data_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                data.append(json.loads(line))
+
+    if not data:
+        logging.error("Test set is empty, exiting.")
+        return
+
+    gen_kwargs = dict(
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        do_sample=(args.temperature > 0)
+    )
+
+    total = len(data)
+    success = 0
+    results = []
+
+    logging.info(f"Starting evaluation: num_samples={total}")
+    for i, sample in enumerate(data):
+        try:
+            pred = run_one_example(model, processor, sample, gen_kwargs)
+            out_text = pred["raw_output"]
+            assistant_only = pred["assistant_only"]
+
+            if args.task_name == "vsp-spatial-planning-cot":
+
+                map_desc = sample.get("map_desc", [])
+                path_str = extract_path_from_text(assistant_only)
+                sim = simulate_vsp(map_desc, path_str)
+                ok = bool(sim["success"])
+                if ok: success += 1
+
+                results.append({
+                    "index": i,
+                    "task_name": args.task_name,
+                    "text_input": sample.get("text_input", ""),
+                    "image_input": sample.get("image_input", []),
+                    "predicted_full_output": out_text,
+                    "extracted_path_string": path_str,
+                    "vsp_simulation_result": sim,
+                    "match": ok,
+                })
+
+            else:  # Standard tasks
+                gold = sample.get("original_final_answer", "")
+                pred_norm = normalize_for_match(pred["extracted_final_answer"])
+                gold_norm = normalize_for_match(gold)
+                ok = (pred_norm == gold_norm)
+                if ok: success += 1
+                
+                results.append({
+                    "index": i,
+                    "task_name": args.task_name,
+
+                    "prediction": assistant_only,
+                    "extracted_final_answer": pred["extracted_final_answer"],
+                    "gold_final_answer": gold,
+                    "match": bool(ok)
+                })
+
+            if (i + 1) % 10 == 0 or (i + 1) == total:
+                logging.info(f"[{i+1}/{total}] Current accuracy={success/(i+1):.4f}")
+
+        except Exception as e:
+            logging.error(f"[{i}] Evaluation failed: {e}")
+            results.append({
+                "index": i,
+                "task_name": args.task_name,
+                "error": str(e)
+            })
+
+    acc = success / total
+    with open(args.output_json_path, "w", encoding="utf-8") as fout:
+        for r in results:
+            fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    logging.info(f"Evaluation finished: success {success}/{total}; accuracy={acc:.4f}")
+    print(f"Accuracy = {acc:.4f}  ({success}/{total})")
+    
+
+
+
+def parse_action_sequence(path_str: str):
+    s = (path_str or "").upper()
+    return [ch for ch in s if ch in ['U','D','R','L']]
+
+def simulate_vsp(map_desc, path_str):
+    actions = parse_action_sequence(path_str)
+
+    # Find start point 1
+    start = None
+    for r, row in enumerate(map_desc):
+        for c, val in enumerate(row):
+            if val == 1:
+                start = (r, c); break
+        if start is not None: break
+    if start is None:
+        raise ValueError("The map description does not contain a start position (cell value 1).")
+
+    cur = start
+    for a in actions:
+        if a not in ACTION_MAP:
+            return {"success": False, "status": "Invalid action", "invalid": True}
+        dr, dc = ACTION_MAP[a]
+        nr, nc = cur[0] + dr, cur[1] + dc
+        if nr < 0 or nr >= len(map_desc) or nc < 0 or nc >= len(map_desc[0]):
+            continue
+        cur = (nr, nc)
+        if map_desc[nr][nc] == -1:
+            return {"success": False, "status": "Fell in hole", "invalid": False}
+
+    return {"success": map_desc[cur[0]][cur[1]] == 2,
+            "status": "Reached goal" if map_desc[cur[0]][cur[1]] == 2 else "Did not reach goal",
+            "invalid": False}
+
+def extract_path_from_text(generated_text: str) -> str:
+    if extract_boxed_content is not None:
+        s = extract_boxed_content(generated_text)
+        if s: return s
+    m = re.search(r"\\boxed\{([UDLRudlr]+)\}", generated_text)
+    if m: return m.group(1)
+    m = re.search(r"final\s*answer\s*(?:is)?\s*[:：]\s*([UDLRudlr]+)", generated_text, re.I)
+    return m.group(1) if m else ""
+
+
+if __name__ == "__main__":
+    main()

@@ -86,7 +86,7 @@ class FakeRunner:
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=8",
-            "korea@10.1.102.41",
+            "korea@172.16.11.41",
         )
         self.events.append("remote-tmux-start")
 
@@ -347,7 +347,7 @@ def test_tmux_commands_use_fixed_sessions_and_quote_shell_metacharacters():
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
-        "korea@10.1.102.41",
+        "korea@172.16.11.41",
     )
 
 
@@ -1378,7 +1378,7 @@ def test_stage1_wrapper_dry_run_builds_both_nodes_without_remote_calls(tmp_path)
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
-        "korea@10.1.102.41",
+        "korea@172.16.11.41",
     ]
     assert payload["local"][:5] == [
         "/usr/bin/tmux",
@@ -2066,12 +2066,12 @@ def test_owned_listener_rejects_foreign_socket_and_accepts_stable_pinned_descend
     )
 
     assert not owned_listener_is_ready(
-        owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
+        owner, master_addr="172.16.11.41", port=29631, proc_root=tmp_path
     )
     liveness.clear()
     (tmp_path / str(child) / "fd/7").symlink_to("socket:[44444]")
     assert owned_listener_is_ready(
-        owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
+        owner, master_addr="172.16.11.41", port=29631, proc_root=tmp_path
     )
     assert liveness == [(owner, 0), (child, 0)]
 
@@ -2122,7 +2122,7 @@ def test_owned_listener_rejects_descendant_pid_reuse_before_fd_verdict(
     monkeypatch.setattr(signal, "pidfd_send_signal", lambda *_args: None)
 
     assert not owned_listener_is_ready(
-        owner, master_addr="10.1.102.41", port=29631, proc_root=tmp_path
+        owner, master_addr="172.16.11.41", port=29631, proc_root=tmp_path
     )
 
 

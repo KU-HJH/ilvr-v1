@@ -1,0 +1,268 @@
+{
+  "schema_version": 2,
+  "bundle_kind": "portable_implementation_reference",
+  "path_base": "bundle_directory",
+  "file_count": 52,
+  "files": [
+    {
+      "path": "README.md",
+      "bytes": 10788,
+      "sha256": "c289b9d036508eb47234372587fbd2c3128818fbe2def6b29f32b052ee5d569a"
+    },
+    {
+      "path": "config/evaluation.json",
+      "bytes": 1144,
+      "sha256": "85209c51e6be9691586d0e847fdc62f28279fe7c32b13a1a3b7580a7204b0c1e"
+    },
+    {
+      "path": "config/prefix-conditioning.json",
+      "bytes": 568,
+      "sha256": "9c8d737ed13de9183abc0ec542e1524431dbbfaa6f73b2ad994356146ff4bf24"
+    },
+    {
+      "path": "config/training.json",
+      "bytes": 1520,
+      "sha256": "22bb0e81b6abe342caa44c67c250945b3c120a9f6d945ed334f7787d63087920"
+    },
+    {
+      "path": "data/TEST.jsonl",
+      "bytes": 525481,
+      "sha256": "6a1dccf32bb5196d09941adfd8ea79e29b58c34316f286673b557ed29dc69618"
+    },
+    {
+      "path": "data/TRAIN.jsonl",
+      "bytes": 4524870,
+      "sha256": "5bc1313a594f5713975b67388c745c6632275c37fd260055b27230c9cfedbed8"
+    },
+    {
+      "path": "reference/checkpoint_metadata/adapter_config.json",
+      "bytes": 4130,
+      "sha256": "af4929bbbf4fdbab84a1403f3055fe6cb6a9653c56f2a60bad9d195685904e3b"
+    },
+    {
+      "path": "reference/checkpoint_metadata/deepspeed-runtime.json",
+      "bytes": 132,
+      "sha256": "d1a882b60cc00aa9367806fbc06222d9f8a08aec10025afa2df7a6226e8901de"
+    },
+    {
+      "path": "reference/checkpoint_metadata/stage1_clean_kl.json",
+      "bytes": 513,
+      "sha256": "089cbfaf7575dba2c3cbaf2fdf480003676cd5a331b2e6a6ae518a15e1a75cd8"
+    },
+    {
+      "path": "reference/checkpoint_metadata/stage1_peft_metadata.json",
+      "bytes": 12108,
+      "sha256": "be99c74aa98311a325f291de1730b28dd058eb9c1d0621cce5eb4e62f06de5f9"
+    },
+    {
+      "path": "reference/checkpoint_metadata/stage1_preference.json",
+      "bytes": 401,
+      "sha256": "e54017008c5c3da1cfbd375a2fad219c61382de787ee0198e272af74a1af3560"
+    },
+    {
+      "path": "reference/checkpoint_metadata/stage1_text_kl.json",
+      "bytes": 627,
+      "sha256": "9d8caf051e3586519f9674767f3662430f206674e97e49282d9546c7d80854d4"
+    },
+    {
+      "path": "reference/checkpoint_metadata/stage1_vision_gain.json",
+      "bytes": 4305,
+      "sha256": "dbd6952567600a2441063b572a85e01251c85b12d6a8f4538749c5b8abd9b936"
+    },
+    {
+      "path": "reference/comparison.json",
+      "bytes": 900,
+      "sha256": "15f437da580cf66a627434f5ea20a56f6dfb64b0a16591e41ada8343e4ff70c4"
+    },
+    {
+      "path": "reference/evaluation_summary.json",
+      "bytes": 759,
+      "sha256": "e3b5bd2f2a2d0a4eb6b37d0050dab3889d3b70fa2d33f1a5c94c7e30dff2dd69"
+    },
+    {
+      "path": "source/configs/deepspeed_zero1.json",
+      "bytes": 375,
+      "sha256": "c0922c8640778ae928c503f5bcacb070f2efaf34b7122431d9b4c2989e25debd"
+    },
+    {
+      "path": "source/docs/stage1-text-kl.md",
+      "bytes": 4114,
+      "sha256": "9e507705af9f0fbe61e9b1f788317fa6dee49b97a54a4c8ede6d8fee3bc1afed"
+    },
+    {
+      "path": "source/eval.py",
+      "bytes": 24614,
+      "sha256": "907062c5774cf87e87f17fbb295469d606ffa457dffcbf3984ce3f9dca808342"
+    },
+    {
+      "path": "source/run_stage1_training.sh",
+      "bytes": 16978,
+      "sha256": "e81e06db29f0d6e43a1693448dae3cd1a40a0fc4b4bdff96c3ab1bbbc28a0f0e"
+    },
+    {
+      "path": "source/src/artifact_paths.py",
+      "bytes": 5187,
+      "sha256": "81cc67814b77c74d6daf49a782c232e98255b9b84fec50cc6f11f8696f3d4b33"
+    },
+    {
+      "path": "source/src/peft_common.py",
+      "bytes": 15973,
+      "sha256": "1f0abaf22dc8c7c8564351b0d0ac1d7237c488bce534eb5bd42ca31c9b0b057d"
+    },
+    {
+      "path": "source/src/stage1/checkpointing.py",
+      "bytes": 73132,
+      "sha256": "91cdde0e47fba323a05e0c72f5c27ce756fddf554b5eaada4ff979bd539e5618"
+    },
+    {
+      "path": "source/src/stage1/clean_kl.py",
+      "bytes": 5945,
+      "sha256": "e7f1522b7735caec4d1b14d5eac914ebbc394090ec41e3ea0e6a2173bb142ae2"
+    },
+    {
+      "path": "source/src/stage1/composition.py",
+      "bytes": 39927,
+      "sha256": "e2b53497242d6e959c2771c45931b1eed805c7ecca46d35b856c8fd40c28e835"
+    },
+    {
+      "path": "source/src/stage1/data.py",
+      "bytes": 24204,
+      "sha256": "ad99aeea4dec917cdcc8cbdfea5d7d98486f0aca9fc5cd8e81e1fba2b32df0e9"
+    },
+    {
+      "path": "source/src/stage1/ema.py",
+      "bytes": 22258,
+      "sha256": "21ad3907a02977d03dfc9d19e40261834a04a872636d9ce7d5ccae1225fdcc2f"
+    },
+    {
+      "path": "source/src/stage1/helper_attention_proxy.py",
+      "bytes": 2825,
+      "sha256": "4f46e6703cc4c9bbd0cb11a46402f18868c3e98992f081f804f655fdea07758a"
+    },
+    {
+      "path": "source/src/stage1/prefix_mask_accounting.py",
+      "bytes": 20397,
+      "sha256": "19fca21badca6614660186fa5c81ae4a1924b52bfb970fd4647c27f379d27486"
+    },
+    {
+      "path": "source/src/stage1/prefix_mask_config.py",
+      "bytes": 9700,
+      "sha256": "c97774138f80b3f6273203b84cdeb1e0d9bedfe213b7a8d48e4b6961709981c6"
+    },
+    {
+      "path": "source/src/stage1/prefix_mask_metadata.py",
+      "bytes": 12328,
+      "sha256": "1ce60bc8694b620c5e69a1660d0269a4cfe012d30617443b1ebd51348c40f2e1"
+    },
+    {
+      "path": "source/src/stage1/prefix_mask_plan.py",
+      "bytes": 10465,
+      "sha256": "39f7efb8534ce7a0983e81d2f2aff1833e5225974b8cc602b0770e194a92a8ee"
+    },
+    {
+      "path": "source/src/stage1/prefix_mask_reference.py",
+      "bytes": 4509,
+      "sha256": "3fd52fcec00aee07dd501d9cac8b9af63a234bc229ab5f44b63b9da83359a2e5"
+    },
+    {
+      "path": "source/src/stage1/targets.py",
+      "bytes": 27284,
+      "sha256": "dbfab6d1b21aa4cf1f9fdae8ab6d9cacf51c0e3aace8e0fd2760f8d3b392db70"
+    },
+    {
+      "path": "source/src/stage1/text_kl.py",
+      "bytes": 8156,
+      "sha256": "492074c6f90dbb2cfb3a8602c6f5cd1ef4a2275ff22552fc011c93027dd1994b"
+    },
+    {
+      "path": "source/src/stage1/trainer.py",
+      "bytes": 77056,
+      "sha256": "f124cebd693c3225ff9581fce15937532fa24074ad844d3d4f3f7d55410d9326"
+    },
+    {
+      "path": "source/src/stage1/types.py",
+      "bytes": 3894,
+      "sha256": "399c4cf6c03c1559a886a7878eb018b8b312d750120e2ebd0c4a67341e53edce"
+    },
+    {
+      "path": "source/src/stage1/vision_gain.py",
+      "bytes": 5537,
+      "sha256": "0a685b47218c59091e379a536e20283493528cb60224da05232ef328909b59d7"
+    },
+    {
+      "path": "source/src/stage1/vision_gain_execution.py",
+      "bytes": 7717,
+      "sha256": "735c6b33af1ee390336df9530a554145f3064c37c39ea3dcbfbafb9214e62ec8"
+    },
+    {
+      "path": "source/src/stage1/vision_gain_packed_execution.py",
+      "bytes": 12283,
+      "sha256": "6c4676db934ff52994f9d9ce7b6490dbef8329a1919f52e72d2bdb3b26d371ef"
+    },
+    {
+      "path": "source/src/stage1/vision_gain_update.py",
+      "bytes": 10120,
+      "sha256": "67d834c163e9a826e0a9c47af3301a9d3f4da63135a3ff7f60af6bdfe9d1f70a"
+    },
+    {
+      "path": "source/src/utils_deepseed.py",
+      "bytes": 27897,
+      "sha256": "d85d149f5e299c83df37c4894e797404a63469bc5d26e4a7a299fc95686c48e8"
+    },
+    {
+      "path": "source/tests/stage1/prefix_unit/conftest.py",
+      "bytes": 546,
+      "sha256": "1f2b4d4affceb08ab07f693362264f5c7e6a4c041cf77ff0da64e1bc9e592d1c"
+    },
+    {
+      "path": "source/tests/stage1/prefix_unit/test_selection.py",
+      "bytes": 9263,
+      "sha256": "59c7b42af36ce5eea06a178bd88ef736b5efe622d71229ed9502b69619dc26f8"
+    },
+    {
+      "path": "source/tests/stage1/prefix_unit/test_text_kl.py",
+      "bytes": 14915,
+      "sha256": "6f9ea0de9debbfd0f3a244ef0b6607e6ea6696975f3dcfac55517dd9f804ebdc"
+    },
+    {
+      "path": "source/tests/stage1/prefix_unit/test_text_kl_cuda_dropout.py",
+      "bytes": 2623,
+      "sha256": "be2113164254d88fd71b1e44e6c06d94ea3b2839b29f4189ac953b8a7ca41835"
+    },
+    {
+      "path": "source/tests/stage1/test_vision_gain_projection.py",
+      "bytes": 1564,
+      "sha256": "1e1801f9aacab9b632361aa52453ee06586d9ace64963dbd181474a3320ccfc8"
+    },
+    {
+      "path": "source/transformers/src/transformers/models/qwen2_5_vl/modeling_qwen2_5_vl.py",
+      "bytes": 150988,
+      "sha256": "ebe21a2c0cd3109558751018f67189aa359571524e5ec71a4658c2a627f14345"
+    },
+    {
+      "path": "source/transformers/src/transformers/models/qwen2_5_vl/modular_qwen2_5_vl.py",
+      "bytes": 152052,
+      "sha256": "1e144ae6d73b955426651bb165eb89ec288c938edbff68a6390dae8b047dabc2"
+    },
+    {
+      "path": "source/transformers/src/transformers/models/qwen2_5_vl/stage1_prefix_conditioning.py",
+      "bytes": 12476,
+      "sha256": "6d3724cad393e94297dafab81c7e0edc96354cd81c259ff63e8a45093a8a4d03"
+    },
+    {
+      "path": "source/transformers/src/transformers/models/qwen2_5_vl/stage1_prefix_trace.py",
+      "bytes": 7639,
+      "sha256": "a9122950c48c419fb55a02d830f5e57c0630addb36aac1ab9a51fbf73206ee47"
+    },
+    {
+      "path": "source/transformers/src/transformers/models/qwen2_5_vl/stage1_vision_gain.py",
+      "bytes": 1186,
+      "sha256": "48dc172b537671201ad1e0ba34da568a8b2778985589f80a0db6984008692d6b"
+    },
+    {
+      "path": "source/transformers/src/transformers/models/qwen2_5_vl/stage1_vision_gain_packed.py",
+      "bytes": 15991,
+      "sha256": "6b69d8c671c20a1690ff80ee422561b583185617c88c15ea35bae4c9eff26c8f"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/venv/ilvr-venv/bin/python",
+  "python.terminal.activateEnvironment": true
+}

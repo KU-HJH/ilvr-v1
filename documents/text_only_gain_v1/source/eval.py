@@ -1,0 +1,750 @@
+# evaluate_deepseed.py
+import os
+import re
+import json
+import argparse
+import logging
+import time
+import sys
+from pathlib import Path
+from typing import List, Dict, Any, Union
+
+import torch
+from PIL import Image
+from transformers import (
+    Qwen2_5_VLForConditionalGeneration,
+    AutoProcessor,
+    LogitsProcessorList,
+)
+
+sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
+from utils_deepseed import LatentTemplateLogitsProcessor
+from stage1.checkpointing import (
+    Stage1ArtifactKind,
+    classify_stage1_artifact,
+    load_stage1_peft_artifact,
+    load_stage1_peft_metadata,
+)
+from stage2.checkpointing import (
+    Stage2ArtifactKind,
+    inspect_stage2_artifact,
+    resolve_latent_token_ids,
+)
+from stage2.backend_fallback import is_flash_attention_initialization_error
+from stage2.inference import (
+    Stage2InferenceController,
+    build_stage2_generation_config,
+)
+from stage2.peft import (
+    load_stage2_model_for_inference,
+    resolve_stage2_qwen_model,
+)
+
+try:
+    from mathruler.grader import extract_boxed_content
+except Exception:
+    extract_boxed_content = None
+
+
+ACTION_MAP = {
+    "LEFT": (0, -1), "DOWN": (1, 0), "RIGHT": (0, 1), "UP": (-1, 0),
+    "L": (0, -1), "D": (1, 0), "R": (0, 1), "U": (-1, 0),
+}
+
+BASE_MODEL_ID = ""  
+
+BASE_DATASET_DIR = ''
+
+
+
+def get_eval_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--artifact_stage",
+        choices=("stage1", "stage2"),
+        default="stage2",
+        help="Training stage represented by model_dir.",
+    )
+    parser.add_argument("--model_dir", type=str, required=True,
+                        help="Path to the trained model directory.")
+    parser.add_argument("--base_model_dir", type=str,
+                        help="Base model directory for a PEFT artifact.")
+    parser.add_argument("--test_data_path", type=str, required=True,
+                        help="Path to the test data JSONL file.")
+    parser.add_argument("--task_name", type=str, required=True,
+                        help="Task name (used for bookkeeping and branching logic).")
+    parser.add_argument("--output_json_path", type=str, default="evaluation_results.jsonl",
+                        help="Path to save per-sample evaluation results.")
+    parser.add_argument("--cache_dir", type=str, default="./cache",
+                        help="Hugging Face cache directory.")
+    parser.add_argument("--max_new_tokens", type=int, default=64)
+    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--top_p", type=float, default=1.0)
+    return parser.parse_args()
+
+
+def load_processor(model_dir: str, cache_dir: str):
+    """
+    Prefer loading the processor from the finetuned model directory
+    (including any special tokens). If this fails, fall back to the
+    base model processor.
+
+    During evaluation, no new special tokens should be introduced,
+    as this may cause mismatches with the model weights.
+    """
+    try:
+        return AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
+    except Exception:
+        logging.warning(
+            "Failed to load processor from model_dir; falling back to the base model."
+        )
+        return AutoProcessor.from_pretrained(BASE_MODEL_ID, cache_dir=cache_dir)
+
+
+def load_model(model_dir: str, cache_dir: str):
+    """
+    Prefer flash_attention_2 for efficiency; automatically fall back
+    to eager attention if flash attention is unavailable.
+    """
+    try:
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_dir,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+            attn_implementation="flash_attention_2",
+        )
+    except Exception as e:
+        if not is_flash_attention_initialization_error(e):
+            raise
+        logging.warning(
+            f"flash_attention_2 initialization failed ({e}); "
+            f"falling back to eager attention."
+        )
+        model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_dir,
+            device_map="auto",
+            torch_dtype=torch.bfloat16,
+            cache_dir=cache_dir,
+            attn_implementation="eager",
+        )
+
+    model.eval()
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    except Exception:
+        pass
+    return model
+
+
+def load_evaluation_artifacts(
+    *,
+    model_dir: str,
+    base_model_dir: str | None,
+    cache_dir: str,
+    artifact_stage: str = "stage2",
+):
+    """Load one full or PEFT artifact for the requested training stage."""
+    if artifact_stage == "stage1":
+        artifact_dir = Path(model_dir)
+        artifact_kind = classify_stage1_artifact(artifact_dir)
+        if artifact_kind is Stage1ArtifactKind.FULL:
+            if base_model_dir is not None:
+                raise ValueError(
+                    "base_model_dir is invalid for a full Stage 1 artifact"
+                )
+            return load_model(model_dir, cache_dir), load_processor(
+                model_dir, cache_dir
+            )
+
+        if base_model_dir is None:
+            raise ValueError(
+                "base_model_dir is required for a Stage 1 PEFT artifact"
+            )
+        metadata = load_stage1_peft_metadata(artifact_dir)
+        processor = AutoProcessor.from_pretrained(
+            model_dir, cache_dir=cache_dir
+        )
+        base_model = load_model(base_model_dir, cache_dir)
+        model = load_stage1_peft_artifact(
+            base_model,
+            processor,
+            artifact_dir,
+            requested_base_model_reference=metadata.base_model_reference,
+            is_trainable=False,
+        )
+        model.eval()
+        return model, processor
+
+    if artifact_stage != "stage2":
+        raise ValueError(f"unsupported artifact_stage: {artifact_stage!r}")
+
+    artifact_inspection = inspect_stage2_artifact(model_dir)
+    if artifact_inspection.artifact_kind is Stage2ArtifactKind.FULL:
+        if base_model_dir is not None:
+            raise ValueError("base_model_dir is invalid for a full Stage 2 artifact")
+        return load_model(model_dir, cache_dir), load_processor(model_dir, cache_dir)
+
+    if base_model_dir is None:
+        raise ValueError("base_model_dir is required for a Stage 2 PEFT artifact")
+    processor = AutoProcessor.from_pretrained(model_dir, cache_dir=cache_dir)
+    model = load_stage2_model_for_inference(
+        base_model_dir,
+        model_dir,
+        processor,
+        source_provenance_kwargs={"cache_dir": cache_dir},
+        load_model=lambda source, **selectors: load_model(
+            source, selectors["cache_dir"]
+        ),
+        artifact_inspection=artifact_inspection,
+    )
+    return model, processor
+
+
+def _resolve_image_paths(image_input: Union[str, List[str]]) -> List[str]:
+    """
+    Resolve image paths from either a single string or a list of strings.
+
+    - Relative paths are resolved using BASE_DATASET_DIR.
+    - Absolute paths are returned unchanged.
+    """
+    if image_input is None:
+        return []
+
+    if isinstance(image_input, str):
+        p = image_input
+        if not os.path.isabs(p):
+            p = os.path.join(BASE_DATASET_DIR, p)
+        return [p]
+
+    if isinstance(image_input, list):
+        outs = []
+        for p in image_input:
+            if not os.path.isabs(p):
+                p = os.path.join(BASE_DATASET_DIR, p)
+            outs.append(p)
+        return outs
+
+    return []
+
+
+def open_images(paths: List[str]) -> List[Image.Image]:
+    """
+    Load images from disk and convert them to RGB.
+
+    Raises explicit errors if a directory path or a non-existent file is encountered.
+    """
+    imgs = []
+    for p in paths:
+        if os.path.isdir(p):
+            raise IsADirectoryError(
+                f"Expected an image file, but received a directory path: {p}"
+            )
+        if not os.path.exists(p):
+            raise FileNotFoundError(f"Image not found: {p}")
+        imgs.append(Image.open(p).convert("RGB"))
+    return imgs
+
+
+# ---- Fallback rules for parsing the final answer ----
+_yes_set = {"yes", "true", "a"}
+_no_set = {"no", "false", "b"}
+
+
+def _clean_answer_span(cand: str) -> str:
+    """
+    Keep only the first line, drop special tokens, then peel surrounding
+    markdown/quotes/brackets and trailing punctuation (e.g. "**2**", "2.").
+    """
+    cand = re.split(r"[\n\r]", (cand or "").strip())[0]
+    cand = _strip_special_tokens(cand)
+    cand = re.sub(r"^[\s\*_`'\"“‘(\[{【]+", "", cand)
+    cand = re.sub(r"[\s\*_`'\"”’)\]}】.。,，!！?？;；:：]+$", "", cand)
+    return cand.strip()
+
+
+def extract_final_answer(text: str) -> str:
+    """
+    Extract the final answer from the model output and return a simplified string.
+
+    Priority rules:
+      1) \\boxed{...} (take the last one)
+      2) Match 'final answer (is): XXX' (case-insensitive, colon optional)
+      3) Match 'answer is: XXX' or 'answer: XXX'
+      4) If the output contains exactly one of yes/no/true/false/a/b
+         (case-insensitive), return it directly
+      5) Otherwise, fall back to the cleaned full text (useful for debugging)
+
+    For patterns 2/3 the LAST occurrence is used, since the conclusion
+    normally appears at the end of the response.
+    """
+    s = _strip_special_tokens(text or "").strip()
+
+    boxed = re.findall(r"\\boxed\{([^{}]*)\}", s)
+    if boxed:
+        return _clean_answer_span(boxed[-1])
+
+    patterns = [
+        r"final\s*answer\s*(?:is)?\s*[:：]?\s*(.+)",
+        r"answer\s*(?:is)?\s*[:：]\s*(.+)",
+    ]
+
+    for pat in patterns:
+        matches = list(re.finditer(pat, s, flags=re.IGNORECASE))
+        if matches:
+            cand = _clean_answer_span(matches[-1].group(1))
+            if cand:
+                return cand
+
+    tokens = re.findall(r"[A-Za-z]+", s.lower())
+    only = [t for t in tokens if t in (_yes_set | _no_set)]
+    if len(only) == 1:
+        return only[0].capitalize() if only[0] in {"yes", "no"} else only[0]
+
+    return _clean_answer_span(s)
+
+
+def _strip_special_tokens(s: str) -> str:
+    """
+    Remove common special or end-of-sequence markers from decoded text.
+    """
+    end_markers = [
+        "<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end|>",
+        "</s>", "<s>", "[/INST]", "[INST]",
+        "<|latent_start|>", "<|latent_end|>", "<|latent_pad|>",
+    ]
+    for m in end_markers:
+        s = s.replace(m, "")
+    return s.strip()
+
+
+def extract_assistant_content(text: str) -> str:
+    """
+    Extract only the assistant's content from the raw model output.
+
+    Designed to be compatible with ChatML / Qwen / LLaMA-style templates.
+
+    Priority:
+      1) <|im_start|>assistant ... <|im_end|>
+      2) <|assistant|> ... (until an end marker or end of text)
+      3) Fallback: content after the last occurrence of 'assistant'
+    """
+    s = text or ""
+
+    # 1) ChatML-style pattern
+    m = re.search(
+        r"<\|im_start\|>\s*assistant\s*(.*?)(?:<\|im_end\|>|$)",
+        s,
+        flags=re.S | re.I,
+    )
+    if m:
+        return _strip_special_tokens(m.group(1))
+
+    # 2) Qwen / other styles
+    m = re.search(
+        r"<\|assistant\|>\s*(.*?)(?:<\|im_end\|>|<\|endoftext\|>|"
+        r"<\|eot_id\|>|<\|end\|>|$)",
+        s,
+        flags=re.S | re.I,
+    )
+    if m:
+        return _strip_special_tokens(m.group(1))
+
+    # 3) Fallback: last assistant segment
+    m = re.search(
+        r"(?:^|\n|\r)assistant\s*[:：]?\s*(.*)$",
+        s,
+        flags=re.S | re.I,
+    )
+    if m:
+        return _strip_special_tokens(m.group(1))
+
+    # If nothing matches, return cleaned full text
+    return _strip_special_tokens(s)
+
+
+def normalize_for_match(ans: str) -> str:
+    """
+    Normalize answers for matching: yes/no style tasks, numeric answers
+    ("2" vs "2.0"), and case-insensitive text comparison.
+    """
+    a = _clean_answer_span(ans)
+    low = a.lower()
+    if low in _yes_set:
+        return "Yes"
+    if low in _no_set:
+        return "No"
+    try:
+        f = float(a.replace(",", ""))
+        if f == int(f):
+            return str(int(f))
+        return str(f)
+    except (ValueError, OverflowError):
+        pass
+    return low
+
+
+def run_one_example(
+    model,
+    processor,
+    sample: Dict[str, Any],
+    gen_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Run inference on a single example and return raw output,
+    extracted final answer, and inference time.
+    """
+    text_input = sample.get("text_input", "")
+    img_list = _resolve_image_paths(sample.get("image_input", []))
+    images = open_images(img_list) if img_list else None
+
+    # Align with training: put image entries into user.content, then append text
+    content = []
+    if images:
+        for _ in images:
+            content.append({"type": "image"})
+    content.append({"type": "text", "text": text_input})
+
+    conversations = [
+        {"role": "user", "content": content}
+    ]
+
+    prompt = processor.apply_chat_template(
+        conversations,
+        tokenize=False,
+        add_generation_prompt=True,
+    )
+
+    inputs = processor(
+        text=[prompt],
+        images=images,
+        return_tensors="pt",
+        padding=True,
+    )
+
+    effective_device = getattr(model, "device", None)
+    model_config = getattr(model, "config", None)
+    artifact_stage = getattr(model_config, "stage", None)
+
+    if artifact_stage == "stage1":
+        if effective_device is None:
+            raise ValueError("Unable to determine the Stage 1 evaluation device")
+        inputs = {
+            key: value.to(effective_device)
+            for key, value in inputs.items()
+            if isinstance(value, torch.Tensor)
+        }
+        latent_pad_id = processor.tokenizer(
+            "<|latent_pad|>", return_tensors="pt"
+        )["input_ids"][0, 0].item()
+        latent_start_id = processor.tokenizer(
+            "<|latent_start|>", return_tensors="pt"
+        )["input_ids"][0, 0].item()
+        latent_end_id = processor.tokenizer(
+            "<|latent_end|>", return_tensors="pt"
+        )["input_ids"][0, 0].item()
+        latent_size = int(getattr(model_config, "latent_size", 8))
+        logits_processor = LogitsProcessorList(
+            [
+                LatentTemplateLogitsProcessor(
+                    latent_start_id,
+                    latent_end_id,
+                    latent_pad_id,
+                    latent_size,
+                )
+            ]
+        )
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        with torch.inference_mode():
+            out_ids = model.generate(
+                **inputs,
+                **gen_kwargs,
+                logits_processor=logits_processor,
+                tokenizer=processor.tokenizer,
+            )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        inference_time = time.perf_counter() - start_time
+    else:
+        stage2_model = resolve_stage2_qwen_model(model)
+        if effective_device is None:
+            effective_device = getattr(stage2_model, "device", None)
+        if effective_device is None:
+            raise ValueError("Unable to determine the Stage 2 evaluation device")
+
+        # Move tensor inputs to the outer runtime wrapper's device when available.
+        inputs = {
+            k: v.to(effective_device)
+            for k, v in inputs.items()
+            if isinstance(v, torch.Tensor)
+        }
+
+        input_ids = inputs["input_ids"]
+        if input_ids.ndim != 2 or input_ids.shape[0] != 1:
+            raise NotImplementedError("Stage 2 evaluation currently supports batch_size=1 only")
+        attention_mask = inputs.get("attention_mask")
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        latent_size = getattr(stage2_model.config, "latent_size", None)
+        if not isinstance(latent_size, int) or isinstance(latent_size, bool) or latent_size <= 0:
+            raise ValueError("Stage 2 checkpoint config must contain a positive latent_size")
+        token_ids = resolve_latent_token_ids(processor.tokenizer, stage2_model.config)
+        generation_config = build_stage2_generation_config(
+            model_config=stage2_model.config,
+            model_generation_config=getattr(stage2_model, "generation_config", None),
+            tokenizer=processor.tokenizer,
+            generation_kwargs=gen_kwargs,
+        )
+
+        # ---- Start inference timing (generation only) ----
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+
+        with torch.inference_mode():
+            generation_result = Stage2InferenceController().generate(
+                model=stage2_model,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                token_ids=token_ids,
+                generation_config=generation_config,
+                pixel_values=inputs.get("pixel_values"),
+                image_grid_thw=inputs.get("image_grid_thw"),
+                return_latent_states=False,
+            )
+        out_ids = generation_result.sequences
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        end_time = time.perf_counter()
+        inference_time = end_time - start_time
+    # ---- End inference timing ----
+
+    out_text = processor.batch_decode(
+        out_ids, skip_special_tokens=False
+    )[0].strip()
+
+    # Extract the answer from the assistant's segment only — running the
+    # regex over the full decoded text (prompt included) can match text in
+    # the user prompt and keeps trailing special tokens like <|im_end|>.
+    assistant_only = extract_assistant_content(out_text)
+    extracted = extract_final_answer(assistant_only)
+    return {
+        "raw_output": out_text,
+        "assistant_only": assistant_only,
+        "extracted_final_answer": extracted,
+        "inference_time": inference_time,
+    }
+
+
+def main():
+    args = get_eval_args()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+    )
+
+    logging.info(f"Loading model from: {args.model_dir}")
+    model, processor = load_evaluation_artifacts(
+        model_dir=args.model_dir,
+        base_model_dir=args.base_model_dir,
+        cache_dir=args.cache_dir,
+        artifact_stage=args.artifact_stage,
+    )
+
+    # Load test data
+    data = []
+    with open(args.test_data_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                data.append(json.loads(line))
+
+    if not data:
+        logging.error("Test dataset is empty. Exiting.")
+        return
+
+    gen_kwargs = dict(
+        max_new_tokens=args.max_new_tokens,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        do_sample=(args.temperature > 0),
+    )
+
+    total = len(data)
+    success = 0
+    results = []
+    total_inference_time = 0.0
+
+    logging.info(f"Starting evaluation: num_samples={total}")
+    for i, sample in enumerate(data):
+        try:
+            pred = run_one_example(model, processor, sample, gen_kwargs)
+            sample_infer_time = pred.get("inference_time", None)
+            if sample_infer_time is not None:
+                total_inference_time += sample_infer_time
+
+            out_text = pred["raw_output"]
+            assistant_only = pred["assistant_only"]
+
+            if args.task_name == "vsp-spatial-planning-cot":
+                # Extract path and run simulation
+                map_desc = sample.get("map_desc", [])
+                path_str = extract_path_from_text(assistant_only)
+                sim = simulate_vsp(map_desc, path_str)
+                ok = bool(sim["success"])
+                if ok:
+                    success += 1
+
+                results.append({
+                    "index": i,
+                    "task_name": args.task_name,
+                    "text_input": sample.get("text_input", ""),
+                    "image_input": sample.get("image_input", []),
+                    "predicted_full_output": out_text,
+                    "extracted_path_string": path_str,
+                    "vsp_simulation_result": sim,
+                    "match": ok,
+                    "inference_time_sec": sample_infer_time,
+                })
+
+            else:
+                # Default zebra-cot branch
+                gold = sample.get("original_final_answer", "")
+                pred_norm = normalize_for_match(pred["extracted_final_answer"])
+                gold_norm = normalize_for_match(gold)
+                ok = (pred_norm == gold_norm)
+                if ok:
+                    success += 1
+
+                results.append({
+                    "index": i,
+                    "task_name": args.task_name,
+                    "image_input": sample.get("image_input", []),
+                    "prediction": assistant_only,
+                    "extracted_final_answer": pred["extracted_final_answer"],
+                    "gold_final_answer": gold,
+                    "match": bool(ok),
+                    "inference_time_sec": sample_infer_time,
+                })
+
+            if (i + 1) % 10 == 0 or (i + 1) == total:
+                logging.info(
+                    f"[{i+1}/{total}] Current accuracy = {success/(i+1):.4f}"
+                )
+
+        except Exception as e:
+            logging.error(f"[{i}] Evaluation failed: {e}")
+            results.append({
+                "index": i,
+                "task_name": args.task_name,
+                "error": str(e),
+                "inference_time_sec": None,
+            })
+
+    acc = success / total if total > 0 else 0.0
+    avg_inference_time = (
+        total_inference_time / total if total > 0 else 0.0
+    )
+
+    with open(args.output_json_path, "w", encoding="utf-8") as fout:
+        for r in results:
+            fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+        # Write a summary line as the last entry
+        fout.write(json.dumps({
+            "summary": True,
+            "num_samples": total,
+            "average_inference_time_sec": avg_inference_time,
+            "total_inference_time_sec": total_inference_time,
+            "accuracy": acc,
+            "success": success,
+        }, ensure_ascii=False) + "\n")
+
+    logging.info(
+        f"Evaluation finished: {success}/{total} correct; accuracy={acc:.4f}"
+    )
+    print(f"Accuracy = {acc:.4f} ({success}/{total})")
+
+
+def parse_action_sequence(path_str: str):
+    """
+    Parse a path string into a sequence of movement actions.
+    """
+    s = (path_str or "").upper()
+    return [ch for ch in s if ch in ['U', 'D', 'R', 'L']]
+
+
+def simulate_vsp(map_desc, path_str):
+    """
+    Simulate the spatial planning environment given a map and an action sequence.
+    """
+    actions = parse_action_sequence(path_str)
+
+    # Locate the start position (cell value = 1)
+    start = None
+    for r, row in enumerate(map_desc):
+        for c, val in enumerate(row):
+            if val == 1:
+                start = (r, c)
+                break
+        if start is not None:
+            break
+
+    if start is None:
+        raise ValueError(
+            "The map description does not contain a start position (cell value 1)."
+        )
+
+    cur = start
+    for a in actions:
+        if a not in ACTION_MAP:
+            return {"success": False, "status": "Invalid action", "invalid": True}
+        dr, dc = ACTION_MAP[a]
+        nr, nc = cur[0] + dr, cur[1] + dc
+        if nr < 0 or nr >= len(map_desc) or nc < 0 or nc >= len(map_desc[0]):
+            continue
+        cur = (nr, nc)
+        if map_desc[nr][nc] == -1:
+            return {"success": False, "status": "Fell into a hole", "invalid": False}
+
+    return {
+        "success": map_desc[cur[0]][cur[1]] == 2,
+        "status": (
+            "Reached goal" if map_desc[cur[0]][cur[1]] == 2
+            else "Did not reach goal"
+        ),
+        "invalid": False,
+    }
+
+
+def extract_path_from_text(generated_text: str) -> str:
+    """
+    Extract a movement path string from model output.
+
+    Priority:
+      1) Use mathruler's boxed-content extractor if available
+      2) Match '\\boxed{UDLR...}'
+      3) Match 'final answer is: UDLR...'
+    """
+    if extract_boxed_content is not None:
+        s = extract_boxed_content(generated_text)
+        if s:
+            return s
+
+    m = re.search(r"\\boxed\{([UDLRudlr]+)\}", generated_text)
+    if m:
+        return m.group(1)
+
+    m = re.search(
+        r"final\s*answer\s*(?:is)?\s*[:：]\s*([UDLRudlr]+)",
+        generated_text,
+        re.I,
+    )
+    return m.group(1) if m else ""
+
+
+if __name__ == "__main__":
+    main()

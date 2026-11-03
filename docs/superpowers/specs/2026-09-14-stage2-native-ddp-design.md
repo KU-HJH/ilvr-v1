@@ -76,7 +76,7 @@ selected configurations and worker behavior. DDP requires complete multi-node
 topology; it cannot enter the worker's legacy single-node fallback.
 
 Native launch retains 2 machines, 4 processes, remote machine rank0/local rank1,
-master `10.1.102.41`, interface `bond1.102`, same explicit port and repository
+master `172.16.11.41`, interface `bond0.11`, same explicit port and repository
 venv. BF16 is explicit for the comparison examples. No new optimizer, gradient
 accumulation implementation, or DDP wrapping is added to Trainer.
 

@@ -1,0 +1,38 @@
+{
+  "status": "complete",
+  "variant": "text-only+text-kl",
+  "samples": 400,
+  "correct": 217,
+  "accuracy": 0.5425,
+  "errors": 0,
+  "by_task": {
+    "creation": {
+      "samples": 100,
+      "correct": 72,
+      "errors": 0,
+      "accuracy": 0.72
+    },
+    "deletion": {
+      "samples": 100,
+      "correct": 57,
+      "errors": 0,
+      "accuracy": 0.57
+    },
+    "update": {
+      "samples": 100,
+      "correct": 40,
+      "errors": 0,
+      "accuracy": 0.4
+    },
+    "selection": {
+      "samples": 100,
+      "correct": 48,
+      "errors": 0,
+      "accuracy": 0.48
+    }
+  },
+  "record_kind": "prior_reference_result_not_a_new_workspace_validation",
+  "training_epochs": 3,
+  "optimizer_steps": 1296,
+  "protocol": "../config/evaluation.json"
+}

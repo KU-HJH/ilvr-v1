@@ -19,7 +19,7 @@ esac
 label=${1:?label}; adapter=${2:?adapter dir under checkpoints/evaluation-staging}
 repo=/root/workspace/ILVR
 eval_commit=f8f80be2
-remote=korea@10.1.102.41
+remote=korea@172.16.11.41
 base=$repo/checkpoints/pretrained/models/Qwen2.5-VL-3B-Instruct
 run=eval-stage2-$label$suffix-test400-$(date -u +%Y%m%d-%H%M%S)
 out=$repo/results/$run

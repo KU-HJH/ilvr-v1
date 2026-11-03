@@ -1,0 +1,22 @@
+{
+  "enabled": true,
+  "temperature": 2.0,
+  "epsilon": 1e-06,
+  "sigmoid_scale": 1.0,
+  "text_rho_min": 0.3,
+  "text_rho_max": 0.5,
+  "text_max_mask_ratio": 0.3,
+  "text_low_attention_threshold": 0.1,
+  "text_fallback_mask_ratio": 0.1,
+  "groups_per_initial_image": 16,
+  "helper_proxy_mass_floor": 0.0001,
+  "image_score_epsilon": 1e-08,
+  "image_rho_min": 0.1,
+  "image_rho_max": 0.3,
+  "image_max_mask_ratio": 0.0,
+  "logit_chunk_rows": 32,
+  "trace_chunk_rows": 32,
+  "max_packed_tokens": null,
+  "max_mask_bytes": null,
+  "mask_all_original_image_keys": false
+}

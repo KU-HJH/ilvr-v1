@@ -9,7 +9,7 @@ set -uo pipefail
 repo=/root/workspace/ILVR
 status_dir=${STATUS_DIR:?set STATUS_DIR}
 port_base=${PORT_BASE:-29910}
-remote=korea@10.1.102.41
+remote=korea@172.16.11.41
 mkdir -p "$status_dir"
 arms=("$@")
 [[ ${#arms[@]} -gt 0 ]] || arms=(visiononly-l03m0 hient-independent-l03m0 hient-cumulative-l03m0)

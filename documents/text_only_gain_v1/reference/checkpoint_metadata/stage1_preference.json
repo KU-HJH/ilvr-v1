@@ -1,0 +1,14 @@
+{
+  "beta": 0.5,
+  "chosen": "teacher_latent",
+  "embedding_source": "student_initial_image_input_detached",
+  "margin": 0.0,
+  "mode": "none",
+  "pooling": "adaptive_avg_pool1d",
+  "reduction": "mean_tokens_then_mean_block_losses",
+  "reference_mode": "none",
+  "replacement_scope": "all_selected_latent_bodies",
+  "schema_version": 1,
+  "target": "same_gt_text_until_next_latent",
+  "weight": 1.0
+}

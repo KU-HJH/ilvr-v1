@@ -1,0 +1,5138 @@
+"""Small, sealed evidence contracts for Stage 1 probes and timed runs.
+
+This module deliberately audits JSON/text/reference metadata only.  It never
+opens an image, model weight, or checkpoint shard and never recursively hashes
+an artifact tree.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, fields
+import fcntl
+import hashlib
+import json
+import math
+import os
+from pathlib import Path
+import subprocess
+import stat as stat_module
+import sys
+import tempfile
+import time
+from typing import Any, Literal, Mapping, Sequence
+
+try:
+    from artifact_paths import (
+        CANONICAL_CHECKPOINT_ROOT,
+        CANONICAL_LOG_ROOT,
+        CANONICAL_RESULT_ROOT,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "artifact_paths":
+        raise
+    from src.artifact_paths import (
+        CANONICAL_CHECKPOINT_ROOT,
+        CANONICAL_LOG_ROOT,
+        CANONICAL_RESULT_ROOT,
+    )
+
+
+_SCHEMA_VERSION = 1
+LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION = 1
+STAGE1_PRODUCER_SCHEMA_VERSION = 2
+_HEX_DIGEST_LENGTH = 64
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _is_exact_int(value: object) -> bool:
+    return type(value) is int
+
+
+def _require_int(name: str, value: object, *, positive: bool = False) -> int:
+    if not _is_exact_int(value):
+        raise TypeError(f"{name} must be an integer (booleans are not numeric)")
+    if value < (1 if positive else 0):
+        qualifier = "positive" if positive else "non-negative"
+        raise ValueError(f"{name} must be {qualifier}")
+    return value
+
+
+def _require_float(name: str, value: object) -> float:
+    if type(value) is not float:
+        raise TypeError(f"{name} must be a float (booleans are not numeric)")
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be finite and non-negative")
+    return value
+
+
+def _require_string(name: str, value: object, *, nonempty: bool = True) -> str:
+    if type(value) is not str:
+        raise TypeError(f"{name} must be a string")
+    if nonempty and not value:
+        raise ValueError(f"{name} must not be empty")
+    if "\0" in value:
+        raise ValueError(f"{name} must not contain an embedded NUL")
+    return value
+
+
+def _require_digest(name: str, value: object) -> str:
+    value = _require_string(name, value)
+    if len(value) != _HEX_DIGEST_LENGTH or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise ValueError(f"{name} must be a lowercase SHA-256 digest")
+    return value
+
+
+def _require_exact_keys(payload: Mapping[str, Any], expected: set[str], kind: str) -> None:
+    if type(payload) is not dict:
+        raise TypeError(f"{kind} must be a JSON object")
+    actual = set(payload)
+    if actual != expected:
+        missing = sorted(expected - actual)
+        unexpected = sorted(actual - expected)
+        raise ValueError(
+            f"invalid {kind} fields: missing={missing}, unexpected={unexpected}"
+        )
+
+
+def _canonical_json_bytes(payload: object) -> bytes:
+    def validate(value: object, location: str) -> None:
+        if type(value) is str:
+            _require_string(location, value, nonempty=False)
+            return
+        if value is None or type(value) in (bool, int):
+            return
+        if type(value) is float:
+            if not math.isfinite(value):
+                raise ValueError(f"{location} contains a non-finite float")
+            return
+        if type(value) is list:
+            for index, item in enumerate(value):
+                validate(item, f"{location}[{index}]")
+            return
+        if type(value) is dict:
+            for key, item in value.items():
+                if type(key) is not str:
+                    raise TypeError(f"{location} contains a non-string key")
+                _require_string(f"{location} key", key, nonempty=False)
+                validate(item, f"{location}.{key}")
+            return
+        raise TypeError(f"{location} is not canonical JSON data: {type(value).__name__}")
+
+    validate(payload, "config")
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def config_digest(config: Mapping[str, object]) -> str:
+    """Digest one small canonical config/launch manifest, never its path contents."""
+
+    if type(config) is not dict:
+        raise TypeError("config must be a plain mapping")
+    return hashlib.sha256(_canonical_json_bytes(config)).hexdigest()
+
+
+def capacity_candidates(start: int, max_per_gpu: int) -> tuple[int, ...]:
+    """Return the approved ascending powers-of-two capacity search."""
+
+    start = _require_int("start", start, positive=True)
+    max_per_gpu = _require_int("max_per_gpu", max_per_gpu, positive=True)
+    if start != 8:
+        raise ValueError("primary capacity probing must start at batch 8")
+    if max_per_gpu < start:
+        raise ValueError("max_per_gpu must be at least the initial batch 8")
+    candidates: list[int] = []
+    candidate = start
+    while candidate <= max_per_gpu:
+        candidates.append(candidate)
+        candidate *= 2
+    return tuple(candidates)
+
+
+def fallback_candidates_after_initial_failure(start: int) -> tuple[int, ...]:
+    """Describe the explicit fallback order allowed after batch 8 is a confirmed OOM."""
+
+    start = _require_int("start", start, positive=True)
+    if start != 8:
+        raise ValueError("fallback is allowed only after the initial batch 8 failure")
+    return (4, 2, 1)
+
+
+@dataclass(frozen=True)
+class Stage1ProducerIdentity:
+    method: str
+    zero_stage: int
+    deepspeed_config_digest: str
+    world_size: int
+    micro_batch: int
+    gradient_accumulation_steps: int
+    effective_global_batch: int
+    sample_stream_digest: str
+    model_id: str
+    seed: int
+
+    def __post_init__(self) -> None:
+        if type(self.method) is not str or self.method not in {"full", "dora"}:
+            raise ValueError("method must be full or dora")
+        zero_stage = _require_int("zero_stage", self.zero_stage, positive=True)
+        if zero_stage not in (1, 2, 3):
+            raise ValueError("zero_stage must be 1, 2, or 3")
+        _require_digest("deepspeed_config_digest", self.deepspeed_config_digest)
+        for name in (
+            "world_size",
+            "micro_batch",
+            "gradient_accumulation_steps",
+            "effective_global_batch",
+        ):
+            _require_int(name, getattr(self, name), positive=True)
+        if self.effective_global_batch != (
+            self.world_size * self.micro_batch * self.gradient_accumulation_steps
+        ):
+            raise ValueError(
+                "effective_global_batch must equal "
+                "world_size * micro_batch * gradient_accumulation_steps"
+            )
+        _require_digest("sample_stream_digest", self.sample_stream_digest)
+        _require_string("model_id", self.model_id)
+        _require_int("seed", self.seed)
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class Stage1BenchmarkEvidence:
+    status: Literal["success", "capacity_oom", "integration_failure"]
+    method: str
+    zero_stage: int
+    deepspeed_config_digest: str
+    micro_batch: int
+    world_size: int
+    gradient_accumulation_steps: int
+    effective_global_batch: int
+    optimizer_steps: int
+    samples_seen: int
+    sample_stream_digest: str
+    model_id: str
+    seed: int
+    model_load_seconds: float
+    trainer_seconds: float
+    total_seconds: float
+    final_save_seconds: float
+    samples_per_second: float
+    steps_per_second: float
+    rank_peak_allocated_bytes: tuple[int, ...]
+    rank_peak_reserved_bytes: tuple[int, ...]
+    trainable_parameters: int
+    total_parameters: int
+    checkpoint_bytes: int
+    final_loss: float
+    representative_gradient_norm: float
+    git_commit: str
+    dependency_versions: dict[str, str]
+    gpu_names: tuple[str, ...]
+    config_digest: str
+    probe_row_indices: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not str or self.status not in {
+            "success",
+            "capacity_oom",
+            "integration_failure",
+        }:
+            raise ValueError(
+                "status must be success, capacity_oom, or integration_failure"
+            )
+        # Reuse identity validation is shared with request parsing.
+        self.identity
+        for name in (
+            "micro_batch",
+            "world_size",
+            "gradient_accumulation_steps",
+        ):
+            _require_int(name, getattr(self, name), positive=True)
+        for name in (
+            "effective_global_batch",
+            "optimizer_steps",
+            "samples_seen",
+            "trainable_parameters",
+            "total_parameters",
+            "checkpoint_bytes",
+        ):
+            _require_int(name, getattr(self, name))
+        expected_batch = (
+            self.world_size * self.micro_batch * self.gradient_accumulation_steps
+        )
+        if self.effective_global_batch != expected_batch:
+            raise ValueError(
+                "effective_global_batch must equal "
+                "world_size * micro_batch * gradient_accumulation_steps"
+            )
+        if self.trainable_parameters > self.total_parameters:
+            raise ValueError("trainable_parameters must not exceed total_parameters")
+        for name in (
+            "model_load_seconds",
+            "trainer_seconds",
+            "total_seconds",
+            "final_save_seconds",
+            "samples_per_second",
+            "steps_per_second",
+            "final_loss",
+            "representative_gradient_norm",
+        ):
+            _require_float(name, getattr(self, name))
+        self._validate_rank_int_tuple(
+            "rank_peak_allocated_bytes", self.rank_peak_allocated_bytes
+        )
+        self._validate_rank_int_tuple(
+            "rank_peak_reserved_bytes", self.rank_peak_reserved_bytes
+        )
+        if any(
+            allocated > reserved
+            for allocated, reserved in zip(
+                self.rank_peak_allocated_bytes, self.rank_peak_reserved_bytes
+            )
+        ):
+            raise ValueError("rank peak allocated bytes must not exceed reserved bytes")
+        if self.total_seconds < (
+            self.model_load_seconds + self.trainer_seconds + self.final_save_seconds
+        ):
+            raise ValueError("total_seconds must cover load, trainer, and final save")
+        if self.status == "success" and self.optimizer_steps == 0:
+            raise ValueError("successful evidence requires optimizer steps")
+        if self.status == "success" and self.samples_seen == 0:
+            raise ValueError("successful evidence requires samples_seen")
+        if type(self.gpu_names) is not tuple or len(self.gpu_names) != self.world_size:
+            raise ValueError("gpu_names tuple length must equal world_size")
+        for index, value in enumerate(self.gpu_names):
+            _require_string(f"gpu_names[{index}]", value)
+        if type(self.probe_row_indices) is not tuple:
+            raise TypeError("probe_row_indices must be a tuple")
+        if len(set(self.probe_row_indices)) != len(self.probe_row_indices):
+            raise ValueError("probe_row_indices must be unique")
+        for index, value in enumerate(self.probe_row_indices):
+            _require_int(f"probe_row_indices[{index}]", value)
+        _require_string("git_commit", self.git_commit)
+        _require_digest("config_digest", self.config_digest)
+        if type(self.dependency_versions) is not dict:
+            raise TypeError("dependency_versions must be a plain dict")
+        for name, version in self.dependency_versions.items():
+            _require_string("dependency_versions key", name)
+            _require_string(f"dependency_versions[{name!r}]", version)
+
+    @property
+    def identity(self) -> Stage1ProducerIdentity:
+        return Stage1ProducerIdentity(
+            method=self.method,
+            zero_stage=self.zero_stage,
+            deepspeed_config_digest=self.deepspeed_config_digest,
+            world_size=self.world_size,
+            micro_batch=self.micro_batch,
+            gradient_accumulation_steps=self.gradient_accumulation_steps,
+            effective_global_batch=self.effective_global_batch,
+            sample_stream_digest=self.sample_stream_digest,
+            model_id=self.model_id,
+            seed=self.seed,
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return _evidence_to_dict(self)
+
+    def _validate_rank_int_tuple(self, name: str, values: object) -> None:
+        if type(values) is not tuple or len(values) != self.world_size:
+            raise ValueError(f"{name} tuple length must equal world_size")
+        for index, value in enumerate(values):
+            _require_int(f"{name}[{index}]", value)
+
+
+@dataclass(frozen=True)
+class DistributedSmokeWitness:
+    initial_final_step: int
+    resume_initial_step: int
+    resume_final_step: int
+    batch_size_observed: int
+    finite_loss: bool
+    checkpoint_validated: bool
+
+
+@dataclass(frozen=True)
+class Stage1SmokeResumeSnapshot:
+    path: Path
+    canonical_payload: bytes
+    marker_digest: str
+
+    def payload(self) -> dict[str, object]:
+        payload = json.loads(self.canonical_payload)
+        if type(payload) is not dict:  # pragma: no cover - constructor invariant.
+            raise AssertionError("smoke checkpoint snapshot stopped being an object")
+        return payload
+
+    def summary(self) -> dict[str, object]:
+        marker = self.payload()
+        return {
+            "initial_final_step": marker["initial_final_step"],
+            "resume_initial_step": marker["initial_final_step"],
+            "resume_final_step": marker["resumed_max_steps"],
+            "batch_size_observed": marker["micro_batch"],
+            "finite_loss": True,
+            "checkpoint_validated": marker["checkpoint_validated"],
+            "resume_artifact_digest": marker["marker_digest"],
+        }
+
+
+_EVIDENCE_FIELDS = {field.name for field in fields(Stage1BenchmarkEvidence)}
+_LEGACY_EVIDENCE_FIELDS = _EVIDENCE_FIELDS - {
+    "zero_stage",
+    "deepspeed_config_digest",
+    "sample_stream_digest",
+    "model_id",
+    "seed",
+}
+_LEGACY_RAW_EVIDENCE_CACHE: dict[
+    Path, tuple[tuple[int, int, int, int], Stage1BenchmarkEvidence]
+] = {}
+_VERIFIED_PRODUCER_EVIDENCE_CACHE: dict[
+    Path, tuple[tuple[int, int, int, int], Stage1BenchmarkEvidence]
+] = {}
+
+
+def _evidence_to_dict(evidence: Stage1BenchmarkEvidence) -> dict[str, object]:
+    if type(evidence) is not Stage1BenchmarkEvidence:
+        raise TypeError("evidence must be Stage1BenchmarkEvidence")
+    payload = asdict(evidence)
+    for name in (
+        "rank_peak_allocated_bytes",
+        "rank_peak_reserved_bytes",
+        "gpu_names",
+        "probe_row_indices",
+    ):
+        payload[name] = list(getattr(evidence, name))
+    return payload
+
+
+def _evidence_from_dict(payload: object) -> Stage1BenchmarkEvidence:
+    if type(payload) is not dict:
+        raise TypeError("benchmark evidence must be a JSON object")
+    _require_exact_keys(payload, _EVIDENCE_FIELDS, "benchmark evidence")
+    values = dict(payload)
+    for name in (
+        "rank_peak_allocated_bytes",
+        "rank_peak_reserved_bytes",
+        "gpu_names",
+        "probe_row_indices",
+    ):
+        if type(values[name]) is not list:
+            raise TypeError(f"{name} must be a JSON array")
+        values[name] = tuple(values[name])
+    if type(values["dependency_versions"]) is not dict:
+        raise TypeError("dependency_versions must be a JSON object")
+    return Stage1BenchmarkEvidence(**values)
+
+
+def reusable_stage1_producer(
+    producer: Stage1BenchmarkEvidence,
+    requested: Mapping[str, object],
+) -> bool:
+    """Return true only for a complete, strictly parsed producer identity match."""
+
+    if not isinstance(producer, Stage1BenchmarkEvidence) or not isinstance(
+        requested, Mapping
+    ):
+        return False
+    if set(requested) != {field.name for field in fields(Stage1ProducerIdentity)}:
+        return False
+    try:
+        identity = Stage1ProducerIdentity(**dict(requested))
+    except (TypeError, ValueError):
+        return False
+    return producer.identity == identity
+
+
+def migrate_stage1_producer_evidence(
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    """Migrate an authenticated schema-1 metric payload in memory only."""
+
+    if not isinstance(payload, Mapping):
+        raise TypeError("legacy Stage 1 evidence must be an object")
+    migrated = copy.deepcopy(dict(payload))
+    if migrated.get("schema_version") != LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION:
+        raise ValueError("unsupported legacy Stage 1 evidence schema")
+    run_config = migrated.get("run_config")
+    if type(run_config) is not dict:
+        raise ValueError("legacy evidence is missing its sealed run_config")
+    migrated["zero_stage"] = 3
+    migrated["deepspeed_config_digest"] = _require_digest(
+        "deepspeed_config_digest", run_config.get("deepspeed_config_digest")
+    )
+    migrated["sample_stream_digest"] = _require_digest(
+        "audit_digest", run_config.get("audit_digest")
+    )
+    migrated["model_id"] = _require_string("model", run_config.get("model"))
+    migrated["seed"] = _require_int("seed", run_config.get("seed"))
+    status = migrated.get("status")
+    try:
+        migrated["status"] = {
+            "success": "success",
+            "oom": "capacity_oom",
+            "failure": "integration_failure",
+        }[status]
+    except (KeyError, TypeError) as error:
+        raise ValueError("legacy evidence has an unsupported status") from error
+    return migrated
+
+
+def _atomic_write_json(path: Path, payload: object) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            json.dump(
+                payload,
+                handle,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                indent=2,
+            )
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _read_json_once(path: Path) -> object:
+    try:
+        with Path(path).open(encoding="utf-8") as handle:
+            return json.load(handle)
+    except json.JSONDecodeError as error:
+        raise ValueError(f"malformed JSON evidence at {path}: {error}") from error
+
+
+def _file_witness(path: Path) -> tuple[int, int, int, int]:
+    stat = Path(path).stat()
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def _write_legacy_benchmark_evidence(
+    path: Path, evidence: Stage1BenchmarkEvidence
+) -> None:
+    """Write the pre-envelope raw test fixture; never use for official reuse."""
+
+    path = Path(path)
+    if path.exists():
+        resolved = path.resolve(strict=True)
+        witness = _file_witness(resolved)
+        cached = _LEGACY_RAW_EVIDENCE_CACHE.get(resolved)
+        if cached is not None and cached[0] == witness:
+            existing = cached[1]
+        else:
+            existing = _evidence_from_dict(_read_json_once(resolved))
+            _LEGACY_RAW_EVIDENCE_CACHE[resolved] = (witness, existing)
+        if existing == evidence:
+            return
+        raise FileExistsError(f"refusing to replace existing benchmark evidence: {path}")
+    _atomic_write_json(path, _evidence_to_dict(evidence))
+    _LEGACY_RAW_EVIDENCE_CACHE[path.resolve()] = (_file_witness(path), evidence)
+
+
+def load_verified_evidence(
+    path: Path, expected_config_digest: str
+) -> Stage1BenchmarkEvidence | None:
+    """Load and strictly validate a small evidence file once per unchanged stat witness."""
+
+    path = Path(os.path.abspath(path))
+    _require_digest("expected_config_digest", expected_config_digest)
+    payload = _read_canonical_evidence_json(path, missing_ok=True)
+    if payload is None:
+        return None
+    resolved = path
+    witness = _file_witness(resolved)
+    cached = _VERIFIED_PRODUCER_EVIDENCE_CACHE.get(resolved)
+    if cached is not None and cached[0] == witness:
+        evidence = cached[1]
+    else:
+        if type(payload) is not dict:
+            raise ValueError("official evidence must be a Stage 1 producer envelope")
+        if payload.get("kind") == _SMOKE_REGISTRY_KIND:
+            evidence, seal, marker = _validate_smoke_registry_payload(
+                payload, resolved
+            )
+        elif payload.get("kind") == "stage1-producer-evidence":
+            evidence, seal = _validate_producer_evidence_payload(payload)
+            marker = None
+        else:
+            raise ValueError("official evidence must be a Stage 1 producer envelope")
+        if seal["run_config"]["kind"] == "stage1-smoke-run-manifest":
+            if marker is None:
+                _validate_smoke_marker_for_evidence(resolved, seal)
+        else:
+            _VERIFIED_PRODUCER_EVIDENCE_CACHE[resolved] = (witness, evidence)
+    if evidence.config_digest != expected_config_digest:
+        return None
+    return evidence
+
+
+_SMOKE_MARKER_FILENAME = "checkpoint-topology.json"
+_SMOKE_REGISTRY_KIND = "stage1-smoke-registry-evidence"
+_SMOKE_REGISTRY_SCHEMA_VERSION = 3
+_SMOKE_EXECUTION_LOCK = ".execution.lock"
+_SMOKE_ATTEMPTS_DIRECTORY = "attempts"
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | os.O_DIRECTORY
+    | getattr(os, "O_NOFOLLOW", 0)
+    | getattr(os, "O_CLOEXEC", 0)
+)
+
+
+def _lexical_absolute_path(value: str | Path, *, base: Path | None = None) -> str:
+    raw = os.fspath(value)
+    if type(raw) is not str:
+        raise TypeError("requested path must decode to a string")
+    _require_string("requested path", raw)
+    if base is not None and not os.path.isabs(raw):
+        raw = os.path.join(os.fspath(base), raw)
+    return os.path.abspath(os.path.normpath(raw))
+
+
+def _repository_path_without_io() -> Path:
+    return Path(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+
+
+def _requested_smoke_paths(
+    *,
+    repository: Path,
+    data_path: str | Path,
+    image_root: str | Path,
+    deepspeed_config: str | Path,
+    launcher_path: str | Path | None,
+) -> dict[str, str]:
+    return {
+        "data_path": _lexical_absolute_path(data_path),
+        "image_root": _lexical_absolute_path(image_root),
+        "deepspeed_config": _lexical_absolute_path(
+            deepspeed_config, base=repository
+        ),
+        "launcher_path": _lexical_absolute_path(
+            repository / "run_stage1_training.sh"
+            if launcher_path is None
+            else launcher_path
+        ),
+    }
+
+
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _require_named_fd_identity(
+    *,
+    directory_fd: int,
+    name: str,
+    opened_fd: int,
+    label: str,
+    require_directory: bool,
+) -> None:
+    try:
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError as error:
+        raise ValueError(f"failed smoke {label} changed while pinned") from error
+    opened = os.fstat(opened_fd)
+    expected_type = stat_module.S_ISDIR if require_directory else stat_module.S_ISREG
+    if not expected_type(named.st_mode) or not _same_file_identity(named, opened):
+        raise ValueError(f"failed smoke {label} changed while pinned")
+
+
+def archive_failed_distributed_attempt(evidence_dir: str | Path) -> Path:
+    """Reject obsolete mutation; append-only attempts retain failures in place."""
+
+    os.fspath(evidence_dir)
+    raise RuntimeError(
+        "unsupported/deprecated: append-only attempts preserve failures in place"
+    )
+
+
+def _checkpoint_file_topology(checkpoint: Path) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    direct: list[dict[str, object]] = []
+    deepspeed: list[dict[str, object]] = []
+    for entry in sorted(checkpoint.iterdir(), key=lambda item: item.name):
+        if entry.is_symlink():
+            raise ValueError(f"smoke checkpoint rejects symlink topology: {entry}")
+        if entry.is_file():
+            direct.append({"name": entry.name, "size": entry.stat().st_size})
+            continue
+        if entry.is_dir() and entry.name.startswith("global_step"):
+            for state_file in sorted(entry.iterdir(), key=lambda item: item.name):
+                if state_file.is_symlink() or not state_file.is_file():
+                    raise ValueError(
+                        f"smoke DeepSpeed state must be a regular file: {state_file}"
+                    )
+                deepspeed.append(
+                    {
+                        "name": f"{entry.name}/{state_file.name}",
+                        "size": state_file.stat().st_size,
+                    }
+                )
+    return direct, deepspeed
+
+
+def seal_stage1_smoke_checkpoint(
+    checkpoint_path: Path,
+    *,
+    method: str,
+    micro_batch: int,
+    world_size: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+    marker_path: Path,
+) -> Stage1SmokeResumeSnapshot:
+    """Validate once and seal only small checkpoint topology metadata."""
+
+    method = _validated_method(method)
+    micro_batch = _require_int("micro_batch", micro_batch, positive=True)
+    world_size = _require_int("world_size", world_size, positive=True)
+    initial_max_steps = _require_int(
+        "initial_max_steps", initial_max_steps, positive=True
+    )
+    resumed_max_steps = _require_int(
+        "resumed_max_steps", resumed_max_steps, positive=True
+    )
+    if (micro_batch, world_size, initial_max_steps, resumed_max_steps) != (2, 2, 3, 4):
+        raise ValueError("distributed smoke requires B=2, world=2, and exact 3-to-4 steps")
+    checkpoint = Path(checkpoint_path).resolve(strict=True)
+    if checkpoint.name != f"checkpoint-{initial_max_steps}":
+        raise ValueError("smoke checkpoint name does not match initial final step")
+    from stage1.checkpointing import Stage1ArtifactKind, resolve_stage1_resume
+
+    decision = resolve_stage1_resume(checkpoint.parent, checkpoint)
+    expected_kind = (
+        Stage1ArtifactKind.FULL if method == "full" else Stage1ArtifactKind.PEFT
+    )
+    if decision.checkpoint_path != checkpoint or decision.artifact_kind is not expected_kind:
+        raise ValueError("smoke checkpoint method/topology validation failed")
+    trainer_state_path = checkpoint / "trainer_state.json"
+    trainer_state = _read_json_once(trainer_state_path)
+    if type(trainer_state) is not dict or trainer_state.get("global_step") != initial_max_steps:
+        raise ValueError("smoke checkpoint trainer state does not end at step 3")
+    direct, deepspeed = _checkpoint_file_topology(checkpoint)
+    marker = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-smoke-checkpoint-topology",
+        "method": method,
+        "artifact_kind": expected_kind.value,
+        "checkpoint_path": str(checkpoint),
+        "initial_final_step": initial_max_steps,
+        "resumed_max_steps": resumed_max_steps,
+        "micro_batch": micro_batch,
+        "world_size": world_size,
+        "checkpoint_validated": True,
+        "trainer_state_digest": config_digest(trainer_state),
+        "checkpoint_files": direct,
+        "deepspeed_state_files": deepspeed,
+    }
+    marker["marker_digest"] = config_digest(marker)
+    _atomic_write_json(Path(marker_path), marker)
+    return load_stage1_smoke_resume_witness(
+        marker_path,
+        method=method,
+        checkpoint_path=checkpoint,
+        micro_batch=micro_batch,
+        initial_max_steps=initial_max_steps,
+        resumed_max_steps=resumed_max_steps,
+    )
+
+
+def load_stage1_smoke_resume_witness(
+    marker_path: Path,
+    *,
+    method: str,
+    checkpoint_path: Path,
+    micro_batch: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+) -> Stage1SmokeResumeSnapshot:
+    """Read one immutable small marker without reopening its checkpoint tree."""
+
+    marker_path = Path(marker_path).resolve(strict=True)
+    marker = _read_json_once(marker_path)
+    return _validate_stage1_smoke_marker_payload(
+        marker,
+        marker_path=marker_path,
+        method=method,
+        checkpoint_path=Path(checkpoint_path).resolve(),
+        micro_batch=micro_batch,
+        initial_max_steps=initial_max_steps,
+        resumed_max_steps=resumed_max_steps,
+    )
+
+
+def _validate_stage1_smoke_marker_payload(
+    marker: object,
+    *,
+    marker_path: Path,
+    method: str,
+    checkpoint_path: Path,
+    micro_batch: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+) -> Stage1SmokeResumeSnapshot:
+    """Validate immutable marker bytes without reopening checkpoint artifacts."""
+
+    _require_exact_keys(
+        marker,
+        {
+            "schema_version", "kind", "method", "artifact_kind",
+            "checkpoint_path", "initial_final_step", "resumed_max_steps",
+            "micro_batch", "world_size", "checkpoint_validated",
+            "trainer_state_digest", "checkpoint_files",
+            "deepspeed_state_files", "marker_digest",
+        },
+        "Stage 1 smoke checkpoint topology",
+    )
+    if (
+        marker.get("schema_version") != _SCHEMA_VERSION
+        or marker.get("kind") != "stage1-smoke-checkpoint-topology"
+    ):
+        raise ValueError("invalid Stage 1 smoke checkpoint topology schema")
+    claimed = marker.get("marker_digest")
+    _require_digest("marker_digest", claimed)
+    digest_input = dict(marker)
+    digest_input.pop("marker_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("smoke checkpoint topology marker digest mismatch")
+    expected_kind = "full" if method == "full" else "peft"
+    if (
+        marker.get("method") != _validated_method(method)
+        or marker.get("artifact_kind") != expected_kind
+        or not Path(checkpoint_path).is_absolute()
+        or marker.get("checkpoint_path") != str(Path(checkpoint_path))
+        or marker.get("initial_final_step") != initial_max_steps
+        or marker.get("resumed_max_steps") != resumed_max_steps
+        or marker.get("micro_batch") != micro_batch
+        or marker.get("world_size") != 2
+        or marker.get("checkpoint_validated") is not True
+    ):
+        raise ValueError("smoke checkpoint topology does not match requested resume")
+    _require_digest("trainer_state_digest", marker.get("trainer_state_digest"))
+    for field_name in ("checkpoint_files", "deepspeed_state_files"):
+        entries = marker.get(field_name)
+        if type(entries) is not list:
+            raise TypeError(f"{field_name} must be an array")
+        names: set[str] = set()
+        for index, entry in enumerate(entries):
+            _require_exact_keys(entry, {"name", "size"}, f"{field_name}[{index}]")
+            name = _require_string(f"{field_name}[{index}].name", entry.get("name"))
+            if name in names or Path(name).is_absolute() or ".." in Path(name).parts:
+                raise ValueError(f"{field_name} contains an unsafe/duplicate name")
+            names.add(name)
+            _require_int(f"{field_name}[{index}].size", entry.get("size"), positive=True)
+    canonical = _canonical_json_bytes(marker)
+    return Stage1SmokeResumeSnapshot(Path(marker_path), canonical, claimed)
+
+
+def _validate_smoke_marker_for_evidence(
+    evidence_path: Path,
+    seal: Mapping[str, object],
+    *,
+    marker_path: Path | None = None,
+) -> Stage1SmokeResumeSnapshot:
+    config = seal["run_config"]
+    summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
+    checkpoint = Path(config["output_dir"]) / f"checkpoint-{summary['initial_final_step']}"
+    snapshot = load_stage1_smoke_resume_witness(
+        (
+            Path(evidence_path).parent / _SMOKE_MARKER_FILENAME
+            if marker_path is None
+            else marker_path
+        ),
+        method=config["method"],
+        checkpoint_path=checkpoint,
+        micro_batch=config["micro_batch"],
+        initial_max_steps=summary["initial_final_step"],
+        resumed_max_steps=summary["resume_final_step"],
+    )
+    if snapshot.marker_digest != summary["resume_artifact_digest"]:
+        raise ValueError("smoke checkpoint topology digest does not match evidence")
+    return snapshot
+
+
+def _validate_embedded_smoke_marker(
+    marker: object,
+    *,
+    marker_path: Path,
+    seal: Mapping[str, object],
+) -> Stage1SmokeResumeSnapshot:
+    config = seal["run_config"]
+    summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
+    checkpoint = Path(config["output_dir"]) / f"checkpoint-{summary['initial_final_step']}"
+    snapshot = _validate_stage1_smoke_marker_payload(
+        marker,
+        marker_path=marker_path,
+        method=config["method"],
+        checkpoint_path=checkpoint,
+        micro_batch=config["micro_batch"],
+        initial_max_steps=summary["initial_final_step"],
+        resumed_max_steps=summary["resume_final_step"],
+    )
+    if snapshot.marker_digest != summary["resume_artifact_digest"]:
+        raise ValueError("smoke checkpoint topology digest does not match evidence")
+    return snapshot
+
+
+def _smoke_attempt_number(name: str) -> int:
+    prefix = "attempt-"
+    if not name.startswith(prefix):
+        raise ValueError(f"noncanonical smoke attempt entry: {name}")
+    suffix = name[len(prefix):]
+    if not suffix.isascii() or not suffix.isdigit() or suffix.startswith("0"):
+        raise ValueError(f"noncanonical smoke attempt entry: {name}")
+    number = int(suffix)
+    if number <= 0 or name != f"{prefix}{number}":
+        raise ValueError(f"noncanonical smoke attempt entry: {name}")
+    return number
+
+
+def _exclusive_write_json(path: Path, payload: object) -> None:
+    """Atomically publish one complete JSON inode without replacing a target."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8") + b"\n"
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            os.fchmod(handle.fileno(), 0o640)
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        temporary.unlink()
+        temporary = None
+        parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _exclusive_write_json_at(directory_fd: int, name: str, payload: object) -> None:
+    """Publish immutable JSON relative to an already pinned directory."""
+
+    if Path(name).name != name:
+        raise ValueError("exclusive JSON name must be a basename")
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        indent=2,
+    ).encode("utf-8") + b"\n"
+    descriptor = os.open(
+        name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0),
+        0o640,
+        dir_fd=directory_fd,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        os.close(descriptor)
+    os.fsync(directory_fd)
+
+
+def _read_canonical_evidence_json(
+    path: Path, *, missing_ok: bool = False
+) -> object | None:
+    """Read one canonical regular evidence inode once without following aliases."""
+
+    path = Path(os.path.abspath(path))
+    try:
+        parent_fd = os.open(path.parent, _DIRECTORY_OPEN_FLAGS)
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise
+    try:
+        try:
+            named = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            if missing_ok:
+                return None
+            raise
+        if not stat_module.S_ISREG(named.st_mode):
+            raise ValueError("canonical evidence must be a regular file")
+        if named.st_nlink != 1:
+            raise ValueError("canonical evidence must not be a filesystem alias")
+        descriptor = os.open(
+            path.name,
+            os.O_RDONLY
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=parent_fd,
+        )
+        try:
+            opened = os.fstat(descriptor)
+            if (
+                not stat_module.S_ISREG(opened.st_mode)
+                or opened.st_nlink != 1
+                or not _same_file_identity(named, opened)
+            ):
+                raise ValueError("canonical evidence changed before read")
+            if opened.st_size > 16 * 1024 * 1024:
+                raise ValueError("canonical evidence is unexpectedly large")
+            chunks: list[bytes] = []
+            remaining = opened.st_size + 1
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            data = b"".join(chunks)
+            after = os.fstat(descriptor)
+            if (
+                not _same_file_identity(opened, after)
+                or after.st_size != opened.st_size
+                or after.st_mtime_ns != opened.st_mtime_ns
+                or len(data) != opened.st_size
+            ):
+                raise ValueError("canonical evidence changed during read")
+        finally:
+            os.close(descriptor)
+        try:
+            named_after = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError as error:
+            raise ValueError("canonical evidence changed during read") from error
+        if (
+            not stat_module.S_ISREG(named_after.st_mode)
+            or named_after.st_nlink != 1
+            or not _same_file_identity(opened, named_after)
+        ):
+            raise ValueError("canonical evidence changed during read")
+    finally:
+        os.close(parent_fd)
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"malformed canonical evidence at {path}: {error}") from error
+
+
+@dataclass(frozen=True)
+class _SmokeExecutionLease:
+    directory: Path
+    parent_fd: int
+    method_name: str
+    directory_fd: int
+    lock_fd: int
+    directory_device: int
+    directory_inode: int
+
+
+def _validate_smoke_execution_lease(lease: _SmokeExecutionLease) -> None:
+    opened_directory = os.fstat(lease.directory_fd)
+    try:
+        named_directory = os.stat(
+            lease.method_name,
+            dir_fd=lease.parent_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise ValueError("smoke method registry changed while lease was held") from error
+    if (
+        not stat_module.S_ISDIR(opened_directory.st_mode)
+        or not stat_module.S_ISDIR(named_directory.st_mode)
+        or (opened_directory.st_dev, opened_directory.st_ino)
+        != (lease.directory_device, lease.directory_inode)
+        or not _same_file_identity(opened_directory, named_directory)
+    ):
+        raise ValueError("smoke method registry changed while lease was held")
+    opened = os.fstat(lease.lock_fd)
+    try:
+        named = os.stat(
+            _SMOKE_EXECUTION_LOCK,
+            dir_fd=lease.directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError as error:
+        raise ValueError("smoke execution lock changed while held") from error
+    if (
+        not stat_module.S_ISREG(named.st_mode)
+        or named.st_nlink != 1
+        or opened.st_nlink != 1
+        or stat_module.S_IMODE(named.st_mode) != 0o600
+        or not _same_file_identity(named, opened)
+    ):
+        raise ValueError("smoke execution lock changed while held")
+
+
+@contextmanager
+def _smoke_execution_lease(evidence_directory: Path):
+    """Hold one method's persistent kernel execution lease until fd close."""
+
+    directory = Path(os.path.abspath(evidence_directory))
+    _validated_method(directory.name)
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    parent_fd = os.open(directory.parent, _DIRECTORY_OPEN_FLAGS)
+    directory_fd: int | None = None
+    lock_fd: int | None = None
+    try:
+        try:
+            os.mkdir(directory.name, 0o750, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        try:
+            directory_fd = os.open(
+                directory.name, _DIRECTORY_OPEN_FLAGS, dir_fd=parent_fd
+            )
+        except OSError as error:
+            raise ValueError("smoke method registry must be a real directory") from error
+        try:
+            lock_fd = os.open(
+                _SMOKE_EXECUTION_LOCK,
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except OSError as error:
+            raise ValueError("smoke execution lock must be a regular file") from error
+        opened = os.fstat(lock_fd)
+        if (
+            not stat_module.S_ISREG(opened.st_mode)
+            or opened.st_nlink != 1
+            or stat_module.S_IMODE(opened.st_mode) != 0o600
+        ):
+            raise ValueError("smoke execution lock must be a unique mode-0600 file")
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise RuntimeError(
+                f"distributed smoke execution is in progress; retry later: {directory}"
+            ) from error
+        _require_named_fd_identity(
+            directory_fd=parent_fd,
+            name=directory.name,
+            opened_fd=directory_fd,
+            label="method registry",
+            require_directory=True,
+        )
+        directory_stat = os.fstat(directory_fd)
+        lease = _SmokeExecutionLease(
+            directory,
+            parent_fd,
+            directory.name,
+            directory_fd,
+            lock_fd,
+            directory_stat.st_dev,
+            directory_stat.st_ino,
+        )
+        _validate_smoke_execution_lease(lease)
+        yield lease
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+        if directory_fd is not None:
+            os.close(directory_fd)
+        os.close(parent_fd)
+
+
+def _allocate_smoke_attempt(
+    evidence_directory: Path,
+    *,
+    lease: _SmokeExecutionLease | None = None,
+) -> Path:
+    """Allocate a monotonic append-only attempt directory using mkdir no-replace."""
+
+    evidence_directory = Path(os.path.abspath(evidence_directory))
+    if lease is None:
+        with _smoke_execution_lease(evidence_directory) as acquired:
+            return _allocate_smoke_attempt(
+                evidence_directory,
+                lease=acquired,
+            )
+    if lease.directory != evidence_directory:
+        raise ValueError("smoke execution lease belongs to a different method")
+    _validate_smoke_execution_lease(lease)
+    method_fd = lease.directory_fd
+    attempts_fd: int | None = None
+    try:
+        try:
+            os.mkdir(_SMOKE_ATTEMPTS_DIRECTORY, 0o750, dir_fd=method_fd)
+        except FileExistsError:
+            pass
+        attempts_fd = os.open(
+            _SMOKE_ATTEMPTS_DIRECTORY, _DIRECTORY_OPEN_FLAGS, dir_fd=method_fd
+        )
+        numbers: list[int] = []
+        for name in os.listdir(attempts_fd):
+            number = _smoke_attempt_number(name)
+            entry = os.stat(name, dir_fd=attempts_fd, follow_symlinks=False)
+            if not stat_module.S_ISDIR(entry.st_mode):
+                raise ValueError(f"smoke attempt entry is not a directory: {name}")
+            numbers.append(number)
+
+        allowed_root_entries = {
+            _SMOKE_ATTEMPTS_DIRECTORY,
+            _SMOKE_EXECUTION_LOCK,
+            "evidence.json",
+        }
+        legacy_failure = any(
+            name not in allowed_root_entries for name in os.listdir(method_fd)
+        )
+        reserved = 1 if legacy_failure else 0
+        next_number = max((*numbers, reserved)) + 1
+        target_name = f"attempt-{next_number}"
+        try:
+            os.mkdir(target_name, 0o750, dir_fd=attempts_fd)
+        except FileExistsError as error:
+            raise FileExistsError(
+                f"smoke attempt was concurrently allocated: {target_name}"
+            ) from error
+        os.fsync(attempts_fd)
+        return evidence_directory / _SMOKE_ATTEMPTS_DIRECTORY / target_name
+    finally:
+        if attempts_fd is not None:
+            os.close(attempts_fd)
+
+
+_FULL_WEIGHT_NAMES = {
+    "model.safetensors",
+    "model.safetensors.index.json",
+    "pytorch_model.bin",
+    "pytorch_model.bin.index.json",
+}
+_DORA_REQUIRED_NAMES = {
+    "adapter_config.json",
+    "adapter_model.safetensors",
+    "ilvr_token_rows.safetensors",
+    "stage1_peft_metadata.json",
+}
+_PROCESSOR_REQUIRED_NAMES = {
+    "preprocessor_config.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+}
+_TOKENIZER_OPTIONAL_NAMES = {
+    "special_tokens_map.json", "added_tokens.json", "chat_template.json",
+    "merges.txt", "vocab.json", "generation_config.json",
+}
+_RUNTIME_OUTPUT_NAMES = {
+    "train.log", "launch-manifest.json", "producer-evidence.json", "evidence.json",
+}
+
+
+def _is_allowlisted_artifact_name(name: str, method: str) -> bool:
+    common = _PROCESSOR_REQUIRED_NAMES | _TOKENIZER_OPTIONAL_NAMES
+    if name in common or name.startswith("chat_template."):
+        return True
+    if method == "full":
+        return name == "config.json" or _is_full_weight_name(name)
+    return name in _DORA_REQUIRED_NAMES
+
+
+def _is_full_weight_name(name: str) -> bool:
+    return (
+        name in _FULL_WEIGHT_NAMES
+        or (name.startswith("model-") and name.endswith(".safetensors"))
+        or (name.startswith("pytorch_model-") and name.endswith(".bin"))
+    )
+
+
+def _build_artifact_manifest(
+    output_dir: Path, *, method: str, final_save: bool
+) -> dict[str, object]:
+    """Capture a small topology/stat witness; never read or hash weight contents."""
+
+    method = _validated_method(method)
+    output_dir = output_dir.resolve()
+    if not final_save:
+        entries: list[dict[str, object]] = []
+        artifact_kind = "none"
+        weight_serialization = None
+    else:
+        if not output_dir.is_dir():
+            raise FileNotFoundError(f"final Stage 1 artifact directory is missing: {output_dir}")
+        entries = []
+        for item in sorted(output_dir.iterdir(), key=lambda path: path.name):
+            if method == "dora" and _is_full_weight_name(item.name):
+                raise ValueError("DoRA final artifact must not contain full-model weights")
+            if method == "full" and item.name in _DORA_REQUIRED_NAMES:
+                raise ValueError("full final artifact unexpectedly contains DoRA weights")
+            if item.name in _RUNTIME_OUTPUT_NAMES or not _is_allowlisted_artifact_name(item.name, method):
+                continue
+            if item.is_symlink() or not item.is_file():
+                raise ValueError(f"artifact sidecar must be a regular non-symlink: {item}")
+            item_stat = item.stat()
+            if item_stat.st_size <= 0:
+                raise ValueError(f"artifact file must have positive size: {item}")
+            entries.append({"name": item.name, "size": item_stat.st_size})
+        names = {item["name"] for item in entries}
+        full_names = {name for name in names if _is_full_weight_name(name)}
+        missing_processor = _PROCESSOR_REQUIRED_NAMES - names
+        if missing_processor:
+            raise ValueError(
+                "final artifact is missing processor/tokenizer files: "
+                f"{sorted(missing_processor)}"
+            )
+        if method == "full":
+            if not full_names:
+                raise ValueError("full final artifact has no full-model weight topology")
+            if "config.json" not in names:
+                raise ValueError("full final artifact is missing config.json")
+            if names & _DORA_REQUIRED_NAMES:
+                raise ValueError("full final artifact unexpectedly contains DoRA weights")
+            standalone = names & {"model.safetensors", "pytorch_model.bin"}
+            indexes = names & {
+                "model.safetensors.index.json", "pytorch_model.bin.index.json"
+            }
+            if len(standalone) + len(indexes) != 1:
+                raise ValueError("full artifact must have exactly one weight serialization")
+            if indexes:
+                index_name = next(iter(indexes))
+                index_path = output_dir / index_name
+                if index_path.stat().st_size > 4 * 1024 * 1024:
+                    raise ValueError("full shard index is unexpectedly large")
+                try:
+                    index_payload = json.loads(index_path.read_text(encoding="utf-8"))
+                except (UnicodeError, json.JSONDecodeError) as error:
+                    raise ValueError("malformed full shard index") from error
+                if type(index_payload) is not dict or type(index_payload.get("weight_map")) is not dict or not index_payload["weight_map"]:
+                    raise ValueError("full shard index requires a nonempty weight_map")
+                references = set(index_payload["weight_map"].values())
+                expected_suffix = ".safetensors" if index_name.startswith("model") else ".bin"
+                expected_prefix = "model-" if index_name.startswith("model") else "pytorch_model-"
+                for reference in references:
+                    if (
+                        type(reference) is not str or "\0" in reference
+                        or Path(reference).name != reference
+                        or not reference.startswith(expected_prefix)
+                        or not reference.endswith(expected_suffix)
+                    ):
+                        raise ValueError(f"invalid full shard reference: {reference!r}")
+                    shard = output_dir / reference
+                    if shard.is_symlink() or not shard.is_file() or shard.stat().st_size <= 0:
+                        raise ValueError(f"referenced full shard is missing or invalid: {reference}")
+                actual_shards = {
+                    name for name in names
+                    if name.startswith(expected_prefix) and name.endswith(expected_suffix)
+                }
+                if actual_shards != references:
+                    raise ValueError("full shard set does not exactly match its index")
+                weight_serialization = {
+                    "kind": "indexed",
+                    "index": index_name,
+                    "shards": sorted(references),
+                }
+            else:
+                weight_serialization = {
+                    "kind": "standalone",
+                    "index": None,
+                    "shards": sorted(standalone),
+                }
+            artifact_kind = "full"
+        else:
+            missing = _DORA_REQUIRED_NAMES - names
+            if missing:
+                raise ValueError(f"DoRA final artifact is missing required files: {sorted(missing)}")
+            if full_names:
+                raise ValueError("DoRA final artifact must not contain full-model weights")
+            artifact_kind = "dora"
+            weight_serialization = None
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-artifact-topology-witness",
+        "method": method,
+        "artifact_kind": artifact_kind,
+        "output_dir": str(output_dir),
+        "final_save": final_save,
+        "weight_serialization": weight_serialization,
+        "files": entries,
+        "checkpoint_bytes": sum(item["size"] for item in entries),
+    }
+    payload["artifact_manifest_digest"] = config_digest(payload)
+    return payload
+
+
+def _load_producer_run_config(path: Path) -> dict[str, object]:
+    return load_stage1_run_config_witness(path).payload()
+
+
+@dataclass(frozen=True)
+class Stage1RunConfigWitness:
+    path: Path
+    file_witness: tuple[int, int, int, int]
+    canonical_payload: bytes
+    config_digest: str
+
+    def payload(self) -> dict[str, object]:
+        payload = json.loads(self.canonical_payload)
+        if type(payload) is not dict:  # pragma: no cover - constructor invariant.
+            raise AssertionError("run config witness payload stopped being an object")
+        return payload
+
+
+def load_stage1_run_config_witness(path: Path) -> Stage1RunConfigWitness:
+    """Read and validate a launch config exactly once into an immutable witness."""
+
+    resolved = Path(path).resolve(strict=True)
+    before = _file_witness(resolved)
+    payload = _validate_producer_run_config_payload(_read_json_once(resolved))
+    after = _file_witness(resolved)
+    if after != before:
+        raise RuntimeError("Stage 1 run config changed while it was read")
+    canonical = _canonical_json_bytes(payload)
+    return Stage1RunConfigWitness(
+        path=resolved,
+        file_witness=before,
+        canonical_payload=canonical,
+        config_digest=payload["config_digest"],
+    )
+
+
+def validate_stage1_runtime_args(
+    witness: Stage1RunConfigWitness,
+    args: object,
+    deepspeed_runtime_profile: object,
+) -> dict[str, object]:
+    config = witness.payload()
+    expected = {
+        "method": getattr(args, "tuning_method", None),
+        "model": getattr(args, "model", None),
+        "source_data_path": str(
+            Path(getattr(args, "benchmark_source_data_path", "")).resolve()
+        ),
+        "data_path": str(Path(getattr(args, "data_path", "")).resolve()),
+        "image_root": str(Path(getattr(args, "image_root", "")).resolve()),
+        "output_dir": str(Path(getattr(args, "save_model_path", "")).resolve()),
+        "micro_batch": getattr(args, "per_device_train_batch_size", None),
+        "gradient_accumulation_steps": getattr(
+            args, "gradient_accumulation_steps", None
+        ),
+        "epochs": getattr(args, "epochs", None),
+        "learning_rate": getattr(args, "learning_rate", None),
+        "seed": getattr(args, "seed", None),
+        "deepspeed_config": str(
+            Path(getattr(args, "deepspeed_config", "")).resolve()
+        ),
+        "attention_implementation": getattr(
+            args, "attention_implementation", None
+        ),
+        "save_strategy": getattr(args, "save_strategy", None),
+        "final_save": getattr(args, "final_save", None),
+        "max_steps": max(0, getattr(args, "max_steps", -1)),
+    }
+    for name, value in expected.items():
+        if config.get(name) != value:
+            raise ValueError(
+                f"Stage 1 runtime {name} does not match sealed run config"
+            )
+    from deepspeed_runtime import DeepSpeedRuntimeProfile
+
+    if not isinstance(deepspeed_runtime_profile, DeepSpeedRuntimeProfile):
+        raise TypeError("Stage 1 producer requires a bound DeepSpeed runtime profile")
+    if (
+        not deepspeed_runtime_profile.enabled
+        or deepspeed_runtime_profile.zero_stage is None
+        or deepspeed_runtime_profile.config_path is None
+        or deepspeed_runtime_profile.config_digest is None
+    ):
+        raise ValueError("Stage 1 matrix producers require DeepSpeed")
+    if deepspeed_runtime_profile.world_size != config["world_size"]:
+        raise ValueError("Stage 1 runtime world size does not match sealed run config")
+    if str(deepspeed_runtime_profile.config_path) != config["deepspeed_config"]:
+        raise ValueError("Stage 1 runtime DeepSpeed config path mismatch")
+    if (
+        config["deepspeed_config_digest"]
+        != deepspeed_runtime_profile.config_digest
+    ):
+        raise ValueError("Stage 1 runtime DeepSpeed config digest mismatch")
+    if _stat_payload(Path(config["source_data_path"])) != config["data_stat"]:
+        raise ValueError("Stage 1 runtime source data stat witness is stale")
+    audit = _load_bound_audit(
+        Path(config["probe_rows"]),
+        data_path=Path(config["source_data_path"]),
+        image_root=Path(config["image_root"]),
+        count=64,
+    )
+    if (
+        audit["audit_digest"] != config["audit_digest"]
+        or audit["input_stat"] != config["data_stat"]
+        or [row["source_row_index"] for row in audit["selected_rows"]]
+        != config["probe_row_indices"]
+    ):
+        raise ValueError("Stage 1 runtime audit rows do not match sealed run config")
+    tuning = config["tuning_config"]
+    if config["method"] == "dora":
+        runtime_tuning = {
+            "use_dora": True,
+            "rank": getattr(args, "lora_r", None),
+            "alpha": getattr(args, "lora_alpha", None),
+            "dropout": getattr(args, "lora_dropout", None),
+            "target_modules": getattr(args, "lora_target_modules", None),
+        }
+        if tuning != runtime_tuning:
+            raise ValueError("Stage 1 runtime DoRA tuning does not match sealed config")
+    return config
+
+
+def _validate_producer_run_config_payload(payload: object) -> dict[str, object]:
+    if type(payload) is not dict:
+        raise TypeError("Stage 1 producer run config must be an object")
+    legacy_fields = {
+        "schema_version", "kind", "method", "tuning_config", "model",
+        "source_data_path", "data_path", "data_stat", "image_root",
+        "output_dir", "micro_batch", "world_size",
+        "gradient_accumulation_steps", "effective_global_batch", "epochs",
+        "learning_rate", "seed", "max_steps", "final_save",
+        "deepspeed_config", "deepspeed_config_digest",
+        "attention_implementation", "save_strategy", "audit_digest",
+        "probe_rows", "probe_row_indices", "maximum_config_digest",
+        "prerequisite_chain_digest", "prerequisite_chain", "config_digest",
+    }
+    schema_version = payload.get("schema_version")
+    if schema_version == LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION:
+        expected_fields = legacy_fields
+        producer_kind = "legacy_zero3"
+    elif schema_version == STAGE1_PRODUCER_SCHEMA_VERSION:
+        expected_fields = legacy_fields | {"producer_kind", "optimizer_steps"}
+        producer_kind = payload.get("producer_kind")
+    else:
+        raise ValueError("unsupported Stage 1 producer run config schema")
+    _require_exact_keys(
+        payload,
+        expected_fields,
+        "Stage 1 producer run config",
+    )
+    if payload.get("kind") not in {
+        "stage1-probe-run-manifest", "stage1-timed-launch-manifest",
+        "stage1-smoke-run-manifest",
+    }:
+        raise ValueError("unsupported Stage 1 producer run config schema")
+    claimed = payload.get("config_digest")
+    _require_digest("config_digest", claimed)
+    digest_input = dict(payload)
+    digest_input.pop("config_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("Stage 1 producer run config digest mismatch")
+    for name in (
+        "method", "model", "source_data_path", "data_path", "image_root",
+        "output_dir", "deepspeed_config", "attention_implementation",
+        "save_strategy", "probe_rows",
+    ):
+        _require_string(name, payload.get(name))
+    _validated_method(payload.get("method"))
+    tuning = payload.get("tuning_config")
+    if payload["method"] == "full":
+        if tuning is not None:
+            raise ValueError("full run config must not contain DoRA tuning")
+    elif tuning != {
+        "use_dora": True, "rank": 32, "alpha": 64, "dropout": 0.05,
+        "target_modules": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+    }:
+        raise ValueError("DoRA run config does not match the approved tuning contract")
+    for name in (
+        "micro_batch", "world_size", "gradient_accumulation_steps",
+        "effective_global_batch",
+    ):
+        _require_int(name, payload.get(name), positive=True)
+    if payload["effective_global_batch"] != (
+        payload["micro_batch"] * payload["world_size"]
+        * payload["gradient_accumulation_steps"]
+    ):
+        raise ValueError("producer run config effective batch invariant failed")
+    if type(payload.get("final_save")) is not bool:
+        raise TypeError("producer run config final_save must be boolean")
+    if (
+        payload.get("epochs") != 3
+        or payload.get("learning_rate") != 1e-5
+        or payload.get("seed") != 42
+        or payload.get("attention_implementation") != "flash_attention_2"
+        or payload.get("save_strategy") != "no"
+    ):
+        raise ValueError("producer run config violates approved experiment invariants")
+    _require_int("epochs", payload.get("epochs"), positive=True)
+    _require_int("seed", payload.get("seed"))
+    _require_int("max_steps", payload.get("max_steps"))
+    if producer_kind == "zero_matrix":
+        if payload["world_size"] != 2:
+            raise ValueError("official zero_matrix producers require world_size 2")
+        if payload["effective_global_batch"] != 16:
+            raise ValueError(
+                "official zero_matrix producers require effective global batch 16"
+            )
+        if payload["optimizer_steps"] != 3:
+            raise ValueError("zero_matrix producers require exactly 3 optimizer steps")
+        if payload["max_steps"] != payload["optimizer_steps"]:
+            raise ValueError("zero_matrix max_steps must equal optimizer_steps")
+    elif producer_kind == "legacy_zero3":
+        if (
+            payload["gradient_accumulation_steps"] != 2
+            or payload["world_size"] != 2
+        ):
+            raise ValueError(
+                "legacy ZeRO-3 producer run config violates fixed controls"
+            )
+    else:
+        raise ValueError("unsupported Stage 1 producer kind")
+    stat_witness = payload.get("data_stat")
+    _require_exact_keys(
+        stat_witness, {"device", "inode", "size", "mtime_ns"}, "producer data stat witness"
+    )
+    for name, value in stat_witness.items():
+        _require_int(f"data_stat.{name}", value)
+    indices = payload.get("probe_row_indices")
+    if type(indices) is not list:
+        raise TypeError("producer run config probe_row_indices must be an array")
+    for index, value in enumerate(indices):
+        _require_int(f"probe_row_indices[{index}]", value)
+    _require_digest("audit_digest", payload.get("audit_digest"))
+    _require_digest("deepspeed_config_digest", payload.get("deepspeed_config_digest"))
+    maximum_digest = payload.get("maximum_config_digest")
+    if maximum_digest is not None:
+        _require_digest("maximum_config_digest", maximum_digest)
+    prerequisite_digest = payload.get("prerequisite_chain_digest")
+    if payload["kind"] == "stage1-smoke-run-manifest":
+        if maximum_digest is not None:
+            raise ValueError("smoke evidence cannot depend on a capacity maximum")
+        if prerequisite_digest is not None:
+            raise ValueError("smoke evidence cannot depend on itself as a prerequisite")
+        if payload.get("prerequisite_chain") is not None:
+            raise ValueError("smoke evidence cannot name a prerequisite chain")
+        if (
+            payload["final_save"] is not False
+            or payload["max_steps"] != 4
+            or payload["micro_batch"] != 2
+        ):
+            raise ValueError("smoke run config requires B=2 and exact step-4 resume")
+    else:
+        _require_digest("prerequisite_chain_digest", prerequisite_digest)
+        _require_string("prerequisite_chain", payload.get("prerequisite_chain"))
+        if payload["kind"] == "stage1-probe-run-manifest":
+            if maximum_digest is not None or payload["final_save"] is not False or payload["max_steps"] == 0:
+                raise ValueError("probe run config has invalid maximum/save/step settings")
+        elif (
+            maximum_digest is None
+            or payload["final_save"] is not True
+            or payload["max_steps"] != 0
+        ):
+            raise ValueError("timed run config has invalid maximum/save/step settings")
+    return payload
+
+
+def _load_prerequisite_chain(path: Path) -> dict[str, object]:
+    payload = _read_json_once(path)
+    _require_exact_keys(
+        payload,
+        {"schema_version", "kind", "shared_identity", "shared_identity_digest",
+         "producer_digests", "resume_witness_digests", "prerequisite_chain_digest"},
+        "Stage 1 smoke prerequisite chain",
+    )
+    if payload.get("schema_version") != _SCHEMA_VERSION or payload.get("kind") != "stage1-smoke-prerequisite-chain":
+        raise ValueError("invalid Stage 1 smoke prerequisite chain")
+    identity = payload.get("shared_identity")
+    if type(identity) is not dict:
+        raise TypeError("smoke shared identity must be an object")
+    _require_digest("shared_identity_digest", payload.get("shared_identity_digest"))
+    if config_digest(identity) != payload["shared_identity_digest"]:
+        raise ValueError("smoke shared identity digest mismatch")
+    for name in ("producer_digests", "resume_witness_digests"):
+        values = payload.get(name)
+        _require_exact_keys(values, {"full", "dora"}, f"smoke {name}")
+        for method, digest in values.items():
+            _require_digest(f"{name}.{method}", digest)
+    claimed = payload.get("prerequisite_chain_digest")
+    _require_digest("prerequisite_chain_digest", claimed)
+    digest_input = dict(payload)
+    digest_input.pop("prerequisite_chain_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("smoke prerequisite chain digest mismatch")
+    return payload
+
+
+_PREREQUISITE_CONTROL_FIELDS = (
+    "model", "source_data_path", "data_stat", "image_root", "world_size",
+    "gradient_accumulation_steps", "learning_rate", "seed",
+    "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
+)
+_PREREQUISITE_RUN_CONTROL_FIELDS = ("epochs", "save_strategy")
+
+
+def _validate_prerequisite_controls(
+    config: Mapping[str, object],
+    prerequisite: Mapping[str, object],
+    *,
+    require_run_controls: bool,
+) -> None:
+    identity = prerequisite["shared_identity"]
+    fields = _PREREQUISITE_CONTROL_FIELDS
+    if require_run_controls:
+        fields += _PREREQUISITE_RUN_CONTROL_FIELDS
+    for name in fields:
+        source_name = (
+            "source_data_path"
+            if name == "source_data_path" and "source_data_path" in config
+            else "data_path" if name == "source_data_path" else name
+        )
+        if identity.get(name) != config.get(source_name):
+            raise ValueError(f"run changes smoke prerequisite field: {name}")
+
+
+def _small_config_digest(path: Path) -> str:
+    resolved = path.resolve(strict=True)
+    if resolved.stat().st_size > 1024 * 1024:
+        raise ValueError(f"configuration file is unexpectedly large: {resolved}")
+    data = resolved.read_bytes()
+    try:
+        payload = json.loads(data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"malformed configuration JSON: {resolved}") from error
+    if (
+        type(payload) is not dict
+        or type(payload.get("zero_optimization")) is not dict
+        or payload["zero_optimization"].get("stage") not in (1, 2, 3)
+    ):
+        raise ValueError("Stage 1 benchmark requires a supported ZeRO configuration")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _prepare_probe_run(args: argparse.Namespace) -> str:
+    method = _validated_method(args.method)
+    source_data = Path(args.source_data_path).resolve(strict=True)
+    train_data = Path(args.data_path).resolve(strict=True)
+    image_root = Path(args.image_root).resolve(strict=True)
+    audit = _load_bound_audit(
+        Path(args.probe_rows), data_path=source_data, image_root=image_root
+    )
+    micro_batch = _require_int("micro_batch", args.micro_batch, positive=True)
+    world_size = _require_int("world_size", args.world_size, positive=True)
+    accumulation = _require_int(
+        "gradient_accumulation_steps", args.gradient_accumulation, positive=True
+    )
+    max_steps = _require_int("max_steps", args.max_steps, positive=True)
+    deepspeed = Path(args.deepspeed_config).resolve(strict=True)
+    prerequisite = _load_prerequisite_chain(Path(args.prerequisite_chain))
+    config = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-probe-run-manifest",
+        "method": method,
+        "tuning_config": None if method == "full" else {
+            "use_dora": True, "rank": 32, "alpha": 64, "dropout": 0.05,
+            "target_modules": "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj",
+        },
+        "model": _require_string("model", args.model),
+        "source_data_path": str(source_data),
+        "data_path": str(train_data),
+        "data_stat": audit["input_stat"],
+        "image_root": str(image_root),
+        "output_dir": str(Path(args.output_dir).resolve()),
+        "micro_batch": micro_batch,
+        "world_size": world_size,
+        "gradient_accumulation_steps": accumulation,
+        "effective_global_batch": world_size * micro_batch * accumulation,
+        "epochs": 3,
+        "learning_rate": 1e-5,
+        "seed": 42,
+        "max_steps": max_steps,
+        "final_save": False,
+        "deepspeed_config": str(deepspeed),
+        "deepspeed_config_digest": _small_config_digest(deepspeed),
+        "attention_implementation": "flash_attention_2",
+        "save_strategy": "no",
+        "audit_digest": audit["audit_digest"],
+        "probe_rows": str(Path(args.probe_rows).resolve()),
+        "probe_row_indices": [row["source_row_index"] for row in audit["selected_rows"]],
+        "maximum_config_digest": None,
+        "prerequisite_chain_digest": prerequisite["prerequisite_chain_digest"],
+        "prerequisite_chain": str(Path(args.prerequisite_chain).resolve(strict=True)),
+    }
+    _validate_prerequisite_controls(
+        config, prerequisite, require_run_controls=True
+    )
+    config["config_digest"] = config_digest(config)
+    path = Path(args.run_config)
+    if path.exists():
+        if _read_json_once(path) == config:
+            return str(path)
+        raise FileExistsError(f"refusing to replace probe run config: {path}")
+    _atomic_write_json(path, config)
+    return str(path)
+
+
+def write_stage1_producer_evidence(
+    path: Path,
+    *,
+    run_config_path: Path | None = None,
+    run_config_witness: Stage1RunConfigWitness | None = None,
+    evidence: Stage1BenchmarkEvidence,
+    smoke_resume_witness: Mapping[str, object] | None = None,
+    artifact_manifest: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Atomically publish metrics plus the producer-authenticated artifact witness."""
+
+    if (run_config_path is None) == (run_config_witness is None):
+        raise ValueError("provide exactly one run config path or immutable witness")
+    witness = run_config_witness or load_stage1_run_config_witness(run_config_path)
+    config = witness.payload()
+    source_path = Path(config["source_data_path"])
+    if not source_path.is_file() or _stat_payload(source_path) != config["data_stat"]:
+        raise ValueError("producer source data stat witness is stale")
+    image_root = Path(config["image_root"])
+    if not image_root.is_dir() or image_root.resolve(strict=True) != image_root:
+        raise ValueError("producer image root must be a resolved existing directory")
+    if evidence.config_digest != config["config_digest"]:
+        raise ValueError("producer evidence is not bound to its run config")
+    if evidence.method != config["method"]:
+        raise ValueError("producer evidence method does not match run config")
+    identity_bindings = {
+        "deepspeed_config_digest": config["deepspeed_config_digest"],
+        "world_size": config["world_size"],
+        "micro_batch": config["micro_batch"],
+        "gradient_accumulation_steps": config["gradient_accumulation_steps"],
+        "effective_global_batch": config["effective_global_batch"],
+        "sample_stream_digest": config["audit_digest"],
+        "model_id": config["model"],
+        "seed": config["seed"],
+    }
+    for name, value in identity_bindings.items():
+        if getattr(evidence, name) != value:
+            raise ValueError(f"producer evidence identity mismatch for {name}")
+    smoke_digest = None
+    if config["kind"] == "stage1-smoke-run-manifest":
+        smoke_resume_witness = _validate_smoke_resume_witness(smoke_resume_witness)
+        smoke_digest = config_digest(smoke_resume_witness)
+    elif smoke_resume_witness is not None:
+        raise ValueError("resume witness is accepted only for smoke evidence")
+    artifact = (
+        _build_artifact_manifest(
+            Path(config["output_dir"]),
+            method=evidence.method,
+            final_save=config["final_save"],
+        )
+        if artifact_manifest is None
+        else dict(artifact_manifest)
+    )
+    if evidence.checkpoint_bytes != artifact["checkpoint_bytes"]:
+        raise ValueError("producer checkpoint_bytes does not match artifact witness")
+    payload = {
+        "schema_version": STAGE1_PRODUCER_SCHEMA_VERSION,
+        "kind": "stage1-producer-evidence",
+        "run_config": config,
+        "benchmark_evidence": _evidence_to_dict(evidence),
+        "artifact_manifest": artifact,
+        "artifact_manifest_digest": artifact["artifact_manifest_digest"],
+        "smoke_resume_witness": smoke_resume_witness,
+        "smoke_resume_witness_digest": smoke_digest,
+    }
+    payload["producer_digest"] = config_digest(payload)
+    _validate_producer_evidence_payload(payload)
+    path = Path(path)
+    if path.exists():
+        existing = _read_json_once(path)
+        if existing == payload:
+            return payload
+        raise FileExistsError(f"refusing to replace producer evidence: {path}")
+    _atomic_write_json(path, payload)
+    return payload
+
+
+def _load_producer_evidence(path: Path) -> tuple[Stage1BenchmarkEvidence, dict[str, object]]:
+    path = Path(os.path.abspath(path))
+    raw = _read_canonical_evidence_json(path)
+    if type(raw) is dict and raw.get("kind") == _SMOKE_REGISTRY_KIND:
+        evidence, payload, marker = _validate_smoke_registry_payload(raw, path)
+    else:
+        evidence, payload = _validate_producer_evidence_payload(raw)
+        marker = None
+    if payload["run_config"]["kind"] == "stage1-smoke-run-manifest":
+        if marker is None:
+            _validate_smoke_marker_for_evidence(path, payload)
+    return evidence, payload
+
+
+def _validate_smoke_registry_payload(
+    payload: object, evidence_path: Path
+) -> tuple[Stage1BenchmarkEvidence, dict[str, object], dict[str, object]]:
+    if type(payload) is not dict:
+        raise TypeError("Stage 1 smoke registry evidence must be an object")
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "kind",
+            "attempt_path",
+            "attempt_evidence_path",
+            "attempt_evidence_digest",
+            "marker_path",
+            "marker_digest",
+            "checkpoint_marker",
+            "request_provenance",
+            "producer_evidence",
+            "registry_digest",
+        },
+        "Stage 1 smoke registry evidence",
+    )
+    if (
+        payload.get("schema_version") != _SMOKE_REGISTRY_SCHEMA_VERSION
+        or payload.get("kind") != _SMOKE_REGISTRY_KIND
+    ):
+        raise ValueError("invalid Stage 1 smoke registry evidence schema")
+    claimed = _require_digest("registry_digest", payload.get("registry_digest"))
+    digest_input = dict(payload)
+    digest_input.pop("registry_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("Stage 1 smoke registry evidence digest mismatch")
+
+    attempt_path = _require_string("attempt_path", payload.get("attempt_path"))
+    parts = Path(attempt_path).parts
+    if len(parts) != 2 or parts[0] != _SMOKE_ATTEMPTS_DIRECTORY:
+        raise ValueError("invalid Stage 1 smoke registry attempt path")
+    _smoke_attempt_number(parts[1])
+    expected_attempt_evidence = f"{attempt_path}/evidence.json"
+    expected_marker = f"{attempt_path}/{_SMOKE_MARKER_FILENAME}"
+    if payload.get("attempt_evidence_path") != expected_attempt_evidence:
+        raise ValueError("invalid Stage 1 smoke registry attempt evidence path")
+    if payload.get("marker_path") != expected_marker:
+        raise ValueError("invalid Stage 1 smoke registry marker path")
+
+    evidence, producer = _validate_producer_evidence_payload(
+        payload.get("producer_evidence"),
+        validate_external_inputs=False,
+    )
+    if producer["run_config"]["kind"] != "stage1-smoke-run-manifest":
+        raise ValueError("registry evidence must contain smoke producer evidence")
+    provenance = payload.get("request_provenance")
+    _require_exact_keys(
+        provenance,
+        {
+            "data_path",
+            "image_root",
+            "deepspeed_config",
+            "launcher_path",
+            "sealed_deepspeed_config_path",
+            "sealed_deepspeed_config_digest",
+            "sealed_run_config_digest",
+        },
+        "Stage 1 smoke request provenance",
+    )
+    for name in (
+        "data_path", "image_root", "deepspeed_config", "launcher_path",
+        "sealed_deepspeed_config_path",
+    ):
+        value = _require_string(f"request_provenance.{name}", provenance.get(name))
+        if not os.path.isabs(value) or _lexical_absolute_path(value) != value:
+            raise ValueError(f"request_provenance.{name} must be lexical absolute")
+    config = producer["run_config"]
+    if (
+        provenance["sealed_deepspeed_config_path"] != config["deepspeed_config"]
+        or provenance["sealed_deepspeed_config_digest"]
+        != config["deepspeed_config_digest"]
+        or provenance["sealed_run_config_digest"] != config["config_digest"]
+    ):
+        raise ValueError("registry request provenance does not match producer seal")
+    _require_digest(
+        "sealed_deepspeed_config_digest",
+        provenance["sealed_deepspeed_config_digest"],
+    )
+    _require_digest("sealed_run_config_digest", provenance["sealed_run_config_digest"])
+    producer_digest = _require_digest(
+        "attempt_evidence_digest", payload.get("attempt_evidence_digest")
+    )
+    if producer_digest != producer["producer_digest"]:
+        raise ValueError("registry attempt evidence digest mismatch")
+    marker_digest = _require_digest("marker_digest", payload.get("marker_digest"))
+    summary = _validate_smoke_resume_witness(producer["smoke_resume_witness"])
+    if marker_digest != summary["resume_artifact_digest"]:
+        raise ValueError("registry marker digest does not match producer evidence")
+    marker = payload.get("checkpoint_marker")
+    expected_output = Path(
+        os.path.abspath(Path(evidence_path).parent / attempt_path / "run")
+    )
+    if Path(producer["run_config"]["output_dir"]) != expected_output:
+        raise ValueError("registry producer output directory does not match attempt")
+    snapshot = _validate_embedded_smoke_marker(
+        marker,
+        marker_path=Path(evidence_path).parent / expected_marker,
+        seal=producer,
+    )
+    if snapshot.marker_digest != marker_digest:
+        raise ValueError("embedded registry marker digest mismatch")
+    return evidence, producer, marker
+
+
+def _smoke_registry_payload(
+    *,
+    attempt: Path,
+    evidence_directory: Path,
+    producer: Mapping[str, object],
+    checkpoint_marker: Mapping[str, object],
+    requested_paths: Mapping[str, str],
+) -> dict[str, object]:
+    evidence_directory = Path(evidence_directory).resolve(strict=True)
+    attempt = Path(attempt).resolve(strict=True)
+    try:
+        relative = attempt.relative_to(evidence_directory).as_posix()
+    except ValueError as error:
+        raise ValueError("smoke attempt is outside its registry") from error
+    marker_digest = _validate_smoke_resume_witness(
+        producer["smoke_resume_witness"]
+    )["resume_artifact_digest"]
+    marker_path = attempt / _SMOKE_MARKER_FILENAME
+    marker = dict(checkpoint_marker)
+    _validate_embedded_smoke_marker(
+        marker,
+        marker_path=marker_path,
+        seal=producer,
+    )
+    config = producer["run_config"]
+    provenance = {
+        **dict(requested_paths),
+        "sealed_deepspeed_config_path": config["deepspeed_config"],
+        "sealed_deepspeed_config_digest": config["deepspeed_config_digest"],
+        "sealed_run_config_digest": config["config_digest"],
+    }
+    payload = {
+        "schema_version": _SMOKE_REGISTRY_SCHEMA_VERSION,
+        "kind": _SMOKE_REGISTRY_KIND,
+        "attempt_path": relative,
+        "attempt_evidence_path": f"{relative}/evidence.json",
+        "attempt_evidence_digest": producer["producer_digest"],
+        "marker_path": f"{relative}/{_SMOKE_MARKER_FILENAME}",
+        "marker_digest": marker_digest,
+        "checkpoint_marker": marker,
+        "request_provenance": provenance,
+        "producer_evidence": dict(producer),
+    }
+    payload["registry_digest"] = config_digest(payload)
+    return payload
+
+
+def _validate_producer_evidence_payload(
+    payload: object,
+    *,
+    validate_external_inputs: bool = True,
+) -> tuple[Stage1BenchmarkEvidence, dict[str, object]]:
+    if type(payload) is not dict:
+        raise TypeError("producer evidence must be an object")
+    _require_exact_keys(
+        payload,
+        {"schema_version", "kind", "run_config", "benchmark_evidence",
+         "artifact_manifest", "artifact_manifest_digest", "producer_digest",
+         "smoke_resume_witness", "smoke_resume_witness_digest"},
+        "Stage 1 producer evidence",
+    )
+    schema_version = payload.get("schema_version")
+    if (
+        schema_version not in {
+            LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION,
+            STAGE1_PRODUCER_SCHEMA_VERSION,
+        }
+        or payload.get("kind") != "stage1-producer-evidence"
+    ):
+        raise ValueError("invalid Stage 1 producer evidence schema")
+    claimed = payload.get("producer_digest")
+    _require_digest("producer_digest", claimed)
+    digest_input = dict(payload)
+    digest_input.pop("producer_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("producer evidence digest mismatch")
+    config = _validate_producer_run_config_payload(payload["run_config"])
+    config_claimed = config["config_digest"]
+    raw_evidence = payload["benchmark_evidence"]
+    if schema_version == LEGACY_STAGE1_PRODUCER_SCHEMA_VERSION:
+        if type(raw_evidence) is not dict or set(raw_evidence) != _LEGACY_EVIDENCE_FIELDS:
+            raise ValueError(
+                "schema-1 producer must contain exact historical evidence fields"
+            )
+        migrated = migrate_stage1_producer_evidence(
+            {
+                **raw_evidence,
+                "schema_version": schema_version,
+                "run_config": config,
+            }
+        )
+        migrated.pop("schema_version")
+        migrated.pop("run_config")
+        evidence = _evidence_from_dict(migrated)
+    else:
+        evidence = _evidence_from_dict(raw_evidence)
+    if evidence.config_digest != config_claimed:
+        raise ValueError("producer metric/config digest mismatch")
+    metric_bindings = {
+        "method": evidence.method,
+        "micro_batch": evidence.micro_batch,
+        "world_size": evidence.world_size,
+        "gradient_accumulation_steps": evidence.gradient_accumulation_steps,
+        "effective_global_batch": evidence.effective_global_batch,
+        "deepspeed_config_digest": evidence.deepspeed_config_digest,
+        "sample_stream_digest": evidence.sample_stream_digest,
+        "model_id": evidence.model_id,
+        "seed": evidence.seed,
+        "probe_row_indices": list(evidence.probe_row_indices),
+    }
+    config_names = {
+        "sample_stream_digest": "audit_digest",
+        "model_id": "model",
+    }
+    for name, value in metric_bindings.items():
+        if config.get(config_names.get(name, name)) != value:
+            raise ValueError(f"producer metric/run config mismatch for {name}")
+    if config.get("producer_kind") == "zero_matrix" and (
+        evidence.optimizer_steps != config["optimizer_steps"]
+        or evidence.samples_seen
+        != config["effective_global_batch"] * config["optimizer_steps"]
+    ):
+        raise ValueError(
+            "zero_matrix producer does not prove exact optimizer steps and samples seen"
+        )
+    smoke_witness = payload.get("smoke_resume_witness")
+    smoke_digest = payload.get("smoke_resume_witness_digest")
+    if config["kind"] == "stage1-smoke-run-manifest":
+        validated_smoke = _validate_smoke_resume_witness(smoke_witness)
+        _require_digest("smoke_resume_witness_digest", smoke_digest)
+        if config_digest(validated_smoke) != smoke_digest:
+            raise ValueError("smoke resume witness digest mismatch")
+        if (
+            evidence.status != "success"
+            or evidence.optimizer_steps != validated_smoke["resume_final_step"]
+            or evidence.samples_seen
+            != evidence.effective_global_batch * validated_smoke["resume_final_step"]
+            or config["max_steps"] != validated_smoke["resume_final_step"]
+            or config["micro_batch"] != validated_smoke["batch_size_observed"]
+        ):
+            raise ValueError("smoke producer does not prove the exact resumed step")
+    elif smoke_witness is not None or smoke_digest is not None:
+        raise ValueError("non-smoke producer evidence contains a resume witness")
+    artifact = payload["artifact_manifest"]
+    if type(artifact) is not dict:
+        raise TypeError("producer artifact manifest must be an object")
+    _require_exact_keys(
+        artifact,
+        {"schema_version", "kind", "method", "artifact_kind", "output_dir",
+         "final_save", "weight_serialization", "files", "checkpoint_bytes",
+         "artifact_manifest_digest"},
+        "producer artifact manifest",
+    )
+    if (
+        artifact["schema_version"] != _SCHEMA_VERSION
+        or artifact["kind"] != "stage1-artifact-topology-witness"
+        or artifact["method"] != evidence.method
+        or artifact["output_dir"] != config["output_dir"]
+        or artifact["final_save"] is not config["final_save"]
+    ):
+        raise ValueError("producer artifact manifest identity mismatch")
+    artifact_claimed = artifact.get("artifact_manifest_digest")
+    _require_digest("artifact_manifest_digest", artifact_claimed)
+    artifact_input = dict(artifact)
+    artifact_input.pop("artifact_manifest_digest")
+    if config_digest(artifact_input) != artifact_claimed or payload["artifact_manifest_digest"] != artifact_claimed:
+        raise ValueError("producer artifact manifest digest mismatch")
+    expected_kind = "none" if config.get("final_save") is False else evidence.method
+    if artifact.get("artifact_kind") != expected_kind:
+        raise ValueError("producer artifact topology does not match run final-save mode")
+    files = artifact.get("files")
+    if type(files) is not list:
+        raise TypeError("producer artifact files must be an array")
+    names: set[str] = set()
+    byte_sum = 0
+    for index, item in enumerate(files):
+        _require_exact_keys(item, {"name", "size"}, f"producer artifact file {index}")
+        name = _require_string(f"artifact file {index}.name", item.get("name"))
+        if Path(name).name != name or name in names:
+            raise ValueError("producer artifact filenames must be unique basenames")
+        names.add(name)
+        size = _require_int(f"artifact file {index}.size", item.get("size"))
+        if expected_kind != "none" and size == 0:
+            raise ValueError("producer artifact files must have positive size")
+        if expected_kind != "none" and not _is_allowlisted_artifact_name(name, evidence.method):
+            raise ValueError("producer artifact manifest contains a non-artifact file")
+        byte_sum += size
+    if artifact.get("checkpoint_bytes") != byte_sum:
+        raise ValueError("producer artifact file sizes do not sum to checkpoint_bytes")
+    if expected_kind != "none" and not _PROCESSOR_REQUIRED_NAMES <= names:
+        raise ValueError("producer artifact witness is missing processor/tokenizer files")
+    serialization = artifact.get("weight_serialization")
+    if expected_kind == "full":
+        if "config.json" not in names:
+            raise ValueError("producer full artifact witness has incomplete model topology")
+        _require_exact_keys(
+            serialization, {"kind", "index", "shards"},
+            "producer full weight serialization",
+        )
+        serialization_kind = serialization.get("kind")
+        shards = serialization.get("shards")
+        if type(shards) is not list or not shards or shards != sorted(set(shards)):
+            raise ValueError("producer full weight shards must be a sorted unique array")
+        for index, name in enumerate(shards):
+            _require_string(f"producer full shard {index}", name)
+        if serialization_kind == "standalone":
+            if serialization.get("index") is not None or len(shards) != 1 or shards[0] not in {
+                "model.safetensors", "pytorch_model.bin"
+            }:
+                raise ValueError("producer standalone full weight witness is invalid")
+            expected_weights = set(shards)
+        elif serialization_kind == "indexed":
+            index_name = _require_string("producer full weight index", serialization.get("index"))
+            if index_name not in {
+                "model.safetensors.index.json", "pytorch_model.bin.index.json"
+            }:
+                raise ValueError("producer full weight index witness is invalid")
+            expected_prefix = "model-" if index_name.startswith("model") else "pytorch_model-"
+            expected_suffix = ".safetensors" if index_name.startswith("model") else ".bin"
+            if any(
+                Path(name).name != name
+                or not name.startswith(expected_prefix)
+                or not name.endswith(expected_suffix)
+                for name in shards
+            ):
+                raise ValueError("producer full shard witness is invalid")
+            expected_weights = {index_name, *shards}
+        else:
+            raise ValueError("producer full weight serialization kind is invalid")
+        actual_weights = {name for name in names if _is_full_weight_name(name)}
+        if actual_weights != expected_weights:
+            raise ValueError("producer full weight witness does not match artifact files")
+    if expected_kind == "dora":
+        if not _DORA_REQUIRED_NAMES <= names or any(_is_full_weight_name(name) for name in names if type(name) is str):
+            raise ValueError("producer DoRA artifact topology is invalid")
+        if serialization is not None:
+            raise ValueError("producer DoRA artifact must not contain full weights")
+    if expected_kind == "none" and serialization is not None:
+        raise ValueError("no-save producer artifact cannot contain weight serialization")
+    if artifact.get("checkpoint_bytes") != evidence.checkpoint_bytes:
+        raise ValueError("producer artifact byte count mismatch")
+    if validate_external_inputs:
+        source = Path(config["source_data_path"])
+        if not source.is_file() or _stat_payload(source) != config["data_stat"]:
+            raise ValueError("producer evidence source data stat witness is stale")
+        image_root = Path(config["image_root"])
+        if not image_root.is_dir() or image_root.resolve(strict=True) != image_root:
+            raise ValueError("producer evidence image root witness is stale")
+    return evidence, payload
+
+
+def _validate_smoke_resume_witness(payload: object) -> dict[str, object]:
+    _require_exact_keys(
+        payload,
+        {"initial_final_step", "resume_initial_step", "resume_final_step",
+         "batch_size_observed", "finite_loss", "checkpoint_validated",
+         "resume_artifact_digest"},
+        "Stage 1 smoke resume witness",
+    )
+    for name in (
+        "initial_final_step", "resume_initial_step", "resume_final_step",
+        "batch_size_observed",
+    ):
+        _require_int(name, payload.get(name), positive=True)
+    if (
+        payload["initial_final_step"] != 3
+        or payload["resume_initial_step"] != 3
+        or payload["resume_final_step"] != 4
+        or payload["batch_size_observed"] != 2
+        or payload.get("finite_loss") is not True
+        or payload.get("checkpoint_validated") is not True
+    ):
+        raise ValueError("smoke resume witness violates the approved 3-to-4 contract")
+    _require_digest("resume_artifact_digest", payload.get("resume_artifact_digest"))
+    return dict(payload)
+
+
+def _stat_payload(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+    }
+
+
+def _validate_count(count: object) -> int:
+    return _require_int("count", count, positive=True)
+
+
+def _reference_list(value: object, *, field: str, row_index: int) -> list[str]:
+    if type(value) is str:
+        references = [value]
+    elif type(value) is list:
+        references = value
+    else:
+        raise ValueError(
+            f"source_row_index={row_index}: {field} must be a path or list of paths"
+        )
+    if not references:
+        raise ValueError(f"source_row_index={row_index}: {field} must not be empty")
+    for reference in references:
+        if type(reference) is not str or not reference:
+            raise ValueError(
+                f"source_row_index={row_index}: {field} contains a malformed reference"
+            )
+    return references
+
+
+def _validate_reference(
+    reference: str,
+    *,
+    image_root: Path,
+    row_index: int,
+    role: str,
+) -> None:
+    selected = Path(reference)
+    if not selected.is_absolute():
+        selected = image_root / selected
+    try:
+        stat = selected.stat()
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"source_row_index={row_index}: missing {role} image reference: {reference}"
+        ) from error
+    if not stat_module.S_ISREG(stat.st_mode):
+        raise ValueError(
+            f"source_row_index={row_index}: {role} image reference is not a file: "
+            f"{reference} (mode={stat.st_mode:o})"
+        )
+
+
+def _score_row(
+    row: object, *, source_row_index: int, image_root: Path
+) -> tuple[tuple[int, int, int, int], dict[str, object]]:
+    if type(row) is not dict:
+        raise ValueError(f"source_row_index={source_row_index}: row must be a JSON object")
+    if "image_input" not in row:
+        raise ValueError(f"source_row_index={source_row_index}: missing image_input")
+    originals = _reference_list(
+        row["image_input"], field="image_input", row_index=source_row_index
+    )
+    for reference in originals:
+        _validate_reference(
+            reference,
+            image_root=image_root,
+            row_index=source_row_index,
+            role="original",
+        )
+    text_input = row.get("text_input", "")
+    if type(text_input) is not str:
+        raise ValueError(f"source_row_index={source_row_index}: text_input must be text")
+    sequence_plan = row.get("sequence_plan")
+    if type(sequence_plan) is not list:
+        raise ValueError(
+            f"source_row_index={source_row_index}: sequence_plan must be a list"
+        )
+    text_parts = [text_input]
+    helper_count = 0
+    latent_block_count = 0
+    for step_index, step in enumerate(sequence_plan):
+        if type(step) is not dict:
+            raise ValueError(
+                f"source_row_index={source_row_index}: sequence_plan[{step_index}] "
+                "must be an object"
+            )
+        step_type = step.get("type")
+        if step_type == "text":
+            content = step.get("content", "")
+            if type(content) is not str:
+                raise ValueError(
+                    f"source_row_index={source_row_index}: sequence_plan[{step_index}] "
+                    "text content must be a string"
+                )
+            text_parts.append(content)
+        elif step_type == "latent":
+            latent_block_count += 1
+            if "helper_image" not in step:
+                raise ValueError(
+                    f"source_row_index={source_row_index}: sequence_plan[{step_index}] "
+                    "is missing helper_image"
+                )
+            helpers = _reference_list(
+                step["helper_image"],
+                field=f"sequence_plan[{step_index}].helper_image",
+                row_index=source_row_index,
+            )
+            helper_count += len(helpers)
+            for reference in helpers:
+                _validate_reference(
+                    reference,
+                    image_root=image_root,
+                    row_index=source_row_index,
+                    role="helper",
+                )
+        else:
+            raise ValueError(
+                f"source_row_index={source_row_index}: sequence_plan[{step_index}] "
+                f"has unsupported type {step_type!r}"
+            )
+    token_estimate = sum(len(text.split()) for text in text_parts)
+    metrics = {
+        "source_row_index": source_row_index,
+        "token_estimate": token_estimate,
+        "original_image_count": len(originals),
+        "helper_image_count": helper_count,
+        "latent_block_count": latent_block_count,
+        "example": row,
+    }
+    return (
+        token_estimate,
+        len(originals),
+        helper_count,
+        latent_block_count,
+    ), metrics
+
+
+def _validate_audit_for_reuse(
+    payload: object,
+    *,
+    data_path: Path,
+    image_root: Path,
+    count: int,
+    witness: dict[str, int],
+) -> tuple[int, ...] | None:
+    if type(payload) is not dict:
+        raise ValueError("high-cost row audit must be a JSON object")
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "kind",
+            "data_path",
+            "image_root",
+            "requested_count",
+            "row_count",
+            "input_stat",
+            "selected_rows",
+            "audit_digest",
+        },
+        "high-cost row audit",
+    )
+    if payload.get("schema_version") != _SCHEMA_VERSION:
+        raise ValueError("unsupported high-cost row audit schema_version")
+    if payload.get("kind") != "stage1-high-cost-row-audit":
+        raise ValueError("invalid high-cost row audit kind")
+    claimed_digest = payload.get("audit_digest")
+    _require_digest("audit_digest", claimed_digest)
+    digest_input = dict(payload)
+    digest_input.pop("audit_digest")
+    if config_digest(digest_input) != claimed_digest:
+        raise ValueError("high-cost row audit digest mismatch")
+    for name in ("requested_count", "row_count"):
+        _require_int(name, payload.get(name))
+    stat_witness = payload.get("input_stat")
+    _require_exact_keys(
+        stat_witness,
+        {"device", "inode", "size", "mtime_ns"},
+        "high-cost input stat witness",
+    )
+    for name, value in stat_witness.items():
+        _require_int(f"input_stat.{name}", value)
+    if (
+        payload.get("data_path") != str(data_path)
+        or payload.get("image_root") != str(image_root)
+        or payload.get("requested_count") != count
+        or payload.get("input_stat") != witness
+    ):
+        return None
+    selected = payload.get("selected_rows")
+    if type(selected) is not list or len(selected) != min(count, payload.get("row_count", -1)):
+        raise ValueError("high-cost row audit has malformed selected_rows")
+    indices: list[int] = []
+    for item in selected:
+        if type(item) is not dict:
+            raise ValueError("high-cost selected row must be an object")
+        _require_exact_keys(
+            item,
+            {
+                "source_row_index",
+                "token_estimate",
+                "original_image_count",
+                "helper_image_count",
+                "latent_block_count",
+                "example",
+            },
+            "high-cost selected row",
+        )
+        index = item.get("source_row_index")
+        _require_int("source_row_index", index)
+        for name in (
+            "token_estimate",
+            "original_image_count",
+            "helper_image_count",
+            "latent_block_count",
+        ):
+            _require_int(name, item.get(name))
+        if type(item.get("example")) is not dict:
+            raise ValueError("high-cost selected row is missing its text/reference example")
+        indices.append(index)
+    if len(set(indices)) != len(indices):
+        raise ValueError("high-cost row audit contains duplicate source indices")
+    return tuple(indices)
+
+
+def select_high_cost_probe_rows(
+    examples: Sequence[Mapping[str, object]] | str | Path,
+    count: int,
+    audit_path: str | Path,
+    *,
+    image_root: str | Path | None = None,
+) -> tuple[int, ...]:
+    """Rank CoMT rows from text/reference metadata and persist a reusable audit."""
+
+    count = _validate_count(count)
+    audit_path = Path(audit_path)
+    if isinstance(examples, (str, os.PathLike)):
+        data_path = Path(examples).resolve(strict=True)
+        root = Path(image_root).resolve(strict=True) if image_root else data_path.parent
+        witness = _stat_payload(data_path)
+        if audit_path.is_file():
+            reused = _validate_audit_for_reuse(
+                _read_json_once(audit_path),
+                data_path=data_path,
+                image_root=root,
+                count=count,
+                witness=witness,
+            )
+            if reused is not None:
+                return reused
+        rows: list[dict[str, object]] = []
+        with data_path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, start=1):
+                if not line.strip():
+                    raise ValueError(
+                        f"blank CoMT JSONL physical line {line_number} is not allowed"
+                    )
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise ValueError(
+                        f"malformed CoMT JSONL at line {line_number}: {error}"
+                    ) from error
+                if type(row) is not dict:
+                    raise ValueError(
+                        f"malformed CoMT JSONL at line {line_number}: row must be an object"
+                    )
+                rows.append(row)
+        if _stat_payload(data_path) != witness:
+            raise RuntimeError("CoMT JSONL changed while its metadata audit was running")
+    else:
+        if type(examples) not in (list, tuple):
+            raise TypeError("examples must be a JSONL path or a list/tuple of mappings")
+        rows = list(examples)
+        root = Path(image_root or ".").resolve(strict=True)
+        metadata_bytes = _canonical_json_bytes(rows)
+        digest = hashlib.sha256(metadata_bytes).hexdigest()
+        data_path = Path(f"in-memory:{digest}")
+        witness = {"device": 0, "inode": 0, "size": len(metadata_bytes), "mtime_ns": 0}
+
+    ranked: list[tuple[tuple[int, int, int, int], dict[str, object]]] = []
+    for source_row_index, row in enumerate(rows):
+        ranked.append(
+            _score_row(row, source_row_index=source_row_index, image_root=root)
+        )
+    ranked.sort(key=lambda item: (*(-value for value in item[0]), item[1]["source_row_index"]))
+    selected_rows = [metrics for _, metrics in ranked[:count]]
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-high-cost-row-audit",
+        "data_path": str(data_path),
+        "image_root": str(root),
+        "requested_count": count,
+        "row_count": len(rows),
+        "input_stat": witness,
+        "selected_rows": selected_rows,
+    }
+    payload["audit_digest"] = config_digest(payload)
+    _atomic_write_json(audit_path, payload)
+    return tuple(item["source_row_index"] for item in selected_rows)
+
+
+def _load_bound_audit(
+    audit_path: Path, *, data_path: Path, image_root: Path, count: int = 64
+) -> dict[str, object]:
+    payload = _read_json_once(audit_path)
+    witness = _stat_payload(data_path)
+    selected = _validate_audit_for_reuse(
+        payload,
+        data_path=data_path.resolve(strict=True),
+        image_root=image_root.resolve(strict=True),
+        count=count,
+        witness=witness,
+    )
+    if selected is None:
+        raise ValueError("probe row audit does not match source data/image root/stat")
+    if not selected:
+        raise ValueError("probe row audit has no selected rows")
+    return payload
+
+
+def _atomic_write_probe_jsonl(
+    audit_path: Path,
+    output_path: Path,
+    *,
+    data_path: Path,
+    image_root: Path,
+) -> None:
+    payload = _load_bound_audit(
+        audit_path, data_path=data_path, image_root=image_root, count=64
+    )
+    selected = payload["selected_rows"]
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary = Path(handle.name)
+            for item in selected:
+                if type(item) is not dict or type(item.get("example")) is not dict:
+                    raise ValueError("probe row audit contains malformed selected example")
+                handle.write(
+                    json.dumps(
+                        item["example"], ensure_ascii=False, allow_nan=False, sort_keys=True
+                    )
+                    + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, output_path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _probe_attempt_path(attempt_dir: Path) -> Path:
+    return attempt_dir / "evidence" / "attempt.json"
+
+
+def _record_probe_attempt(args: argparse.Namespace) -> dict[str, object]:
+    method = _validated_method(args.method)
+    micro_batch = _require_int("micro_batch", args.micro_batch, positive=True)
+    world_size = _require_int("world_size", args.world_size, positive=True)
+    accumulation = _require_int(
+        "gradient_accumulation_steps", args.gradient_accumulation, positive=True
+    )
+    process_id = _require_int("process_id", args.process_id, positive=True)
+    exit_code = _require_int("exit_code", args.exit_code)
+    max_steps = _require_int("max_steps", args.max_steps, positive=True)
+    source_data_path = Path(args.source_data_path).resolve(strict=True)
+    image_root = Path(args.image_root).resolve(strict=True)
+    audit = _load_bound_audit(
+        Path(args.probe_rows), data_path=source_data_path, image_root=image_root
+    )
+    probe_indices = [row["source_row_index"] for row in audit["selected_rows"]]
+    if type(args.command) is not list or not args.command:
+        raise ValueError("probe attempt requires a recorded command")
+    command = args.command[1:] if args.command[0] == "--" else args.command
+    if not command:
+        raise ValueError("probe attempt command must not be empty")
+    if command.count("--benchmark-run-config") != 1:
+        raise ValueError("probe argv requires exactly one benchmark run config")
+    run_config_index = command.index("--benchmark-run-config")
+    if run_config_index + 1 >= len(command):
+        raise ValueError("probe benchmark run config flag has no value")
+    sealed_run = _load_producer_run_config(Path(command[run_config_index + 1]))
+    expected_run = {
+        "method": method,
+        "micro_batch": micro_batch,
+        "world_size": world_size,
+        "gradient_accumulation_steps": accumulation,
+        "max_steps": max_steps,
+        "final_save": False,
+        "model": _require_string("model", args.model),
+        "source_data_path": str(source_data_path),
+        "image_root": str(image_root),
+        "output_dir": str(Path(args.output_dir).resolve()),
+        "deepspeed_config": str(Path(args.deepspeed_config).resolve()),
+        "attention_implementation": _require_string(
+            "attention_implementation", args.attention_implementation
+        ),
+        "audit_digest": audit["audit_digest"],
+    }
+    for name, value in expected_run.items():
+        if sealed_run.get(name) != value:
+            raise ValueError(f"probe run config mismatch for {name}")
+    launch_config = {
+        "method": method,
+        "micro_batch": micro_batch,
+        "world_size": world_size,
+        "gradient_accumulation_steps": accumulation,
+        "effective_global_batch": world_size * micro_batch * accumulation,
+        "learning_rate": float(args.learning_rate),
+        "seed": args.seed,
+        "max_steps": max_steps,
+        "final_save": False,
+        "model": expected_run["model"],
+        "tuning_config": sealed_run["tuning_config"],
+        "data_path": str(source_data_path),
+        "train_data_path": sealed_run["data_path"],
+        "data_stat": audit["input_stat"],
+        "image_root": str(image_root),
+        "deepspeed_config": str(Path(args.deepspeed_config).resolve()),
+        "deepspeed_config_digest": sealed_run["deepspeed_config_digest"],
+        "attention_implementation": _require_string(
+            "attention_implementation", args.attention_implementation
+        ),
+        "probe_rows": str(Path(args.probe_rows).resolve()),
+        "probe_row_indices": probe_indices,
+        "audit_digest": audit["audit_digest"],
+        "run_config_digest": sealed_run["config_digest"],
+        "prerequisite_chain_digest": sealed_run["prerequisite_chain_digest"],
+        "prerequisite_chain": sealed_run["prerequisite_chain"],
+        "command": command,
+    }
+    digest = config_digest(launch_config)
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-probe-attempt",
+        "attempt_id": _require_string("attempt_id", args.attempt_id),
+        "recorded_at_ns": time.time_ns(),
+        "status": "success" if exit_code == 0 else "requires-classification",
+        "method": method,
+        "micro_batch": micro_batch,
+        "world_size": world_size,
+        "gradient_accumulation_steps": accumulation,
+        "effective_global_batch": world_size * micro_batch * accumulation,
+        "max_steps": max_steps,
+        "final_save": False,
+        "process_id": process_id,
+        "exit_code": exit_code,
+        "requires_oom_classification": exit_code != 0,
+        "output_dir": str(Path(args.output_dir).resolve()),
+        "stdout_path": str(Path(args.stdout_path).resolve()),
+        "stderr_path": str(Path(args.stderr_path).resolve()),
+        "probe_rows": str(Path(args.probe_rows).resolve()),
+        "probe_row_indices": probe_indices,
+        "audit_digest": audit["audit_digest"],
+        "data_stat": audit["input_stat"],
+        "prerequisite_chain_digest": sealed_run["prerequisite_chain_digest"],
+        "command": command,
+        "launch_config": launch_config,
+        "config_digest": digest,
+    }
+    payload["attempt_digest"] = config_digest(payload)
+    attempt_dir = Path(args.attempt_dir)
+    attempt_path = _probe_attempt_path(attempt_dir)
+    if attempt_path.exists():
+        raise FileExistsError(f"probe attempts are append-only: {attempt_path}")
+    if len(attempt_dir.parents) >= 4 and attempt_dir.parents[2].name in {
+        "attempts",
+        "long-smoke",
+    }:
+        probe_root = attempt_dir.parents[3]
+        for previous_path in _attempt_files(probe_root, method):
+            previous = _load_probe_attempt(previous_path)
+            if previous["process_id"] == process_id:
+                raise RuntimeError(
+                    f"probe process ID was reused instead of remaining unique: {process_id}"
+                )
+    _atomic_write_json(attempt_path, payload)
+    return payload
+
+
+def _load_probe_attempt(path: Path) -> dict[str, object]:
+    if path.is_dir():
+        path = _probe_attempt_path(path)
+    payload = _read_json_once(path)
+    if type(payload) is not dict or payload.get("kind") != "stage1-probe-attempt":
+        raise ValueError(f"invalid Stage 1 probe attempt: {path}")
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "kind",
+            "attempt_id",
+            "recorded_at_ns",
+            "status",
+            "method",
+            "micro_batch",
+            "world_size",
+            "gradient_accumulation_steps",
+            "effective_global_batch",
+            "max_steps",
+            "final_save",
+            "process_id",
+            "exit_code",
+            "requires_oom_classification",
+            "output_dir",
+            "stdout_path",
+            "stderr_path",
+            "probe_rows",
+            "probe_row_indices",
+            "audit_digest",
+            "data_stat",
+            "prerequisite_chain_digest",
+            "command",
+            "launch_config",
+            "config_digest",
+            "attempt_digest",
+        },
+        "Stage 1 probe attempt",
+    )
+    for name in (
+        "schema_version",
+        "recorded_at_ns",
+        "micro_batch",
+        "world_size",
+        "gradient_accumulation_steps",
+        "effective_global_batch",
+        "max_steps",
+        "process_id",
+        "exit_code",
+    ):
+        _require_int(name, payload.get(name))
+    if payload["schema_version"] != _SCHEMA_VERSION:
+        raise ValueError("unsupported Stage 1 probe attempt schema")
+    _validated_method(payload.get("method"))
+    for name in (
+        "attempt_id", "status", "method", "output_dir", "stdout_path",
+        "stderr_path", "probe_rows",
+    ):
+        _require_string(name, payload.get(name))
+    if len(path.parents) >= 4 and path.name == "attempt.json":
+        attempt_dir = path.parents[1]
+        legacy_topology = (
+            path.parents[3].name == payload["method"]
+            and path.parents[2].name == f"micro-batch-{payload['micro_batch']}"
+            and attempt_dir.name == f"attempt-{payload['attempt_id']}"
+        )
+        canonical_output = Path(payload["output_dir"])
+        canonical_logs = (Path(payload["stdout_path"]), Path(payload["stderr_path"]))
+        canonical_topology = (
+            attempt_dir.name == "attempt-record"
+            and path.parents[2] == CANONICAL_RESULT_ROOT / canonical_output.name
+            and canonical_output.parent == CANONICAL_CHECKPOINT_ROOT
+            and all(
+                log.parent == CANONICAL_LOG_ROOT / canonical_output.name
+                for log in canonical_logs
+            )
+        )
+        if not (
+            (
+                legacy_topology
+                and canonical_output == (attempt_dir / "output").resolve()
+                and canonical_logs
+                == (
+                    (attempt_dir / "logs" / "stdout.log").resolve(),
+                    (attempt_dir / "logs" / "stderr.log").resolve(),
+                )
+            )
+            or canonical_topology
+        ):
+            raise ValueError("probe attempt path topology does not match sealed identity")
+    expected_status = "success" if payload["exit_code"] == 0 else "requires-classification"
+    if payload.get("status") != expected_status:
+        raise ValueError("probe attempt status does not match exit_code")
+    if type(payload.get("requires_oom_classification")) is not bool:
+        raise TypeError("requires_oom_classification must be a boolean")
+    if payload["requires_oom_classification"] is not (payload["exit_code"] != 0):
+        raise ValueError("probe classification requirement does not match exit_code")
+    _require_int("process_id", payload["process_id"], positive=True)
+    _require_int("recorded_at_ns", payload["recorded_at_ns"], positive=True)
+    _require_int("max_steps", payload["max_steps"], positive=True)
+    if type(payload.get("final_save")) is not bool:
+        raise TypeError("final_save must be a boolean")
+    _require_digest("config_digest", payload.get("config_digest"))
+    _require_digest("audit_digest", payload.get("audit_digest"))
+    if config_digest(payload.get("launch_config")) != payload["config_digest"]:
+        raise ValueError("probe attempt config digest mismatch")
+    _validate_probe_launch_config(payload["launch_config"])
+    _require_digest("attempt_digest", payload.get("attempt_digest"))
+    digest_input = dict(payload)
+    digest_input.pop("attempt_digest")
+    if config_digest(digest_input) != payload["attempt_digest"]:
+        raise ValueError("probe attempt digest mismatch")
+    if payload["effective_global_batch"] != (
+        payload["world_size"]
+        * payload["micro_batch"]
+        * payload["gradient_accumulation_steps"]
+    ):
+        raise ValueError("probe attempt effective_global_batch invariant failed")
+    if type(payload.get("command")) is not list or not all(
+        type(item) is str for item in payload["command"]
+    ):
+        raise TypeError("probe attempt command must be a string array")
+    for name in (
+        "method", "micro_batch", "world_size", "gradient_accumulation_steps",
+        "effective_global_batch", "max_steps", "final_save", "command",
+        "probe_row_indices", "audit_digest", "data_stat",
+        "prerequisite_chain_digest",
+    ):
+        if payload[name] != payload["launch_config"][name]:
+            raise ValueError(f"probe attempt duplicate field mismatch: {name}")
+    _validate_probe_argv(payload)
+    return payload
+
+
+_PROBE_REPOSITORY_RELATIVE_ARGV_FLAGS = frozenset(
+    {
+        "--data-path",
+        "--output-dir",
+        "--log-file",
+        "--benchmark-run-config",
+        "--producer-evidence",
+    }
+)
+
+
+def _probe_argv_path_matches_sealed_absolute(
+    value: str, expected: str
+) -> bool:
+    """Accept an absolute seal or its exact legacy repository-relative spelling."""
+
+    if value == expected:
+        return True
+    expected_path = Path(expected)
+    if not expected_path.is_absolute() or ".." in expected_path.parts:
+        return False
+    try:
+        repository_relative = expected_path.relative_to(_REPOSITORY_ROOT)
+    except ValueError:
+        return False
+    return value == str(repository_relative)
+
+
+def _validate_probe_argv(attempt: Mapping[str, object]) -> None:
+    command = attempt["command"]
+    if type(command) is not list or not command:
+        raise TypeError("probe attempt command must be a nonempty string array")
+    for index, item in enumerate(command):
+        _require_string(f"command[{index}]", item)
+    output_dir = Path(str(attempt["output_dir"]))
+    canonical_output = (
+        output_dir.parent.name == "zero-stage-compatibility"
+        and output_dir.parent.parent.name == "checkpoints"
+    )
+    if canonical_output:
+        repository = output_dir.parents[2]
+        log_path = (
+            repository / "logs" / "zero-stage-compatibility" / output_dir.name / "train.log"
+        )
+        result_dir = repository / "results" / "zero-stage-compatibility" / output_dir.name
+    else:
+        log_path = Path(str(attempt["stdout_path"])).with_name("train.log")
+        result_dir = output_dir.parent / "evidence"
+    flag_values = {
+        "--method": str(attempt["method"]),
+        "--model": str(attempt["launch_config"]["model"]),
+        "--source-data-path": str(attempt["launch_config"]["data_path"]),
+        "--data-path": str(attempt["launch_config"]["train_data_path"]),
+        "--image-root": str(attempt["launch_config"]["image_root"]),
+        "--output-dir": str(attempt["output_dir"]),
+        "--micro-batch": str(attempt["micro_batch"]),
+        "--epochs": "3",
+        "--learning-rate": str(attempt["launch_config"]["learning_rate"]),
+        "--gradient-accumulation": str(attempt["gradient_accumulation_steps"]),
+        "--seed": str(attempt["launch_config"]["seed"]),
+        "--deepspeed-config": str(attempt["launch_config"]["deepspeed_config"]),
+        "--attention-implementation": str(attempt["launch_config"]["attention_implementation"]),
+        "--save-strategy": "no",
+        "--log-file": str(log_path),
+        "--max-steps": str(attempt["max_steps"]),
+        "--benchmark-run-config": str(result_dir / "run-config.json"),
+        "--producer-evidence": str(result_dir / "producer-evidence.json"),
+    }
+    allowed = set(flag_values) | {"--no-final-save"}
+    seen: set[str] = set()
+    index = 1
+    while index < len(command):
+        flag = command[index]
+        if flag == "--no-final-save":
+            if flag in seen:
+                raise ValueError("probe argv repeats --no-final-save")
+            seen.add(flag)
+            index += 1
+            continue
+        if flag not in allowed or flag == "--no-final-save":
+            raise ValueError(f"probe argv contains an unsupported flag: {flag}")
+        if flag in seen or index + 1 >= len(command):
+            raise ValueError(f"probe argv has a repeated or valueless flag: {flag}")
+        value = command[index + 1]
+        _require_string(f"argv value for {flag}", value)
+        if flag in flag_values:
+            expected = flag_values[flag]
+            if flag == "--learning-rate":
+                if float(value) != float(expected):
+                    raise ValueError(f"probe argv value mismatch for {flag}")
+            elif flag in _PROBE_REPOSITORY_RELATIVE_ARGV_FLAGS:
+                if not _probe_argv_path_matches_sealed_absolute(value, expected):
+                    if flag == "--data-path":
+                        raise ValueError(
+                            "probe --data-path must equal the materialized audited probe input"
+                        )
+                    raise ValueError(f"probe argv value mismatch for {flag}")
+            elif value != expected:
+                raise ValueError(f"probe argv value mismatch for {flag}")
+        seen.add(flag)
+        index += 2
+    if seen != allowed:
+        raise ValueError(f"probe argv flag set mismatch: missing={sorted(allowed - seen)}")
+
+
+def _validate_probe_launch_config(payload: object) -> None:
+    _require_exact_keys(
+        payload,
+        {
+            "method",
+            "micro_batch",
+            "world_size",
+            "gradient_accumulation_steps",
+            "effective_global_batch",
+            "learning_rate",
+            "seed",
+            "max_steps",
+            "final_save",
+            "model",
+            "tuning_config",
+            "data_path",
+            "train_data_path",
+            "data_stat",
+            "image_root",
+            "deepspeed_config",
+            "deepspeed_config_digest",
+            "attention_implementation",
+            "probe_rows",
+            "probe_row_indices",
+            "audit_digest",
+            "run_config_digest",
+            "prerequisite_chain_digest",
+            "prerequisite_chain",
+            "command",
+        },
+        "probe launch config",
+    )
+    _validated_method(payload.get("method"))
+    for name in (
+        "micro_batch",
+        "world_size",
+        "gradient_accumulation_steps",
+        "effective_global_batch",
+        "max_steps",
+    ):
+        _require_int(name, payload.get(name), positive=True)
+    _require_int("seed", payload.get("seed"))
+    if type(payload.get("learning_rate")) is not float or not math.isfinite(
+        payload["learning_rate"]
+    ) or payload["learning_rate"] <= 0:
+        raise ValueError("probe learning_rate must be a positive finite float")
+    if payload.get("final_save") is not False:
+        raise ValueError("probe launch config must disable final save")
+    for name in (
+        "model",
+        "data_path",
+        "train_data_path",
+        "image_root",
+        "deepspeed_config",
+        "attention_implementation",
+        "probe_rows",
+    ):
+        _require_string(name, payload.get(name))
+    for name in (
+        "audit_digest", "deepspeed_config_digest", "run_config_digest",
+        "prerequisite_chain_digest",
+    ):
+        _require_digest(name, payload.get(name))
+    _require_string("prerequisite_chain", payload.get("prerequisite_chain"))
+    tuning = payload.get("tuning_config")
+    if payload["method"] == "full" and tuning is not None:
+        raise ValueError("full probe config must not contain DoRA tuning")
+    if payload["method"] == "dora" and type(tuning) is not dict:
+        raise ValueError("DoRA probe config requires tuning settings")
+    stat_witness = payload.get("data_stat")
+    _require_exact_keys(
+        stat_witness, {"device", "inode", "size", "mtime_ns"}, "probe data stat witness"
+    )
+    for name, value in stat_witness.items():
+        _require_int(f"data_stat.{name}", value)
+    indices = payload.get("probe_row_indices")
+    if type(indices) is not list or not indices:
+        raise ValueError("probe_row_indices must be a nonempty array")
+    for index, value in enumerate(indices):
+        _require_int(f"probe_row_indices[{index}]", value)
+    if type(payload.get("command")) is not list or not payload["command"] or not all(
+        type(item) is str for item in payload["command"]
+    ):
+        raise TypeError("probe launch config command must be a nonempty string array")
+    if payload["effective_global_batch"] != (
+        payload["micro_batch"]
+        * payload["world_size"]
+        * payload["gradient_accumulation_steps"]
+    ):
+        raise ValueError("probe launch config effective batch invariant failed")
+
+
+def _classification_path(attempt_path: Path) -> Path:
+    if attempt_path.is_dir():
+        return attempt_path / "evidence" / "failure-classification.json"
+    return attempt_path.parent / "failure-classification.json"
+
+
+def _classify_failure(attempt_path: Path, classification: str) -> None:
+    attempt = _load_probe_attempt(attempt_path)
+    if attempt["exit_code"] == 0:
+        raise ValueError("a successful probe attempt cannot be classified as a failure")
+    if classification not in {"capacity_oom", "integration_failure"}:
+        raise ValueError("unsupported probe failure classification")
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-probe-failure-classification",
+        "classification": classification,
+        "method": attempt["method"],
+        "micro_batch": attempt["micro_batch"],
+        "attempt_config_digest": attempt["config_digest"],
+        "attempt_digest": attempt["attempt_digest"],
+    }
+    payload["classification_digest"] = config_digest(payload)
+    path = _classification_path(attempt_path)
+    try:
+        _exclusive_write_json(path, payload)
+    except FileExistsError:
+        if _read_json_once(path) != payload:
+            raise FileExistsError(
+                f"different failure classification already exists: {path}"
+            ) from None
+
+
+def _probe_execution_lock_identity(fd: int, path: Path) -> tuple[os.stat_result, Path]:
+    fd = _require_int("probe lock fd", fd, positive=True)
+    path = Path(os.path.abspath(path))
+    opened = os.fstat(fd)
+    try:
+        named = os.stat(path, follow_symlinks=False)
+    except OSError as error:
+        raise ValueError("probe execution lock path is invalid") from error
+    if (
+        not stat_module.S_ISREG(opened.st_mode)
+        or not stat_module.S_ISREG(named.st_mode)
+        or opened.st_nlink != 1
+        or named.st_nlink != 1
+        or not _same_file_identity(opened, named)
+    ):
+        raise ValueError("probe execution lock must be one mode-0600 regular file")
+    return opened, path
+
+
+def _validate_probe_execution_lock(fd: int, path: Path) -> None:
+    opened, _ = _probe_execution_lock_identity(fd, path)
+    if stat_module.S_IMODE(opened.st_mode) != 0o600:
+        raise ValueError("probe execution lock must be one mode-0600 regular file")
+
+
+def _acquire_probe_execution_lock(fd: int, path: Path) -> None:
+    """Acquire one controller lease on the Bash-owned open file description."""
+
+    opened, path = _probe_execution_lock_identity(fd, path)
+    os.fchmod(fd, 0o600)
+    opened = os.fstat(fd)
+    if stat_module.S_IMODE(opened.st_mode) != 0o600:
+        raise ValueError("probe execution lock must be one mode-0600 regular file")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as error:
+        raise RuntimeError(f"probe execution is in progress: {path.parent}") from error
+    _validate_probe_execution_lock(fd, path)
+
+
+def _failure_classification(attempt_path: Path) -> str | None:
+    attempt = _load_probe_attempt(attempt_path)
+    path = _classification_path(attempt_path)
+    if not path.is_file():
+        return None
+    classification = _read_json_once(path)
+    _require_exact_keys(
+        classification,
+        {"schema_version", "kind", "classification", "method", "micro_batch",
+         "attempt_config_digest", "attempt_digest", "classification_digest"},
+        "probe failure classification",
+    )
+    claimed = classification.get("classification_digest")
+    _require_digest("classification_digest", claimed)
+    digest_input = dict(classification)
+    digest_input.pop("classification_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("probe failure classification digest mismatch")
+    value = classification.get("classification")
+    if value not in {"capacity_oom", "integration_failure"}:
+        raise ValueError("unsupported probe failure classification")
+    if not (
+        classification.get("schema_version") == _SCHEMA_VERSION
+        and classification.get("kind") == "stage1-probe-failure-classification"
+        and classification.get("method") == attempt["method"]
+        and classification.get("micro_batch") == attempt["micro_batch"]
+        and classification.get("attempt_config_digest") == attempt["config_digest"]
+        and classification.get("attempt_digest") == attempt["attempt_digest"]
+    ):
+        raise ValueError("probe failure classification does not match its attempt")
+    return value
+
+
+def _confirmed_capacity_oom(attempt_path: Path) -> bool:
+    return _failure_classification(attempt_path) == "capacity_oom"
+
+
+def _attempt_files(probe_dir: Path, method: str | None = None) -> list[Path]:
+    pattern = "attempts/*/micro-batch-*/attempt-*/evidence/attempt.json"
+    paths = list(probe_dir.glob(pattern))
+    for pointer_path in (Path(probe_dir) / "attempt-index").glob("*.json"):
+        if pointer_path.is_symlink() or not pointer_path.is_file():
+            raise ValueError(f"unsafe probe attempt pointer: {pointer_path}")
+        pointer = _read_json_once(pointer_path)
+        _require_exact_keys(
+            pointer,
+            {
+                "schema_version",
+                "kind",
+                "attempt_path",
+                "attempt_digest",
+                "pointer_digest",
+            },
+            "probe attempt pointer",
+        )
+        claimed_pointer_digest = _require_digest(
+            "pointer_digest", pointer["pointer_digest"]
+        )
+        pointer_input = dict(pointer)
+        pointer_input.pop("pointer_digest")
+        if config_digest(pointer_input) != claimed_pointer_digest:
+            raise ValueError("probe attempt pointer digest mismatch")
+        attempt_path = Path(_require_string("attempt_path", pointer["attempt_path"]))
+        attempt = _load_probe_attempt(attempt_path)
+        if attempt["attempt_digest"] != _require_digest(
+            "attempt_digest", pointer["attempt_digest"]
+        ):
+            raise ValueError("probe attempt pointer does not match attempt digest")
+        paths.append(attempt_path)
+    paths = list(dict.fromkeys(paths))
+    attempts: list[tuple[int, Path]] = []
+    for path in paths:
+        attempt = _load_probe_attempt(path)
+        if method is None or attempt["method"] == method:
+            attempts.append((attempt["recorded_at_ns"], path))
+    attempts.sort(key=lambda item: item[0])
+    return [path for _, path in attempts]
+
+
+def _register_probe_attempt(probe_dir: Path, attempt_path: Path) -> Path:
+    """Publish a small controller-local pointer to canonical per-run evidence."""
+    attempt_path = Path(attempt_path)
+    if attempt_path.is_symlink() or not attempt_path.is_file():
+        raise ValueError(f"probe attempt must be a real file: {attempt_path}")
+    resolved_attempt = attempt_path.resolve(strict=True)
+    result_root = CANONICAL_RESULT_ROOT.resolve(strict=False)
+    result_dir = resolved_attempt.parents[2]
+    if (
+        resolved_attempt.name != "attempt.json"
+        or resolved_attempt.parent.name != "evidence"
+        or resolved_attempt.parents[1].name != "attempt-record"
+        or result_dir.parent.resolve(strict=False) != result_root
+        or result_dir.is_symlink()
+    ):
+        raise ValueError(
+            "probe attempt pointer requires canonical per-run result evidence"
+        )
+    attempt = _load_probe_attempt(resolved_attempt)
+    for previous_path in _attempt_files(Path(probe_dir), attempt["method"]):
+        previous = _load_probe_attempt(previous_path)
+        if previous["process_id"] == attempt["process_id"]:
+            raise RuntimeError(
+                "probe process ID was reused instead of remaining unique: "
+                f'{attempt["process_id"]}'
+            )
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-probe-attempt-pointer",
+        "attempt_path": str(resolved_attempt),
+        "attempt_digest": attempt["attempt_digest"],
+    }
+    payload["pointer_digest"] = config_digest(payload)
+    pointer = (
+        Path(probe_dir)
+        / "attempt-index"
+        / f'{attempt["attempt_digest"]}.json'
+    )
+    _exclusive_write_json(pointer, payload)
+    return pointer
+
+
+def _validated_capacity_chain(
+    attempts: Sequence[tuple[Path, dict[str, object]]], *, require_success: bool
+) -> tuple[tuple[Path, dict[str, object]] | None, tuple[Path, dict[str, object]] | None]:
+    if not attempts:
+        if require_success:
+            raise ValueError("capacity chain contains no attempts")
+        return None, None
+    timestamps = [attempt["recorded_at_ns"] for _, attempt in attempts]
+    if len(set(timestamps)) != len(timestamps) or timestamps != sorted(timestamps):
+        raise ValueError("capacity chain does not have one strict recorded order")
+    fingerprint_names = (
+        "method", "world_size", "gradient_accumulation_steps", "learning_rate",
+        "seed", "model", "data_path", "train_data_path", "data_stat", "image_root",
+        "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
+        "probe_rows", "probe_row_indices", "audit_digest", "tuning_config",
+        "prerequisite_chain", "prerequisite_chain_digest",
+    )
+    first_config = attempts[0][1]["launch_config"]
+    for _, attempt in attempts[1:]:
+        for name in fingerprint_names:
+            if attempt["launch_config"][name] != first_config[name]:
+                raise ValueError(f"capacity chain changes immutable field: {name}")
+    capacity_attempts: list[tuple[Path, dict[str, object]]] = []
+    pending_retry: int | None = None
+    for path, attempt in attempts:
+        if pending_retry is not None and attempt["micro_batch"] != pending_retry:
+            raise ValueError(
+                "an integration failure must be retried at the same candidate"
+            )
+        classification = None
+        if attempt["exit_code"] != 0 and _classification_path(path).is_file():
+            classification = _failure_classification(path)
+        if classification == "integration_failure":
+            pending_retry = attempt["micro_batch"]
+            continue
+        pending_retry = None
+        capacity_attempts.append((path, attempt))
+    if pending_retry is not None and require_success:
+        raise ValueError(
+            "integration failure requires an append-only retry at the same candidate"
+        )
+    if not capacity_attempts:
+        if require_success:
+            raise ValueError("capacity chain contains no successful candidate")
+        return None, None
+    batches = [attempt["micro_batch"] for _, attempt in capacity_attempts]
+    if len(set(batches)) != len(batches):
+        raise ValueError("capacity chain contains a duplicate candidate")
+    if batches[0] != 8:
+        raise ValueError("capacity chain must start at batch 8")
+    selected = None
+    first_failure = None
+    if capacity_attempts[0][1]["exit_code"] == 0:
+        expected = 8
+        for index, item in enumerate(capacity_attempts):
+            _, attempt = item
+            if attempt["micro_batch"] != expected:
+                raise ValueError("ascending capacity chain skips or reorders a candidate")
+            if attempt["exit_code"] != 0:
+                first_failure = item
+                if index != len(capacity_attempts) - 1:
+                    raise ValueError("capacity chain launches after its first failure")
+            else:
+                if first_failure is not None:
+                    raise ValueError("capacity chain records success after first failure")
+                selected = item
+            expected *= 2
+    else:
+        expected_order = (8, 4, 2, 1)
+        for index, item in enumerate(capacity_attempts):
+            _, attempt = item
+            if index >= len(expected_order) or attempt["micro_batch"] != expected_order[index]:
+                raise ValueError("fallback capacity chain skips or reorders a candidate")
+            if index == 0:
+                first_failure = item
+            if attempt["exit_code"] == 0:
+                selected = item
+                if index != len(capacity_attempts) - 1:
+                    raise ValueError("fallback capacity chain launches after success")
+            elif selected is not None:
+                raise ValueError("fallback capacity chain launches after success")
+    if require_success and selected is None:
+        raise ValueError("capacity chain contains no successful candidate")
+    return selected, first_failure
+
+
+def _require_candidate(probe_dir: Path, method: str, candidate: int) -> str:
+    method = _validated_method(method)
+    candidate = _require_int("candidate", candidate, positive=True)
+    attempts = [
+        (path, _load_probe_attempt(path)) for path in _attempt_files(probe_dir, method)
+    ]
+    selected, _ = _validated_capacity_chain(attempts, require_success=False)
+    if not attempts:
+        if candidate != 8:
+            raise ValueError("first capacity candidate must be 8")
+        return "confirmed-candidate"
+    capacity_attempts = [
+        (path, attempt)
+        for path, attempt in attempts
+        if not (
+            attempt["exit_code"] != 0
+            and _classification_path(path).is_file()
+            and _failure_classification(path) == "integration_failure"
+        )
+    ]
+    if any(
+        attempt["exit_code"] == 0 and attempt["micro_batch"] == candidate
+        for _, attempt in capacity_attempts
+    ):
+        return "already-successful"
+    last_path, last = attempts[-1]
+    if last["exit_code"] != 0:
+        classification = _failure_classification(last_path)
+        if classification == "integration_failure":
+            if not capacity_attempts:
+                expected = 8
+            elif capacity_attempts[0][1]["exit_code"] == 0:
+                if capacity_attempts[-1][1]["exit_code"] != 0:
+                    expected = None
+                else:
+                    expected = capacity_attempts[-1][1]["micro_batch"] * 2
+            elif capacity_attempts[-1][1]["exit_code"] != 0:
+                expected = {8: 4, 4: 2, 2: 1}.get(
+                    capacity_attempts[-1][1]["micro_batch"]
+                )
+            else:
+                expected = None
+            if candidate != last["micro_batch"] or candidate != expected:
+                raise ValueError(
+                    "integration failure retry must use the same next candidate"
+                )
+            return "confirmed-candidate"
+        if classification != "capacity_oom":
+            raise ValueError("next candidate requires classification of the prior failure")
+        if batches := [item[1]["micro_batch"] for item in capacity_attempts]:
+            expected = {8: 4, 4: 2, 2: 1}.get(batches[-1])
+        if (
+            batches[0] != 8
+            or capacity_attempts[0][1]["exit_code"] == 0
+            or candidate != expected
+        ):
+            raise ValueError("no launch is allowed after the first ascending failure")
+        return "confirmed-candidate"
+    if capacity_attempts[0][1]["exit_code"] != 0:
+        raise ValueError("fallback search stops at its first success")
+    expected = last["micro_batch"] * 2
+    if candidate != expected:
+        raise ValueError(f"next ascending candidate must be {expected}")
+    return "confirmed-candidate"
+
+
+def _require_initial_oom(probe_dir: Path, method: str) -> Path:
+    method = _validated_method(method)
+    matches = []
+    for path in _attempt_files(probe_dir, method):
+        attempt = _load_probe_attempt(path)
+        if (
+            attempt["micro_batch"] == 8
+            and attempt["exit_code"] != 0
+            and _confirmed_capacity_oom(path)
+        ):
+            matches.append(path)
+    if len(matches) != 1:
+        raise ValueError(
+            "fallback requires exactly one initial batch 8 failure with a confirmed "
+            "capacity_oom classification"
+        )
+    return matches[0]
+
+
+def _require_fallback(probe_dir: Path, method: str, candidate: int) -> None:
+    candidate = _require_int("fallback", candidate, positive=True)
+    if candidate not in {4, 2, 1}:
+        raise ValueError("fallback must be 4, 2, or 1")
+    required_failures = {4: (8,), 2: (8, 4), 1: (8, 4, 2)}[candidate]
+    attempts = [
+        (path, _load_probe_attempt(path)) for path in _attempt_files(probe_dir, method)
+    ]
+    for required_batch in required_failures:
+        matches = [
+            (path, attempt)
+            for path, attempt in attempts
+            if attempt["micro_batch"] == required_batch
+            and not (
+                attempt["exit_code"] != 0
+                and _classification_path(path).is_file()
+                and _failure_classification(path) == "integration_failure"
+            )
+        ]
+        if len(matches) != 1:
+            raise ValueError(
+                f"fallback {candidate} requires exactly one prior batch "
+                f"{required_batch} attempt"
+            )
+        path, attempt = matches[0]
+        if attempt["exit_code"] == 0 or not _confirmed_capacity_oom(path):
+            raise ValueError(
+                f"fallback {candidate} requires batch {required_batch} to be a "
+                "confirmed capacity OOM"
+            )
+
+
+def _validated_method(value: object) -> str:
+    if type(value) is not str or value not in {"full", "dora"}:
+        raise ValueError("method must be full or dora")
+    return value
+
+
+def _smoke_run_config(
+    *,
+    method: str,
+    model: str,
+    data_path: Path,
+    image_root: Path,
+    output_dir: Path,
+    micro_batch: int,
+    gradient_accumulation_steps: int,
+    world_size: int,
+    resumed_max_steps: int,
+    deepspeed_config: Path,
+    audit_path: Path,
+) -> dict[str, object]:
+    audit = _load_bound_audit(
+        audit_path, data_path=data_path, image_root=image_root, count=64
+    )
+    config = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-smoke-run-manifest",
+        "method": method,
+        "tuning_config": None if method == "full" else {
+            "use_dora": True,
+            "rank": 32,
+            "alpha": 64,
+            "dropout": 0.05,
+            "target_modules": (
+                "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
+            ),
+        },
+        "model": model,
+        "source_data_path": str(data_path),
+        "data_path": str(data_path),
+        "data_stat": audit["input_stat"],
+        "image_root": str(image_root),
+        "output_dir": str(output_dir),
+        "micro_batch": micro_batch,
+        "world_size": world_size,
+        "gradient_accumulation_steps": gradient_accumulation_steps,
+        "effective_global_batch": (
+            micro_batch * world_size * gradient_accumulation_steps
+        ),
+        "epochs": 3,
+        "learning_rate": 1e-5,
+        "seed": 42,
+        "max_steps": resumed_max_steps,
+        "final_save": False,
+        "deepspeed_config": str(deepspeed_config),
+        "deepspeed_config_digest": _small_config_digest(deepspeed_config),
+        "attention_implementation": "flash_attention_2",
+        "save_strategy": "no",
+        "audit_digest": audit["audit_digest"],
+        "probe_rows": str(audit_path),
+        "probe_row_indices": [
+            row["source_row_index"] for row in audit["selected_rows"]
+        ],
+        "maximum_config_digest": None,
+        "prerequisite_chain_digest": None,
+        "prerequisite_chain": None,
+    }
+    config["config_digest"] = config_digest(config)
+    _validate_producer_run_config_payload(config)
+    return config
+
+
+def _run_smoke_launcher(
+    launcher: Path,
+    arguments: Sequence[str],
+    *,
+    log_path: Path,
+) -> None:
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    environment = os.environ.copy()
+    repository = Path(__file__).resolve().parents[2]
+    python_paths = (
+        str(repository),
+        str(repository / "transformers/src"),
+        str(repository / "src"),
+    )
+    existing = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        (*python_paths, *((existing,) if existing else ()))
+    )
+    venv_bin = repository / "venv/ilvr-venv/bin"
+    environment["PATH"] = os.pathsep.join(
+        (str(venv_bin), environment.get("PATH", ""))
+    )
+    with log_path.open("wb") as log:
+        completed = subprocess.run(
+            [str(launcher), *arguments],
+            cwd=repository,
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+    if completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode, [str(launcher), *arguments]
+        )
+
+
+def _distributed_smoke_result(
+    evidence: Stage1BenchmarkEvidence, seal: Mapping[str, object]
+) -> DistributedSmokeWitness:
+    summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
+    if (
+        evidence.status != "success"
+        or evidence.method != seal["run_config"]["method"]
+        or evidence.micro_batch != summary["batch_size_observed"]
+        or evidence.world_size != 2
+    ):
+        raise ValueError("distributed smoke evidence does not match its request")
+    return DistributedSmokeWitness(
+        initial_final_step=summary["initial_final_step"],
+        resume_initial_step=summary["resume_initial_step"],
+        resume_final_step=summary["resume_final_step"],
+        batch_size_observed=summary["batch_size_observed"],
+        finite_loss=summary["finite_loss"],
+        checkpoint_validated=summary["checkpoint_validated"],
+    )
+
+
+def _load_canonical_smoke_evidence(
+    evidence_path: Path,
+) -> tuple[Stage1BenchmarkEvidence, dict[str, object], dict[str, object]] | None:
+    raw = _read_canonical_evidence_json(evidence_path, missing_ok=True)
+    if raw is None:
+        return None
+    if type(raw) is not dict or raw.get("kind") != _SMOKE_REGISTRY_KIND:
+        raise ValueError("canonical smoke evidence must be a registry envelope")
+    evidence, seal, _ = _validate_smoke_registry_payload(raw, evidence_path)
+    return evidence, seal, raw["request_provenance"]
+
+
+def _matching_canonical_smoke_result(
+    evidence_path: Path,
+    *,
+    method: str,
+    model: str,
+    micro_batch: int,
+    gradient_accumulation_steps: int,
+    world_size: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+    requested_paths: Mapping[str, str],
+) -> DistributedSmokeWitness | None:
+    loaded = _load_canonical_smoke_evidence(evidence_path)
+    if loaded is None:
+        return None
+    evidence, seal, provenance = loaded
+    config = seal["run_config"]
+    summary = _validate_smoke_resume_witness(seal["smoke_resume_witness"])
+    if (
+        evidence.status != "success"
+        or evidence.method != method
+        or evidence.micro_batch != micro_batch
+        or evidence.world_size != world_size
+        or config["method"] != method
+        or config["model"] != model
+        or config["micro_batch"] != micro_batch
+        or config["gradient_accumulation_steps"]
+        != gradient_accumulation_steps
+        or config["world_size"] != world_size
+        or summary["initial_final_step"] != initial_max_steps
+        or summary["resume_final_step"] != resumed_max_steps
+        or any(provenance[name] != value for name, value in requested_paths.items())
+    ):
+        raise FileExistsError(
+            "canonical smoke evidence belongs to a different semantic request"
+        )
+    return _distributed_smoke_result(evidence, seal)
+
+
+def run_or_load_distributed_witness(
+    *,
+    method: str,
+    model: str,
+    data_path: str | Path,
+    image_root: str | Path,
+    micro_batch: int,
+    gradient_accumulation_steps: int,
+    world_size: int,
+    initial_max_steps: int,
+    resumed_max_steps: int,
+    deepspeed_config: str | Path,
+    evidence_dir: str | Path,
+    launcher_path: str | Path | None = None,
+) -> DistributedSmokeWitness:
+    """Run one exact 3->4 two-rank smoke, or reuse its sealed small witness."""
+
+    method = _validated_method(method)
+    model = _require_string("model", model)
+    micro_batch = _require_int("micro_batch", micro_batch, positive=True)
+    accumulation = _require_int(
+        "gradient_accumulation_steps",
+        gradient_accumulation_steps,
+        positive=True,
+    )
+    world_size = _require_int("world_size", world_size, positive=True)
+    initial_max_steps = _require_int(
+        "initial_max_steps", initial_max_steps, positive=True
+    )
+    resumed_max_steps = _require_int(
+        "resumed_max_steps", resumed_max_steps, positive=True
+    )
+    if (micro_batch, accumulation, world_size, initial_max_steps, resumed_max_steps) != (
+        2,
+        2,
+        2,
+        3,
+        4,
+    ):
+        raise ValueError(
+            "distributed smoke requires micro-batch 2, accumulation 2, "
+            "world-size 2, and exact 3-to-4 steps"
+        )
+    evidence_directory = Path(os.path.abspath(evidence_dir))
+    if evidence_directory.name != method:
+        raise ValueError("smoke evidence directory basename must match method")
+    repository = _repository_path_without_io()
+    requested_paths = _requested_smoke_paths(
+        repository=repository,
+        data_path=data_path,
+        image_root=image_root,
+        deepspeed_config=deepspeed_config,
+        launcher_path=launcher_path,
+    )
+    evidence_path = evidence_directory / "evidence.json"
+    expected_scalars = {
+        "method": method,
+        "model": model,
+        "micro_batch": micro_batch,
+        "gradient_accumulation_steps": accumulation,
+        "world_size": world_size,
+        "initial_max_steps": initial_max_steps,
+        "resumed_max_steps": resumed_max_steps,
+        "requested_paths": requested_paths,
+    }
+    if (
+        reused := _matching_canonical_smoke_result(
+            evidence_path, **expected_scalars
+        )
+    ) is not None:
+        return reused
+
+    with _smoke_execution_lease(evidence_directory) as execution_lease:
+        if (
+            reused := _matching_canonical_smoke_result(
+                evidence_path, **expected_scalars
+            )
+        ) is not None:
+            return reused
+
+        data = Path(data_path).resolve(strict=True)
+        images = Path(image_root).resolve(strict=True)
+        deepspeed = Path(deepspeed_config)
+        if not deepspeed.is_absolute():
+            deepspeed = repository / deepspeed
+        deepspeed = deepspeed.resolve(strict=True)
+        audit_path = evidence_directory.parent / "high-cost-rows.json"
+        select_high_cost_probe_rows(data, 64, audit_path, image_root=images)
+
+        attempt = _allocate_smoke_attempt(
+            evidence_directory, lease=execution_lease
+        )
+        run_dir = attempt / "run"
+        checkpoint = run_dir / f"checkpoint-{initial_max_steps}"
+        marker_path = attempt / _SMOKE_MARKER_FILENAME
+        run_config_path = attempt / "run-config.json"
+        attempt_evidence_path = attempt / "evidence.json"
+        config = _smoke_run_config(
+            method=method,
+            model=model,
+            data_path=data,
+            image_root=images,
+            output_dir=run_dir,
+            micro_batch=micro_batch,
+            gradient_accumulation_steps=accumulation,
+            world_size=world_size,
+            resumed_max_steps=resumed_max_steps,
+            deepspeed_config=deepspeed,
+            audit_path=audit_path,
+        )
+        launcher = (
+            repository / "run_stage1_training.sh"
+            if launcher_path is None
+            else Path(launcher_path)
+        ).resolve(strict=True)
+        common = [
+            "--method", method,
+            "--model", model,
+            "--data-path", str(data),
+            "--image-root", str(images),
+            "--output-dir", str(run_dir),
+            "--micro-batch", str(micro_batch),
+            "--epochs", "3",
+            "--learning-rate", "1e-5",
+            "--gradient-accumulation", str(accumulation),
+            "--seed", "42",
+            "--deepspeed-config", str(deepspeed),
+            "--attention-implementation", "flash_attention_2",
+        ]
+        _validate_smoke_execution_lease(execution_lease)
+        _run_smoke_launcher(
+            launcher,
+            [
+                *common,
+                "--save-strategy", "steps",
+                "--save-steps", str(initial_max_steps),
+                "--max-steps", str(initial_max_steps),
+                "--no-final-save",
+            ],
+            log_path=attempt / "initial.log",
+        )
+        _validate_smoke_execution_lease(execution_lease)
+        checkpoint_snapshot = seal_stage1_smoke_checkpoint(
+            checkpoint,
+            method=method,
+            micro_batch=micro_batch,
+            world_size=world_size,
+            initial_max_steps=initial_max_steps,
+            resumed_max_steps=resumed_max_steps,
+            marker_path=marker_path,
+        )
+        _atomic_write_json(run_config_path, config)
+        _validate_smoke_execution_lease(execution_lease)
+        _run_smoke_launcher(
+            launcher,
+            [
+                *common,
+                "--source-data-path", str(data),
+                "--save-strategy", "no",
+                "--save-steps", "612",
+                "--resume", str(checkpoint),
+                "--max-steps", str(resumed_max_steps),
+                "--benchmark-run-config", str(run_config_path),
+                "--producer-evidence", str(attempt_evidence_path),
+                "--smoke-resume-witness", str(marker_path),
+                "--no-final-save",
+            ],
+            log_path=attempt / "resume.log",
+        )
+        _validate_smoke_execution_lease(execution_lease)
+        produced, seal = _load_producer_evidence(attempt_evidence_path)
+        if produced.config_digest != config["config_digest"]:
+            raise RuntimeError("distributed smoke did not publish matching evidence")
+        registry = _smoke_registry_payload(
+            attempt=attempt,
+            evidence_directory=evidence_directory,
+            producer=seal,
+            checkpoint_marker=checkpoint_snapshot.payload(),
+            requested_paths=requested_paths,
+        )
+        _validate_smoke_registry_payload(registry, evidence_path)
+        _validate_smoke_execution_lease(execution_lease)
+        try:
+            _exclusive_write_json_at(
+                execution_lease.directory_fd,
+                evidence_path.name,
+                registry,
+            )
+        except FileExistsError:
+            _validate_smoke_execution_lease(execution_lease)
+            reused = _matching_canonical_smoke_result(
+                evidence_path, **expected_scalars
+            )
+            if reused is None:  # pragma: no cover - colliding inode must exist.
+                raise RuntimeError("canonical smoke evidence disappeared")
+            return reused
+        _validate_smoke_execution_lease(execution_lease)
+        return _distributed_smoke_result(produced, seal)
+
+
+def _load_evidence_without_expected(path: Path) -> Stage1BenchmarkEvidence:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    evidence, _ = _load_producer_evidence(path)
+    return evidence
+
+
+def _check_evidence(args: argparse.Namespace) -> str:
+    method = _validated_method(args.method)
+    directory = Path(os.path.abspath(args.evidence_dir))
+    if directory.name != method:
+        raise ValueError("smoke evidence directory basename must match method")
+    path = directory / "evidence.json"
+    loaded = _load_canonical_smoke_evidence(path)
+    if loaded is None:
+        return "missing"
+    evidence, seal, _ = loaded
+    if seal["run_config"]["kind"] != "stage1-smoke-run-manifest":
+        raise ValueError("check-evidence accepts only Task 15 smoke evidence")
+    _validate_smoke_resume_witness(seal["smoke_resume_witness"])
+    if (
+        evidence.status == "success"
+        and evidence.method == method
+        and evidence.micro_batch == args.micro_batch
+        and evidence.world_size == args.world_size
+    ):
+        return "reusable-success"
+    return "missing"
+
+
+def _build_smoke_prerequisite_chain(
+    loaded: Sequence[tuple[Stage1BenchmarkEvidence, dict[str, object]]],
+) -> dict[str, object]:
+    evidences = [item[0] for item in loaded]
+    if len(evidences) != 2 or {item.method for item in evidences} != {"full", "dora"}:
+        raise ValueError("required evidence must be an exact full/DoRA pair")
+    by_method = {item[0].method: item for item in loaded}
+    for method, (evidence, seal) in by_method.items():
+        if seal["run_config"].get("kind") != "stage1-smoke-run-manifest":
+            raise ValueError("required evidence must be Task 15 smoke evidence")
+        _validate_smoke_resume_witness(seal.get("smoke_resume_witness"))
+        if evidence.micro_batch != 2 or evidence.world_size != 2:
+            raise ValueError("smoke prerequisite must use two ranks at micro-batch 2")
+    identity_names = (
+        "model", "source_data_path", "data_stat", "image_root", "world_size",
+        "gradient_accumulation_steps", "epochs", "learning_rate", "seed",
+        "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
+        "save_strategy", "audit_digest", "probe_row_indices",
+    )
+    full_config = by_method["full"][1]["run_config"]
+    dora_config = by_method["dora"][1]["run_config"]
+    shared_identity = {}
+    for name in identity_names:
+        if full_config.get(name) != dora_config.get(name):
+            raise ValueError(f"smoke prerequisite pair changes controlled field: {name}")
+        shared_identity[name] = full_config[name]
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-smoke-prerequisite-chain",
+        "shared_identity": shared_identity,
+        "shared_identity_digest": config_digest(shared_identity),
+        "producer_digests": {
+            method: by_method[method][1]["producer_digest"]
+            for method in ("full", "dora")
+        },
+        "resume_witness_digests": {
+            method: by_method[method][1]["smoke_resume_witness_digest"]
+            for method in ("full", "dora")
+        },
+    }
+    payload["prerequisite_chain_digest"] = config_digest(payload)
+    return payload
+
+
+def _require_evidence(paths: Sequence[str]) -> dict[str, object]:
+    loaded = []
+    for raw_path in paths:
+        evidence, seal = _load_producer_evidence(Path(raw_path))
+        if evidence.status != "success":
+            raise ValueError(f"required evidence is not successful: {raw_path}")
+        loaded.append((evidence, seal))
+    payload = _build_smoke_prerequisite_chain(loaded)
+    if all(Path(path).is_file() for path in paths):
+        common = Path(os.path.commonpath([str(Path(path).resolve()) for path in paths]))
+        while common.is_file() or common.name in {"full", "dora"}:
+            common = common.parent
+        chain_path = common / "prerequisite-chain.json"
+        if chain_path.exists() and _read_json_once(chain_path) != payload:
+            raise FileExistsError(f"different smoke prerequisite chain exists: {chain_path}")
+        if not chain_path.exists():
+            _atomic_write_json(chain_path, payload)
+    return payload
+
+
+def _summaries(paths: Sequence[str]) -> list[dict[str, object]]:
+    summaries = []
+    for raw_path in paths:
+        evidence = _load_evidence_without_expected(Path(raw_path))
+        summaries.append(
+            {
+                "path": str(Path(raw_path)),
+                "status": evidence.status,
+                "method": evidence.method,
+                "micro_batch": evidence.micro_batch,
+                "world_size": evidence.world_size,
+                "effective_global_batch": evidence.effective_global_batch,
+                "optimizer_steps": evidence.optimizer_steps,
+                "final_loss": evidence.final_loss,
+            }
+        )
+    return summaries
+
+
+def _load_maximum(path: Path) -> dict[str, object]:
+    payload = _read_json_once(path)
+    if type(payload) is not dict or payload.get("kind") != "stage1-capacity-maximum":
+        raise ValueError(f"invalid Stage 1 maximum manifest: {path}")
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version",
+            "kind",
+            "status",
+            "method",
+            "selected_micro_batch",
+            "world_size",
+            "gradient_accumulation_steps",
+            "effective_global_batch",
+            "long_smoke_steps",
+            "long_smoke_attempt",
+            "selected_attempt",
+            "first_failure",
+            "launch_config",
+            "attempt_chain_digest",
+            "audit_digest",
+            "data_stat",
+            "probe_row_indices",
+            "prerequisite_chain_digest",
+            "long_smoke_producer_digest",
+            "rank_peak_allocated_bytes",
+            "rank_peak_reserved_bytes",
+            "config_digest",
+        },
+        "Stage 1 maximum manifest",
+    )
+    if payload.get("schema_version") != _SCHEMA_VERSION:
+        raise ValueError("unsupported maximum manifest schema")
+    if payload.get("status") != "success":
+        raise ValueError("maximum manifest is not successful")
+    _validated_method(payload.get("method"))
+    for name in (
+        "selected_micro_batch",
+        "world_size",
+        "gradient_accumulation_steps",
+        "effective_global_batch",
+        "long_smoke_steps",
+    ):
+        _require_int(name, payload.get(name), positive=True)
+    if payload["effective_global_batch"] != (
+        payload["selected_micro_batch"]
+        * payload["world_size"]
+        * payload["gradient_accumulation_steps"]
+    ):
+        raise ValueError("maximum effective_global_batch invariant failed")
+    for name in ("long_smoke_attempt", "selected_attempt"):
+        _require_string(name, payload.get(name))
+    if payload.get("first_failure") is not None and type(payload["first_failure"]) is not dict:
+        raise TypeError("maximum first_failure must be null or an object")
+    _validate_probe_launch_config(payload.get("launch_config"))
+    for name in (
+        "attempt_chain_digest", "audit_digest", "prerequisite_chain_digest",
+        "long_smoke_producer_digest"
+    ):
+        _require_digest(name, payload.get(name))
+    if payload["audit_digest"] != payload["launch_config"]["audit_digest"]:
+        raise ValueError("maximum audit digest is not bound to launch config")
+    if payload["data_stat"] != payload["launch_config"]["data_stat"]:
+        raise ValueError("maximum data stat is not bound to launch config")
+    if payload["probe_row_indices"] != payload["launch_config"]["probe_row_indices"]:
+        raise ValueError("maximum probe row indices are not bound to launch config")
+    if (
+        payload["prerequisite_chain_digest"]
+        != payload["launch_config"]["prerequisite_chain_digest"]
+    ):
+        raise ValueError("maximum prerequisite chain is not bound to launch config")
+    for name in ("rank_peak_allocated_bytes", "rank_peak_reserved_bytes"):
+        values = payload.get(name)
+        if type(values) is not list or len(values) != payload["world_size"]:
+            raise ValueError(f"maximum {name} must contain one value per rank")
+        for index, value in enumerate(values):
+            _require_int(f"{name}[{index}]", value)
+    _require_digest("config_digest", payload.get("config_digest"))
+    digest_input = dict(payload)
+    digest_input.pop("config_digest")
+    if config_digest(digest_input) != payload["config_digest"]:
+        raise ValueError("maximum config digest mismatch")
+    selected_path = Path(payload["selected_attempt"])
+    selected = _load_probe_attempt(selected_path)
+    long_attempt = _load_probe_attempt(Path(payload["long_smoke_attempt"]))
+    if payload["launch_config"] != selected["launch_config"]:
+        raise ValueError("maximum selected attempt launch config mismatch")
+    selected_bindings = {
+        "method": "method",
+        "selected_micro_batch": "micro_batch",
+        "world_size": "world_size",
+        "gradient_accumulation_steps": "gradient_accumulation_steps",
+        "effective_global_batch": "effective_global_batch",
+    }
+    for maximum_name, attempt_name in selected_bindings.items():
+        if (
+            payload[maximum_name] != selected[attempt_name]
+            or selected[attempt_name]
+            != selected["launch_config"][attempt_name]
+        ):
+            raise ValueError(
+                "maximum selected attempt identity or batch controls mismatch"
+            )
+    if (
+        selected["max_steps"] != 3
+        or selected["launch_config"]["max_steps"] != 3
+    ):
+        raise ValueError("maximum selected attempt must run exactly 3 steps")
+    if payload["long_smoke_steps"] != 10:
+        raise ValueError("maximum long smoke must run exactly 10 steps")
+    if len(selected_path.parents) < 6 or selected_path.parents[4].name != "attempts":
+        raise ValueError("maximum selected attempt is outside a probe attempt tree")
+    probe_root = selected_path.parents[5]
+    chain = [
+        (path, _load_probe_attempt(path))
+        for path in _attempt_files(probe_root, payload["method"])
+    ]
+    chain_selected, chain_failure = _validated_capacity_chain(
+        chain, require_success=True
+    )
+    assert chain_selected is not None
+    for attempt_path, attempt in chain:
+        if attempt["exit_code"] != 0 and _failure_classification(attempt_path) is None:
+            raise ValueError("maximum chain contains an unclassified failure")
+    if config_digest(
+        {"attempt_digests": [attempt["attempt_digest"] for _, attempt in chain]}
+    ) != payload["attempt_chain_digest"]:
+        raise ValueError("maximum attempt chain digest mismatch")
+    if chain_selected[0].resolve() != selected_path.resolve():
+        raise ValueError("maximum is not the last valid success in its ordered chain")
+    expected_failure = None
+    if chain_failure is not None:
+        expected_failure = {
+            "micro_batch": chain_failure[1]["micro_batch"],
+            "classification": "capacity_oom",
+            "attempt_config_digest": chain_failure[1]["config_digest"],
+            "attempt_path": str(chain_failure[0]),
+        }
+    if payload["first_failure"] != expected_failure:
+        raise ValueError("maximum first failure does not match its ordered chain")
+    long_launch = long_attempt["launch_config"]
+    selected_launch = selected["launch_config"]
+    immutable_launch_fields = {
+        "method", "micro_batch", "world_size", "gradient_accumulation_steps",
+        "effective_global_batch", "learning_rate", "seed", "final_save",
+        "model", "tuning_config", "data_path", "train_data_path", "data_stat",
+        "image_root", "deepspeed_config", "deepspeed_config_digest",
+        "attention_implementation", "probe_rows", "probe_row_indices",
+        "audit_digest", "prerequisite_chain_digest", "prerequisite_chain",
+    }
+    if any(
+        long_launch[name] != selected_launch[name]
+        for name in immutable_launch_fields
+    ):
+        raise ValueError("maximum long-smoke attempt does not match selected maximum")
+    selected_command = selected_launch["command"]
+    normalized_long_command = list(long_launch["command"])
+    for flag in (
+        "--output-dir", "--log-file", "--max-steps",
+        "--benchmark-run-config", "--producer-evidence",
+    ):
+        if selected_command.count(flag) != normalized_long_command.count(flag):
+            raise ValueError("maximum long-smoke command changes its flag set")
+        if flag in selected_command:
+            selected_index = selected_command.index(flag)
+            long_index = normalized_long_command.index(flag)
+            normalized_long_command[long_index + 1] = selected_command[
+                selected_index + 1
+            ]
+    if normalized_long_command != selected_command:
+        raise ValueError(
+            "maximum long-smoke command changes more than attempt paths or steps"
+        )
+    long_attempt_bindings = {
+        "method": selected["method"],
+        "micro_batch": selected["micro_batch"],
+        "world_size": selected["world_size"],
+        "gradient_accumulation_steps": selected[
+            "gradient_accumulation_steps"
+        ],
+        "effective_global_batch": selected["effective_global_batch"],
+        "final_save": False,
+        "audit_digest": selected["audit_digest"],
+        "data_stat": selected["data_stat"],
+        "probe_row_indices": selected["probe_row_indices"],
+        "prerequisite_chain_digest": selected["prerequisite_chain_digest"],
+    }
+    for name, value in long_attempt_bindings.items():
+        if long_attempt[name] != value or long_launch[name] != value:
+            raise ValueError(
+                "maximum long-smoke attempt does not match selected maximum"
+            )
+    if (
+        long_attempt["max_steps"] != 10
+        or long_launch["max_steps"] != 10
+        or long_attempt["exit_code"] != 0
+    ):
+        raise ValueError("maximum long smoke must be a successful exact 10-step run")
+    producer_path = Path(long_attempt["output_dir"]).parent / "evidence" / "producer-evidence.json"
+    evidence, producer = _load_producer_evidence(producer_path)
+    if producer["producer_digest"] != payload["long_smoke_producer_digest"]:
+        raise ValueError("maximum long-smoke producer digest mismatch")
+    producer_config = producer["run_config"]
+    expected_producer_bindings = {
+        "config_digest": long_launch["run_config_digest"],
+        "method": long_attempt["method"],
+        "tuning_config": long_launch["tuning_config"],
+        "micro_batch": long_attempt["micro_batch"],
+        "world_size": long_attempt["world_size"],
+        "gradient_accumulation_steps": long_attempt[
+            "gradient_accumulation_steps"
+        ],
+        "effective_global_batch": long_attempt["effective_global_batch"],
+        "max_steps": long_attempt["max_steps"],
+        "final_save": False,
+        "learning_rate": long_launch["learning_rate"],
+        "seed": long_launch["seed"],
+        "model": long_launch["model"],
+        "source_data_path": long_launch["data_path"],
+        "data_path": long_launch["train_data_path"],
+        "data_stat": long_attempt["data_stat"],
+        "image_root": long_launch["image_root"],
+        "output_dir": long_attempt["output_dir"],
+        "deepspeed_config": long_launch["deepspeed_config"],
+        "deepspeed_config_digest": long_launch["deepspeed_config_digest"],
+        "attention_implementation": long_launch["attention_implementation"],
+        "probe_rows": long_launch["probe_rows"],
+        "audit_digest": long_attempt["audit_digest"],
+        "probe_row_indices": long_attempt["probe_row_indices"],
+        "prerequisite_chain_digest": long_attempt[
+            "prerequisite_chain_digest"
+        ],
+        "prerequisite_chain": long_launch["prerequisite_chain"],
+    }
+    for name, value in expected_producer_bindings.items():
+        if producer_config.get(name) != value:
+            raise ValueError(
+                f"maximum long-smoke producer is not bound to attempt field: {name}"
+            )
+    evidence_bindings = {
+        "method": long_attempt["method"],
+        "micro_batch": long_attempt["micro_batch"],
+        "world_size": long_attempt["world_size"],
+        "gradient_accumulation_steps": long_attempt[
+            "gradient_accumulation_steps"
+        ],
+        "effective_global_batch": long_attempt["effective_global_batch"],
+        "config_digest": producer_config["config_digest"],
+        "probe_row_indices": tuple(long_attempt["probe_row_indices"]),
+    }
+    for name, value in evidence_bindings.items():
+        if getattr(evidence, name) != value:
+            raise ValueError(
+                f"maximum long-smoke producer evidence mismatch for {name}"
+            )
+    if evidence.status != "success":
+        raise ValueError("maximum long-smoke producer evidence is not successful")
+    if evidence.optimizer_steps != 10:
+        raise ValueError("maximum long-smoke producer must record 10 optimizer steps")
+    expected_samples = 10 * long_attempt["effective_global_batch"]
+    if evidence.samples_seen != expected_samples:
+        raise ValueError(
+            "maximum long-smoke producer samples seen does not match its exact steps"
+        )
+    if (
+        list(evidence.rank_peak_allocated_bytes) != payload["rank_peak_allocated_bytes"]
+        or list(evidence.rank_peak_reserved_bytes) != payload["rank_peak_reserved_bytes"]
+    ):
+        raise ValueError("maximum rank memory witness mismatch")
+    return payload
+
+
+def _rewrite_command_flag(command: list[str], flag: str, value: str) -> None:
+    if flag not in command:
+        command.extend((flag, value))
+        return
+    index = command.index(flag)
+    if index + 1 >= len(command):
+        raise ValueError(f"recorded command has no value for {flag}")
+    command[index + 1] = value
+
+
+def _validate_maximum(probe_dir: Path, long_smoke_steps: int) -> dict[str, object]:
+    long_smoke_steps = _require_int("long_smoke_steps", long_smoke_steps, positive=True)
+    maximum_path = probe_dir / "maximum.json"
+    if maximum_path.is_file():
+        existing = _load_maximum(maximum_path)
+        if existing["long_smoke_steps"] != long_smoke_steps:
+            raise ValueError("existing maximum uses a different long-smoke length")
+        current = [
+            _load_probe_attempt(path)["attempt_digest"]
+            for path in _attempt_files(probe_dir, existing["method"])
+        ]
+        if config_digest({"attempt_digests": current}) != existing["attempt_chain_digest"]:
+            raise ValueError("attempt chain changed after maximum was sealed")
+        return existing
+    attempt_paths = _attempt_files(probe_dir)
+    if not attempt_paths:
+        raise ValueError("probe directory contains no attempts")
+    attempts = [(path, _load_probe_attempt(path)) for path in attempt_paths]
+    methods = {attempt["method"] for _, attempt in attempts}
+    if len(methods) != 1:
+        raise ValueError("probe directory mixes full and DoRA attempts")
+    selected_item, first_failure_item = _validated_capacity_chain(
+        attempts, require_success=True
+    )
+    assert selected_item is not None
+    failed = [(path, attempt) for path, attempt in attempts if attempt["exit_code"] != 0]
+    for path, _ in failed:
+        if _failure_classification(path) is None:
+            raise ValueError(f"requires-classification: {path}")
+    selected_path, selected = selected_item
+    long_root = (
+        probe_dir
+        / "long-smoke"
+        / selected["method"]
+        / f"micro-batch-{selected['micro_batch']}"
+    )
+    existing_long = list(long_root.glob("attempt-*/evidence/attempt.json"))
+    if len(existing_long) > 1:
+        raise ValueError("selected maximum has repeated long-smoke evidence")
+    if existing_long:
+        long_attempt = _load_probe_attempt(existing_long[0])
+        if long_attempt["max_steps"] != long_smoke_steps or long_attempt["exit_code"] != 0:
+            raise ValueError("existing long smoke is not a matching success")
+    else:
+        attempt_id = f"{time.time_ns()}-{os.getpid()}"
+        long_dir = long_root / f"attempt-{attempt_id}"
+        output_dir = long_dir / "output"
+        logs_dir = long_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=False)
+        command = list(selected["command"])
+        _rewrite_command_flag(command, "--max-steps", str(long_smoke_steps))
+        _rewrite_command_flag(command, "--output-dir", str(output_dir))
+        _rewrite_command_flag(command, "--log-file", str(logs_dir / "train.log"))
+        command = [item for item in command if item != "--final-save"]
+        if "--no-final-save" not in command:
+            command.append("--no-final-save")
+        run_config_path = long_dir / "evidence" / "run-config.json"
+        producer_path = long_dir / "evidence" / "producer-evidence.json"
+        _prepare_probe_run(
+            argparse.Namespace(
+                run_config=str(run_config_path),
+                method=selected["method"],
+                model=selected["launch_config"]["model"],
+                source_data_path=selected["launch_config"]["data_path"],
+                data_path=selected["launch_config"]["train_data_path"],
+                image_root=selected["launch_config"]["image_root"],
+                output_dir=str(output_dir),
+                micro_batch=selected["micro_batch"],
+                world_size=selected["world_size"],
+                gradient_accumulation=selected["gradient_accumulation_steps"],
+                max_steps=long_smoke_steps,
+                deepspeed_config=selected["launch_config"]["deepspeed_config"],
+                probe_rows=selected["probe_rows"],
+                prerequisite_chain=selected["launch_config"]["prerequisite_chain"],
+            )
+        )
+        _rewrite_command_flag(command, "--benchmark-run-config", str(run_config_path))
+        _rewrite_command_flag(command, "--producer-evidence", str(producer_path))
+        stdout_path = logs_dir / "stdout.log"
+        stderr_path = logs_dir / "stderr.log"
+        with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+            "w", encoding="utf-8"
+        ) as stderr_handle:
+            process = subprocess.Popen(command, stdout=stdout_handle, stderr=stderr_handle)
+            exit_code = process.wait()
+        namespace = argparse.Namespace(
+            attempt_dir=str(long_dir),
+            attempt_id=attempt_id,
+            method=selected["method"],
+            micro_batch=selected["micro_batch"],
+            world_size=selected["world_size"],
+            gradient_accumulation=selected["gradient_accumulation_steps"],
+            learning_rate=selected["launch_config"]["learning_rate"],
+            seed=selected["launch_config"]["seed"],
+            model=selected["launch_config"]["model"],
+            source_data_path=selected["launch_config"]["data_path"],
+            image_root=selected["launch_config"]["image_root"],
+            deepspeed_config=selected["launch_config"]["deepspeed_config"],
+            attention_implementation=selected["launch_config"][
+                "attention_implementation"
+            ],
+            process_id=process.pid,
+            exit_code=exit_code,
+            max_steps=long_smoke_steps,
+            output_dir=str(output_dir),
+            stdout_path=str(stdout_path),
+            stderr_path=str(stderr_path),
+            probe_rows=selected["probe_rows"],
+            command=["--", *command],
+        )
+        long_attempt = _record_probe_attempt(namespace)
+        if exit_code != 0:
+            raise RuntimeError(
+                f"long smoke failed and requires-classification: {long_dir}"
+            )
+    long_producer_path = (
+        Path(long_attempt["output_dir"]).parent / "evidence" / "producer-evidence.json"
+    )
+    if not long_producer_path.is_file():
+        raise FileNotFoundError(
+            f"long smoke is missing rank-local producer evidence: {long_producer_path}"
+        )
+    long_evidence, long_seal = _load_producer_evidence(long_producer_path)
+    if (
+        long_evidence.status != "success"
+        or long_evidence.method != selected["method"]
+        or long_evidence.micro_batch != selected["micro_batch"]
+        or long_evidence.optimizer_steps != long_smoke_steps
+        or long_evidence.config_digest != long_attempt["launch_config"]["run_config_digest"]
+    ):
+        raise ValueError("long-smoke producer evidence does not match selected maximum")
+    first_failure = None
+    if first_failure_item is not None:
+        first_path, first = first_failure_item
+        first_failure = {
+            "micro_batch": first["micro_batch"],
+            "classification": "capacity_oom",
+            "attempt_config_digest": first["config_digest"],
+            "attempt_path": str(first_path),
+        }
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-capacity-maximum",
+        "status": "success",
+        "method": selected["method"],
+        "selected_micro_batch": selected["micro_batch"],
+        "world_size": selected["world_size"],
+        "gradient_accumulation_steps": selected["gradient_accumulation_steps"],
+        "effective_global_batch": selected["effective_global_batch"],
+        "long_smoke_steps": long_smoke_steps,
+        "long_smoke_attempt": str(_probe_attempt_path(Path(long_attempt["output_dir"]).parent)),
+        "selected_attempt": str(selected_path),
+        "first_failure": first_failure,
+        "launch_config": selected["launch_config"],
+        "attempt_chain_digest": config_digest(
+            {"attempt_digests": [attempt["attempt_digest"] for _, attempt in attempts]}
+        ),
+        "audit_digest": selected["audit_digest"],
+        "data_stat": selected["data_stat"],
+        "probe_row_indices": selected["probe_row_indices"],
+        "prerequisite_chain_digest": selected["prerequisite_chain_digest"],
+        "long_smoke_producer_digest": long_seal["producer_digest"],
+        "rank_peak_allocated_bytes": list(long_evidence.rank_peak_allocated_bytes),
+        "rank_peak_reserved_bytes": list(long_evidence.rank_peak_reserved_bytes),
+    }
+    payload["config_digest"] = config_digest(payload)
+    _atomic_write_json(maximum_path, payload)
+    return payload
+
+
+def _require_matching_maximum_controls(
+    maxima: Sequence[Mapping[str, object]],
+) -> None:
+    configs = [item["launch_config"] for item in maxima]
+    for name in (
+        "model", "data_path", "data_stat", "image_root", "world_size",
+        "gradient_accumulation_steps", "learning_rate", "seed",
+        "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
+        "probe_rows", "probe_row_indices", "audit_digest",
+        "prerequisite_chain_digest",
+    ):
+        if configs[0][name] != configs[1][name]:
+            raise ValueError(f"maximum comparison changes controlled field: {name}")
+
+
+def _compare_maxima(paths: Sequence[str]) -> dict[str, object]:
+    maxima = [_load_maximum(Path(path)) for path in paths]
+    if {item["method"] for item in maxima} != {"full", "dora"}:
+        raise ValueError("maximum comparison requires separated full and DoRA manifests")
+    prerequisite_digests = {
+        item["prerequisite_chain_digest"] for item in maxima
+    }
+    if len(prerequisite_digests) != 1:
+        raise ValueError("maximum comparison changes the smoke prerequisite chain")
+    _require_matching_maximum_controls(maxima)
+    return {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-capacity-comparison",
+        "prerequisite_chain_digest": next(iter(prerequisite_digests)),
+        "methods": {
+            item["method"]: {
+                "micro_batch": item["selected_micro_batch"],
+                "effective_global_batch": item["effective_global_batch"],
+                "long_smoke_steps": item["long_smoke_steps"],
+                "first_failure": item["first_failure"],
+                "rank_peak_allocated_bytes": item["rank_peak_allocated_bytes"],
+                "rank_peak_reserved_bytes": item["rank_peak_reserved_bytes"],
+                "maximum_config_digest": item["config_digest"],
+                "prerequisite_chain_digest": item["prerequisite_chain_digest"],
+            }
+            for item in maxima
+        },
+    }
+
+
+def _prepare_timed_run(args: argparse.Namespace) -> str:
+    method = _validated_method(args.method)
+    maximum = _load_maximum(Path(args.maximum))
+    if maximum["method"] != method:
+        raise ValueError("timed method does not match maximum manifest")
+    if args.epochs != 3 or args.learning_rate != 1e-5:
+        raise ValueError("timed runs require exactly 3 epochs and learning rate 1e-5")
+    if args.gradient_accumulation != 2 or args.world_size != 2:
+        raise ValueError("timed runs require gradient accumulation 2 and world size 2")
+    source_config = maximum["launch_config"]
+    output_dir = Path(args.output_dir).resolve()
+    launch_config = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-timed-launch-manifest",
+        "method": method,
+        "tuning_config": source_config["tuning_config"],
+        "model": source_config["model"],
+        "source_data_path": source_config["data_path"],
+        "data_path": source_config["data_path"],
+        "data_stat": source_config["data_stat"],
+        "image_root": source_config["image_root"],
+        "output_dir": str(output_dir),
+        "micro_batch": maximum["selected_micro_batch"],
+        "world_size": args.world_size,
+        "gradient_accumulation_steps": args.gradient_accumulation,
+        "effective_global_batch": (
+            maximum["selected_micro_batch"]
+            * args.world_size
+            * args.gradient_accumulation
+        ),
+        "epochs": args.epochs,
+        "learning_rate": args.learning_rate,
+        "seed": 42,
+        "max_steps": 0,
+        "attention_implementation": "flash_attention_2",
+        "deepspeed_config": source_config["deepspeed_config"],
+        "deepspeed_config_digest": source_config["deepspeed_config_digest"],
+        "save_strategy": "no",
+        "final_save": True,
+        "audit_digest": source_config["audit_digest"],
+        "probe_rows": source_config["probe_rows"],
+        "probe_row_indices": source_config["probe_row_indices"],
+        "maximum_config_digest": maximum["config_digest"],
+        "prerequisite_chain": source_config["prerequisite_chain"],
+        "prerequisite_chain_digest": maximum["prerequisite_chain_digest"],
+    }
+    launch_config["config_digest"] = config_digest(launch_config)
+    manifest_path = output_dir / "launch-manifest.json"
+    evidence_path = output_dir / "evidence.json"
+    if evidence_path.is_file():
+        evidence, seal = _load_producer_evidence(evidence_path)
+        if (
+            evidence.config_digest == launch_config["config_digest"]
+            and seal["run_config"] == launch_config
+            and evidence.status == "success"
+        ):
+            return "reusable-success"
+        raise ValueError("timed output contains stale or malformed evidence")
+    if output_dir.exists():
+        entries = list(output_dir.iterdir())
+        if entries and entries != [manifest_path]:
+            raise FileExistsError(
+                f"refusing incomplete or colliding timed output: {output_dir}"
+            )
+        if manifest_path.is_file():
+            if _read_json_once(manifest_path) != launch_config:
+                raise ValueError("existing timed launch manifest does not match")
+            return str(manifest_path)
+    _atomic_write_json(manifest_path, launch_config)
+    return str(manifest_path)
+
+
+def _launcher_args_from_manifest(path: Path) -> list[str]:
+    payload = _load_timed_manifest(path)
+
+    result = [
+        "--method", str(payload["method"]),
+        "--model", str(payload["model"]),
+        "--source-data-path", str(payload["source_data_path"]),
+        "--data-path", str(payload["data_path"]),
+        "--image-root", str(payload["image_root"]),
+        "--output-dir", str(payload["output_dir"]),
+        "--micro-batch", str(payload["micro_batch"]),
+        "--epochs", str(payload["epochs"]),
+        "--learning-rate", str(payload["learning_rate"]),
+        "--gradient-accumulation", str(payload["gradient_accumulation_steps"]),
+        "--seed", str(payload["seed"]),
+        "--deepspeed-config", str(payload["deepspeed_config"]),
+        "--attention-implementation", str(payload["attention_implementation"]),
+        "--save-strategy", str(payload["save_strategy"]),
+        "--final-save",
+        "--benchmark-run-config", str(path.resolve()),
+        "--producer-evidence", str(Path(payload["output_dir"]) / "producer-evidence.json"),
+    ]
+    return result
+
+
+def _load_timed_manifest(path: Path) -> dict[str, object]:
+    payload = _load_producer_run_config(path)
+    if payload["kind"] != "stage1-timed-launch-manifest":
+        raise ValueError("launcher manifest has the wrong kind")
+    if payload["final_save"] is not True or payload["maximum_config_digest"] is None:
+        raise ValueError("timed manifest must bind a maximum and final save")
+    return payload
+
+
+def _validate_timed_run(run_dir: Path) -> str:
+    manifest_path = run_dir / "launch-manifest.json"
+    manifest = _load_timed_manifest(manifest_path)
+    claimed = manifest["config_digest"]
+    evidence_path = run_dir / "evidence.json"
+    if evidence_path.is_file():
+        reusable, reusable_seal = _load_producer_evidence(evidence_path)
+        if (
+            reusable.config_digest != claimed
+            or reusable_seal["run_config"] != manifest
+            or reusable.status != "success"
+        ):
+            raise ValueError("timed evidence is not successful")
+        return "reusable-success"
+    producer_path = run_dir / "producer-evidence.json"
+    if not producer_path.is_file():
+        raise FileNotFoundError(
+            f"missing matching small producer evidence: {producer_path}"
+        )
+    producer, producer_seal = _load_producer_evidence(producer_path)
+    if producer.config_digest != claimed:
+        raise ValueError("producer evidence is not bound to the timed manifest")
+    if producer_seal["run_config"] != manifest:
+        raise ValueError("producer run config does not exactly match timed manifest")
+    if producer.status != "success" or producer.method != manifest["method"]:
+        raise ValueError("producer evidence does not match the successful timed run")
+    if (
+        producer.micro_batch != manifest["micro_batch"]
+        or producer.world_size != manifest["world_size"]
+        or producer.gradient_accumulation_steps
+        != manifest["gradient_accumulation_steps"]
+    ):
+        raise ValueError("producer evidence batch configuration mismatch")
+    expected_samples = 3450 * manifest["epochs"]
+    expected_steps = math.ceil(3450 / manifest["effective_global_batch"]) * manifest[
+        "epochs"
+    ]
+    if producer.samples_seen != expected_samples or producer.optimizer_steps != expected_steps:
+        raise ValueError("producer evidence sample/optimizer-step invariant mismatch")
+    _atomic_write_json(evidence_path, producer_seal)
+    return str(evidence_path)
+
+
+def _validate_legacy_comparison_evidence(payload: object) -> dict[str, object]:
+    """Validate one historical comparison row without inventing current identity."""
+
+    _require_exact_keys(payload, _LEGACY_EVIDENCE_FIELDS, "legacy benchmark evidence")
+    if payload.get("status") not in {"success", "oom", "failure"}:
+        raise ValueError("legacy evidence status must be success, oom, or failure")
+    if payload.get("method") not in {"full", "dora"}:
+        raise ValueError("legacy evidence method must be full or dora")
+    for name in ("micro_batch", "world_size", "gradient_accumulation_steps"):
+        _require_int(name, payload.get(name), positive=True)
+    for name in (
+        "effective_global_batch",
+        "optimizer_steps",
+        "samples_seen",
+        "trainable_parameters",
+        "total_parameters",
+        "checkpoint_bytes",
+    ):
+        _require_int(name, payload.get(name))
+    if payload["effective_global_batch"] != (
+        payload["world_size"]
+        * payload["micro_batch"]
+        * payload["gradient_accumulation_steps"]
+    ):
+        raise ValueError("legacy evidence effective global batch invariant failed")
+    if payload["trainable_parameters"] > payload["total_parameters"]:
+        raise ValueError("legacy evidence trainable parameters exceed total parameters")
+    for name in (
+        "model_load_seconds",
+        "trainer_seconds",
+        "total_seconds",
+        "final_save_seconds",
+        "samples_per_second",
+        "steps_per_second",
+        "final_loss",
+        "representative_gradient_norm",
+    ):
+        _require_float(name, payload.get(name))
+    if payload["total_seconds"] < (
+        payload["model_load_seconds"]
+        + payload["trainer_seconds"]
+        + payload["final_save_seconds"]
+    ):
+        raise ValueError("legacy evidence total time does not cover component timings")
+    if payload["status"] == "success" and payload["optimizer_steps"] == 0:
+        raise ValueError("successful legacy evidence requires optimizer steps")
+    rank_values = []
+    for name in ("rank_peak_allocated_bytes", "rank_peak_reserved_bytes"):
+        values = payload.get(name)
+        if type(values) is not list or len(values) != payload["world_size"]:
+            raise ValueError(f"legacy {name} length must equal world_size")
+        for index, value in enumerate(values):
+            _require_int(f"{name}[{index}]", value)
+        rank_values.append(values)
+    if any(
+        allocated > reserved
+        for allocated, reserved in zip(rank_values[0], rank_values[1])
+    ):
+        raise ValueError("legacy rank peak allocated bytes exceed reserved bytes")
+    gpu_names = payload.get("gpu_names")
+    if type(gpu_names) is not list or len(gpu_names) != payload["world_size"]:
+        raise ValueError("legacy gpu_names length must equal world_size")
+    for index, value in enumerate(gpu_names):
+        _require_string(f"gpu_names[{index}]", value)
+    indices = payload.get("probe_row_indices")
+    if type(indices) is not list or len(set(indices)) != len(indices):
+        raise ValueError("legacy probe_row_indices must be a unique array")
+    for index, value in enumerate(indices):
+        _require_int(f"probe_row_indices[{index}]", value)
+    _require_string("git_commit", payload.get("git_commit"))
+    _require_digest("config_digest", payload.get("config_digest"))
+    versions = payload.get("dependency_versions")
+    if type(versions) is not dict:
+        raise TypeError("legacy dependency_versions must be an object")
+    for name, version in versions.items():
+        _require_string("dependency_versions key", name)
+        _require_string(f"dependency_versions[{name!r}]", version)
+    return dict(payload)
+
+
+def _validate_run_comparison_payload(payload: object) -> dict[str, object]:
+    _require_exact_keys(
+        payload,
+        {
+            "schema_version", "kind", "paper_level_reproduction",
+            "common_batch_control", "prerequisite_chain_digest", "methods",
+            "comparison_digest",
+        },
+        "Stage 1 timed comparison",
+    )
+    if (
+        payload.get("schema_version") != _SCHEMA_VERSION
+        or payload.get("kind") != "stage1-maximum-throughput-comparison"
+        or payload.get("paper_level_reproduction") is not False
+        or payload.get("common_batch_control") is not False
+    ):
+        raise ValueError("invalid Stage 1 timed comparison identity")
+    _require_digest(
+        "prerequisite_chain_digest", payload.get("prerequisite_chain_digest")
+    )
+    claimed = payload.get("comparison_digest")
+    _require_digest("comparison_digest", claimed)
+    digest_input = dict(payload)
+    digest_input.pop("comparison_digest")
+    if config_digest(digest_input) != claimed:
+        raise ValueError("Stage 1 timed comparison digest mismatch")
+    methods = payload.get("methods")
+    _require_exact_keys(methods, {"full", "dora"}, "timed comparison methods")
+    method_shapes = {
+        frozenset(raw_evidence) if type(raw_evidence) is dict else frozenset()
+        for raw_evidence in methods.values()
+    }
+    if method_shapes == {frozenset(_LEGACY_EVIDENCE_FIELDS)}:
+        evidence_parser = _validate_legacy_comparison_evidence
+    elif method_shapes == {frozenset(_EVIDENCE_FIELDS)}:
+        evidence_parser = _evidence_from_dict
+    else:
+        raise ValueError("timed comparison methods use inconsistent evidence schemas")
+    for method, raw_evidence in methods.items():
+        evidence = evidence_parser(raw_evidence)
+        evidence_method = (
+            evidence.method if isinstance(evidence, Stage1BenchmarkEvidence)
+            else evidence["method"]
+        )
+        evidence_status = (
+            evidence.status if isinstance(evidence, Stage1BenchmarkEvidence)
+            else evidence["status"]
+        )
+        if evidence_method != method or evidence_status != "success":
+            raise ValueError("timed comparison method evidence mismatch")
+    return dict(payload)
+
+
+def _load_run_comparison(path: Path) -> dict[str, object]:
+    return _validate_run_comparison_payload(_read_json_once(path))
+
+
+def _compare_runs(paths: Sequence[str], output: Path) -> dict[str, object]:
+    loaded = [_load_producer_evidence(Path(path)) for path in paths]
+    evidences = [item[0] for item in loaded]
+    if {item.method for item in evidences} != {"full", "dora"}:
+        raise ValueError("run comparison requires separated full and DoRA evidence")
+    if any(item.status != "success" for item in evidences):
+        raise ValueError("run comparison requires successful sealed evidence")
+    configs = [item[1]["run_config"] for item in loaded]
+    for name in (
+        "model", "source_data_path", "data_path", "data_stat", "image_root", "world_size",
+        "gradient_accumulation_steps", "epochs", "learning_rate", "seed",
+        "deepspeed_config", "deepspeed_config_digest", "attention_implementation",
+        "save_strategy", "audit_digest", "probe_row_indices",
+        "prerequisite_chain_digest",
+    ):
+        if configs[0][name] != configs[1][name]:
+            raise ValueError(f"run comparison changes controlled field: {name}")
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-maximum-throughput-comparison",
+        "paper_level_reproduction": False,
+        "common_batch_control": False,
+        "prerequisite_chain_digest": configs[0]["prerequisite_chain_digest"],
+        "methods": {
+            item.method: _evidence_to_dict(item) for item in evidences
+        },
+    }
+    payload["comparison_digest"] = config_digest(payload)
+    _validate_run_comparison_payload(payload)
+    _atomic_write_json(output, payload)
+    return payload
+
+
+def _final_report(args: argparse.Namespace) -> dict[str, object]:
+    smoke_paths = [Path(args.smoke_full), Path(args.smoke_dora)]
+    timed_paths = [Path(args.timed_full), Path(args.timed_dora)]
+    smoke_loaded = [_load_producer_evidence(path) for path in smoke_paths]
+    timed_loaded = [_load_producer_evidence(path) for path in timed_paths]
+    smoke = [item[0] for item in smoke_loaded]
+    timed = [item[0] for item in timed_loaded]
+    maximum = [_load_maximum(Path(args.maximum_full)), _load_maximum(Path(args.maximum_dora))]
+    for label, values in (("smoke", smoke), ("timed", timed)):
+        if {item.method for item in values} != {"full", "dora"}:
+            raise ValueError(f"{label} evidence must contain separated full and DoRA methods")
+        if any(item.status != "success" for item in values):
+            raise ValueError(f"{label} evidence must be successful")
+    if {item["method"] for item in maximum} != {"full", "dora"}:
+        raise ValueError("maximum manifests must contain separated full and DoRA methods")
+    prerequisite = _build_smoke_prerequisite_chain(smoke_loaded)
+    prerequisite_digest = prerequisite["prerequisite_chain_digest"]
+    if any(
+        item["prerequisite_chain_digest"] != prerequisite_digest
+        for item in maximum
+    ):
+        raise ValueError("maximum evidence does not descend from the smoke prerequisite")
+    _require_matching_maximum_controls(maximum)
+    for item in maximum:
+        _validate_prerequisite_controls(
+            item["launch_config"], prerequisite, require_run_controls=False
+        )
+    maximum_by_method = {item["method"]: item for item in maximum}
+    for item in timed:
+        selected = maximum_by_method[item.method]
+        if (
+            item.micro_batch != selected["selected_micro_batch"]
+            or item.effective_global_batch != selected["effective_global_batch"]
+        ):
+            raise ValueError(
+                f"timed {item.method} evidence does not use its validated maximum"
+            )
+    for path, item, loaded in zip(timed_paths, timed, timed_loaded):
+        manifest = _load_timed_manifest(path.parent / "launch-manifest.json")
+        if manifest["config_digest"] != item.config_digest:
+            raise ValueError(f"timed evidence config digest mismatch: {path}")
+        if loaded[1]["run_config"] != manifest:
+            raise ValueError(f"timed evidence run config mismatch: {path}")
+        selected = maximum_by_method[item.method]
+        if loaded[1]["run_config"]["maximum_config_digest"] != selected["config_digest"]:
+            raise ValueError(f"timed evidence maximum digest mismatch: {path}")
+        if (
+            loaded[1]["run_config"]["prerequisite_chain_digest"]
+            != prerequisite_digest
+        ):
+            raise ValueError(f"timed evidence prerequisite chain mismatch: {path}")
+        if (
+            loaded[1]["run_config"]["audit_digest"] != selected["audit_digest"]
+            or loaded[1]["run_config"]["data_stat"] != selected["data_stat"]
+            or loaded[1]["run_config"]["probe_row_indices"] != selected["probe_row_indices"]
+        ):
+            raise ValueError(f"timed evidence audit chain mismatch: {path}")
+    payload = {
+        "schema_version": _SCHEMA_VERSION,
+        "kind": "stage1-final-evidence-report",
+        "paper_level_reproduction": False,
+        "prerequisite_chain_digest": prerequisite_digest,
+        "smoke": {item.method: _evidence_to_dict(item) for item in smoke},
+        "maximum": maximum_by_method,
+        "timed": {item.method: _evidence_to_dict(item) for item in timed},
+    }
+    payload["config_digest"] = config_digest(payload)
+    _atomic_write_json(Path(args.output), payload)
+    return payload
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="command_name", required=True)
+
+    candidates = subparsers.add_parser("capacity-candidates")
+    candidates.add_argument("--start", type=int, default=8)
+    candidates.add_argument("--max-per-gpu", type=int, required=True)
+
+    audit = subparsers.add_parser("audit")
+    audit.add_argument("--data-path", required=True)
+    audit.add_argument("--image-root", required=True)
+    audit.add_argument("--output", required=True)
+    audit.add_argument("--count", type=int, required=True)
+
+    probe_jsonl = subparsers.add_parser("probe-jsonl")
+    probe_jsonl.add_argument("--audit", required=True)
+    probe_jsonl.add_argument("--data-path", required=True)
+    probe_jsonl.add_argument("--image-root", required=True)
+    probe_jsonl.add_argument("--output", required=True)
+
+    record = subparsers.add_parser("record-attempt")
+    record.add_argument("--attempt-dir", required=True)
+    record.add_argument("--attempt-id", required=True)
+    record.add_argument("--method", required=True)
+    record.add_argument("--micro-batch", type=int, required=True)
+    record.add_argument("--world-size", type=int, default=2)
+    record.add_argument("--gradient-accumulation", type=int, required=True)
+    record.add_argument("--learning-rate", type=float, required=True)
+    record.add_argument("--seed", type=int, required=True)
+    record.add_argument("--model", required=True)
+    record.add_argument("--source-data-path", required=True)
+    record.add_argument("--image-root", required=True)
+    record.add_argument("--deepspeed-config", required=True)
+    record.add_argument("--attention-implementation", required=True)
+    record.add_argument("--process-id", type=int, required=True)
+    record.add_argument("--exit-code", type=int, required=True)
+    record.add_argument("--max-steps", type=int, required=True)
+    record.add_argument("--output-dir", required=True)
+    record.add_argument("--stdout-path", required=True)
+    record.add_argument("--stderr-path", required=True)
+    record.add_argument("--probe-rows", required=True)
+    record.add_argument("command", nargs=argparse.REMAINDER)
+
+    register = subparsers.add_parser("register-attempt")
+    register.add_argument("--probe-dir", required=True)
+    register.add_argument("--attempt", required=True)
+
+    probe_run = subparsers.add_parser("prepare-probe-run")
+    probe_run.add_argument("--run-config", required=True)
+    probe_run.add_argument("--method", required=True)
+    probe_run.add_argument("--model", required=True)
+    probe_run.add_argument("--source-data-path", required=True)
+    probe_run.add_argument("--data-path", required=True)
+    probe_run.add_argument("--image-root", required=True)
+    probe_run.add_argument("--output-dir", required=True)
+    probe_run.add_argument("--micro-batch", type=int, required=True)
+    probe_run.add_argument("--world-size", type=int, default=2)
+    probe_run.add_argument("--gradient-accumulation", type=int, required=True)
+    probe_run.add_argument("--max-steps", type=int, required=True)
+    probe_run.add_argument("--deepspeed-config", required=True)
+    probe_run.add_argument("--probe-rows", required=True)
+    probe_run.add_argument("--prerequisite-chain", required=True)
+
+    classify = subparsers.add_parser("classify-failure")
+    classify.add_argument("--attempt", required=True)
+    classify.add_argument(
+        "--classification",
+        choices=("capacity_oom", "integration_failure"),
+        required=True,
+    )
+
+    acquire_probe_lock = subparsers.add_parser("acquire-probe-lock")
+    acquire_probe_lock.add_argument("--fd", type=int, required=True)
+    acquire_probe_lock.add_argument("--path", required=True)
+
+    validate_probe_lock = subparsers.add_parser("validate-probe-lock")
+    validate_probe_lock.add_argument("--fd", type=int, required=True)
+    validate_probe_lock.add_argument("--path", required=True)
+
+    require_initial = subparsers.add_parser("require-initial-oom")
+    require_initial.add_argument("--probe-dir", required=True)
+    require_initial.add_argument("--method", required=True)
+
+    require_fallback = subparsers.add_parser("require-fallback")
+    require_fallback.add_argument("--probe-dir", required=True)
+    require_fallback.add_argument("--method", required=True)
+    require_fallback.add_argument("--candidate", type=int, required=True)
+
+    require_candidate = subparsers.add_parser("require-candidate")
+    require_candidate.add_argument("--probe-dir", required=True)
+    require_candidate.add_argument("--method", required=True)
+    require_candidate.add_argument("--candidate", type=int, required=True)
+
+    check = subparsers.add_parser("check-evidence")
+    check.add_argument("--evidence-dir", required=True)
+    check.add_argument("--method", choices=("full", "dora"), required=True)
+    check.add_argument("--micro-batch", type=int, required=True)
+    check.add_argument("--world-size", type=int, required=True)
+
+    archive = subparsers.add_parser("archive-failed-attempt")
+    archive.add_argument("--evidence-dir", required=True)
+
+    require = subparsers.add_parser("require-evidence")
+    require.add_argument("paths", nargs="+")
+
+    summarize = subparsers.add_parser("summarize")
+    summarize.add_argument("paths", nargs="+")
+
+    validate_maximum = subparsers.add_parser("validate-maximum")
+    validate_maximum.add_argument("--probe-dir", required=True)
+    validate_maximum.add_argument("--long-smoke-steps", type=int, required=True)
+
+    compare_maxima = subparsers.add_parser("compare-maxima")
+    compare_maxima.add_argument("paths", nargs=2)
+
+    prepare = subparsers.add_parser("prepare-timed-run")
+    prepare.add_argument("--method", choices=("full", "dora"), required=True)
+    prepare.add_argument("--maximum", required=True)
+    prepare.add_argument("--output-dir", required=True)
+    prepare.add_argument("--epochs", type=int, required=True)
+    prepare.add_argument("--learning-rate", type=float, required=True)
+    prepare.add_argument("--gradient-accumulation", type=int, required=True)
+    prepare.add_argument("--world-size", type=int, required=True)
+
+    launcher_args = subparsers.add_parser("launcher-args")
+    launcher_args.add_argument("--manifest", required=True)
+
+    validate_timed = subparsers.add_parser("validate-timed-run")
+    validate_timed.add_argument("--run-dir", required=True)
+
+    compare_runs = subparsers.add_parser("compare-runs")
+    compare_runs.add_argument("paths", nargs=2)
+    compare_runs.add_argument("--output", required=True)
+
+    final = subparsers.add_parser("final-report")
+    final.add_argument("--smoke-full", required=True)
+    final.add_argument("--smoke-dora", required=True)
+    final.add_argument("--maximum-full", required=True)
+    final.add_argument("--maximum-dora", required=True)
+    final.add_argument("--timed-full", required=True)
+    final.add_argument("--timed-dora", required=True)
+    final.add_argument("--output", required=True)
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _build_parser()
+    args = parser.parse_args(argv)
+    command = args.command_name
+    if command == "capacity-candidates":
+        print(" ".join(map(str, capacity_candidates(args.start, args.max_per_gpu))))
+    elif command == "audit":
+        selected = select_high_cost_probe_rows(
+            args.data_path,
+            args.count,
+            args.output,
+            image_root=args.image_root,
+        )
+        print(" ".join(map(str, selected)))
+    elif command == "probe-jsonl":
+        _atomic_write_probe_jsonl(
+            Path(args.audit),
+            Path(args.output),
+            data_path=Path(args.data_path),
+            image_root=Path(args.image_root),
+        )
+        print(args.output)
+    elif command == "record-attempt":
+        payload = _record_probe_attempt(args)
+        print(_probe_attempt_path(Path(args.attempt_dir)))
+        if payload["requires_oom_classification"]:
+            print("requires-classification", file=sys.stderr)
+    elif command == "register-attempt":
+        print(_register_probe_attempt(Path(args.probe_dir), Path(args.attempt)))
+    elif command == "prepare-probe-run":
+        print(_prepare_probe_run(args))
+    elif command == "classify-failure":
+        _classify_failure(Path(args.attempt), args.classification)
+        print(args.classification)
+    elif command == "acquire-probe-lock":
+        _acquire_probe_execution_lock(args.fd, Path(args.path))
+        print("probe-lock-acquired")
+    elif command == "validate-probe-lock":
+        _validate_probe_execution_lock(args.fd, Path(args.path))
+        print("probe-lock-valid")
+    elif command == "require-initial-oom":
+        print(_require_initial_oom(Path(args.probe_dir), args.method))
+    elif command == "require-fallback":
+        _require_fallback(Path(args.probe_dir), args.method, args.candidate)
+        print("confirmed-fallback")
+    elif command == "require-candidate":
+        print(_require_candidate(Path(args.probe_dir), args.method, args.candidate))
+    elif command == "check-evidence":
+        print(_check_evidence(args))
+    elif command == "archive-failed-attempt":
+        try:
+            archive_failed_distributed_attempt(args.evidence_dir)
+        except RuntimeError as error:
+            parser.error(str(error))
+    elif command == "require-evidence":
+        _require_evidence(args.paths)
+        print("reusable-success")
+    elif command == "summarize":
+        print(json.dumps(_summaries(args.paths), sort_keys=True))
+    elif command == "validate-maximum":
+        payload = _validate_maximum(Path(args.probe_dir), args.long_smoke_steps)
+        print(json.dumps(payload, sort_keys=True))
+    elif command == "compare-maxima":
+        print(json.dumps(_compare_maxima(args.paths), sort_keys=True))
+    elif command == "prepare-timed-run":
+        print(_prepare_timed_run(args))
+    elif command == "launcher-args":
+        for item in _launcher_args_from_manifest(Path(args.manifest)):
+            sys.stdout.buffer.write(item.encode("utf-8") + b"\0")
+    elif command == "validate-timed-run":
+        print(_validate_timed_run(Path(args.run_dir)))
+    elif command == "compare-runs":
+        print(json.dumps(_compare_runs(args.paths, Path(args.output)), sort_keys=True))
+    elif command == "final-report":
+        print(json.dumps(_final_report(args), sort_keys=True))
+    else:  # pragma: no cover - argparse enforces the closed command set.
+        raise AssertionError(command)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = [
+    "Stage1BenchmarkEvidence",
+    "archive_failed_distributed_attempt",
+    "capacity_candidates",
+    "config_digest",
+    "fallback_candidates_after_initial_failure",
+    "load_verified_evidence",
+    "main",
+    "select_high_cost_probe_rows",
+]

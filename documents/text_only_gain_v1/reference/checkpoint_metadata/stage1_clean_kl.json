@@ -1,0 +1,14 @@
+{
+  "additional_model_forwards": 0,
+  "beta": 0.0,
+  "direction": "student_to_reference",
+  "queries": "existing_gain_valid_gt_queries",
+  "reduction": "mean_tokens_per_valid_sample_then_mean_valid_samples",
+  "reference": "existing_ema_clean_logits_detached",
+  "scale": "temperature_squared",
+  "schema_version": 1,
+  "student": "existing_base_clean_logits",
+  "temperature": "prefix_conditioning.temperature",
+  "warmup": "completed_trainer_steps_over_ceil_planned_steps_times_ratio",
+  "warmup_ratio": 0.05
+}

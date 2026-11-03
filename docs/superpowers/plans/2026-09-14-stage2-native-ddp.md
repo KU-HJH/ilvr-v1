@@ -15,7 +15,7 @@
 - Add Stage2-only native DDP to the existing fixed two-node/four-rank coordinator to enable the approved three comparison examples.
 - Keep Stage1, legacy ZeRO, objective math/F/M/reference and training baseline unchanged. No new coordinator, generic backend framework, historical matrix expansion, evaluation migration or deployment automation.
 - Stage2 `train-stage2` and standalone preflight accept `--backend {deepspeed,ddp}`, default `deepspeed`.
-- Native launch retains 2 machines, 4 processes, remote machine rank0/local rank1, master `10.1.102.41`, interface `bond1.102`, same explicit port and repository venv.
+- Native launch retains 2 machines, 4 processes, remote machine rank0/local rank1, master `172.16.11.41`, interface `bond0.11`, same explicit port and repository venv.
 - DDP rejects an explicit `--zero-stage`, a nonempty `DEEPSPEED_CONFIG`, and conflicting enabled Accelerate DeepSpeed/FSDP/plugin environment settings.
 - Keep legacy artifact manifest/identity V1 emitters and accepted field sets unchanged for Stage1/Stage2 ZeRO.
 - V2 requires `execution_backend="ddp"`, `objective_enabled: bool`, `stage="stage2"`, `zero_stage=null`, `deepspeed_config_digest=null`, `model_state_layout="trainer"` plus the existing identity fields. Never encode DDP as ZeRO0.

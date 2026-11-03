@@ -1,0 +1,38 @@
+{
+  "record_kind": "prior_reference_results",
+  "results": [
+    {
+      "variant": "baseline",
+      "accuracy": 0.51,
+      "correct": 204,
+      "samples": 400,
+      "errors": 0,
+      "delta_vs_baseline_percentage_points": 0.0
+    },
+    {
+      "variant": "gain",
+      "accuracy": 0.5025,
+      "correct": 201,
+      "samples": 400,
+      "errors": 0,
+      "delta_vs_baseline_percentage_points": -0.7500000000000062
+    },
+    {
+      "variant": "text-only",
+      "accuracy": 0.52,
+      "correct": 208,
+      "samples": 400,
+      "errors": 0,
+      "delta_vs_baseline_percentage_points": 1.0000000000000009
+    },
+    {
+      "variant": "text-only+text-kl",
+      "accuracy": 0.5425,
+      "correct": 217,
+      "samples": 400,
+      "errors": 0,
+      "delta_vs_baseline_percentage_points": 3.2499999999999973,
+      "delta_vs_text_only_percentage_points": 2.2499999999999964
+    }
+  ]
+}

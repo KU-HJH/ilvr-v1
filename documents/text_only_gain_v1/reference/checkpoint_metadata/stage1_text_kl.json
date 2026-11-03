@@ -1,0 +1,16 @@
+{
+  "additional_checkpoint_traversals": 0,
+  "additional_model_forwards": 0,
+  "beta": 0.01,
+  "direction": "clean_to_text_masked",
+  "gradient": "joint_positive_and_kl_vjp_then_optimizer_backward",
+  "queries": "existing_gain_valid_gt_queries",
+  "reduction": "mean_tokens_per_valid_sample_then_mean_valid_samples",
+  "scale": "temperature_squared",
+  "schema_version": 1,
+  "student": "existing_packed_positive_R_logits",
+  "target": "existing_base_clean_logits_detached",
+  "temperature": "prefix_conditioning.temperature",
+  "warmup": "completed_trainer_steps_over_ceil_planned_steps_times_ratio",
+  "warmup_ratio": 0.05
+}
