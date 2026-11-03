@@ -1,0 +1,4 @@
+{
+  "root": "A visual-history-only ablation is invalid if matching superficial baseline options hides a different actual Trainer/collator, teacher/text arithmetic, initialization, data order, loss or backend. The unused8192 option versus actual32768/nontruncating baseline path already demonstrates this failure mode.",
+  "first_nail": "Before full training, compare the actual pinned baseline and modified builder on identical frozen teacher observations and candidates; require equal baseline intent/text/candidates and first-block query, attribute later query differences exclusively to the visual term, and compare resolved native loss/training profiles on both nodes. Any additional difference falsifies isolation."
+}

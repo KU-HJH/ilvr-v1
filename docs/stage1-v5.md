@@ -51,8 +51,8 @@ Use the existing training coordinator's `--dry-run` on the first printed command
 and the evaluation command's `--dry-run` to inspect exact node commands.
 Training preflight requires clean matching commits, compatible environments,
 readable inputs, fresh namespaces, free resources and the fixed four-rank
-profile: remote rank0 `korea@10.1.102.41`/`llm_kd`, local rank1, two GPUs/node,
-rendezvous `10.1.102.41`, Gloo/NCCL `bond1.102`.
+profile: remote rank0 `korea@172.16.11.41`/`llm_kd`, local rank1, two GPUs/node,
+rendezvous `172.16.11.41`, Gloo/NCCL `bond0.11`.
 
 The selected training profile is micro1/GAS4/global16, LR5e-5, seed42, warmup10,
 BF16, existing AdamW/linear, decay0.01/clip1, DoRA r32/alpha64/dropout0.05 on
