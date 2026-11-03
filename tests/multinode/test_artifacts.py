@@ -858,7 +858,7 @@ def test_push_never_overwrites_and_is_scoped_to_the_run():
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert command[-1] == (
-        "korea@10.1.102.41:"
+        "korea@172.16.11.41:"
         f"{_REPOSITORY_ROOT}/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
@@ -882,7 +882,7 @@ def test_pull_selects_only_local_process_ranks_and_common_metadata(tmp_path):
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
     )
     assert command[-2].startswith(
-        f"korea@10.1.102.41:{_REPOSITORY_ROOT}/checkpoints/"
+        f"korea@172.16.11.41:{_REPOSITORY_ROOT}/checkpoints/"
     )
     assert command[-1] == f"{tmp_path}/checkpoint-copy/"
     assert "--checksum" not in command
@@ -1937,7 +1937,7 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         calls.append(argv)
         if argv[0] == "/usr/bin/rsync":
             files_path = Path(argv[argv.index("--files-from") + 1])
-            if argv[-1].startswith("korea@10.1.102.41:"):
+            if argv[-1].startswith("korea@172.16.11.41:"):
                 return subprocess.CompletedProcess(
                     command, 0, stdout="", stderr=""
                 )
