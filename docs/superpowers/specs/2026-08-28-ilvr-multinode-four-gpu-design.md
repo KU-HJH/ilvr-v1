@@ -7,8 +7,8 @@ DeepSpeed ZeRO-1, ZeRO-2, ZeRO-3 조합을 실행하는 경로를 가진다. 이
 trainer, model, data, loss, checkpoint identity 계약을 다시 만들지 않고 기존
 경로를 두 노드의 총 네 GPU로 확장한다.
 
-두 실행 노드는 각각 NVIDIA H100 NVL 두 장과 `bond1.102` 인터페이스를 가진다.
-원격 실행은 반드시 `korea@10.1.102.41`의 `llm_kd` Docker container에서
+두 실행 노드는 각각 NVIDIA H100 NVL 두 장과 `bond0.11` 인터페이스를 가진다.
+원격 실행은 반드시 `korea@172.16.11.41`의 `llm_kd` Docker container에서
 이루어진다. 두 노드의 `/root/workspace/ILVR`과 artifact 저장소는 같은 문자열
 경로를 사용하지만 물리적으로 공유되는 filesystem은 아니다.
 
@@ -42,12 +42,12 @@ trainer, model, data, loss, checkpoint identity 계약을 다시 만들지 않�
 
 | 항목 | 값 |
 |---|---|
-| 원격 SSH host | `korea@10.1.102.41` |
+| 원격 SSH host | `korea@172.16.11.41` |
 | 원격 container | `llm_kd` |
 | 양쪽 repository root | `/root/workspace/ILVR` |
 | 양쪽 Python environment | `/root/workspace/ILVR/venv/ilvr-venv` |
-| rendezvous/master address | `10.1.102.41` |
-| socket interface | `bond1.102` |
+| rendezvous/master address | `172.16.11.41` |
+| socket interface | `bond0.11` |
 | 원격 machine rank | `0` |
 | 로컬 machine rank | `1` |
 | machines | `2` |
@@ -122,9 +122,9 @@ DeepSpeed config 또는 artifact identity를 stage launcher passthrough로 다�
 ILVR_NUM_MACHINES=2
 ILVR_NUM_PROCESSES=4
 ILVR_MACHINE_RANK=0|1
-ILVR_MAIN_PROCESS_IP=10.1.102.41
+ILVR_MAIN_PROCESS_IP=172.16.11.41
 ILVR_MAIN_PROCESS_PORT=<explicit port>
-ILVR_SOCKET_IFNAME=bond1.102
+ILVR_SOCKET_IFNAME=bond0.11
 ```
 
 각 launcher는 이를 Accelerate의 `--num_machines`, cluster-wide
@@ -231,7 +231,7 @@ sample identity, prediction과 기존 metric 입력을 기록한다.
 - bounded noninteractive SSH와 실행 중인 `llm_kd`
 - 양쪽 repository, venv Python, Accelerate, DeepSpeed, torchrun
 - 동일 tracked Git commit과 clean tracked worktree
-- 양쪽 H100 GPU 정확히 두 장과 `bond1.102`
+- 양쪽 H100 GPU 정확히 두 장과 `bond0.11`
 - master address와 명시한 port의 사용 가능 여부
 - 선택한 Stage, method, ZeRO config와 `world_size=4`
 - model, dataset, image root, resume/handoff checkpoint 입력

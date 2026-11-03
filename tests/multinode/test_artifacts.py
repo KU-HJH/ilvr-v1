@@ -855,7 +855,7 @@ def test_push_never_overwrites_and_is_scoped_to_the_run():
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
     assert command[-1] == (
-        "korea@10.1.102.41:"
+        "korea@172.16.11.41:"
         "/root/workspace/ILVR/checkpoints/"
         "stage1-lora-zero3-four-gpu/checkpoint-2/"
     )
@@ -879,7 +879,7 @@ def test_pull_selects_only_local_process_ranks_and_common_metadata(tmp_path):
         "/usr/bin/docker exec -i llm_kd /usr/bin/rsync"
     )
     assert command[-2].startswith(
-        "korea@10.1.102.41:/root/workspace/ILVR/checkpoints/"
+        "korea@172.16.11.41:/root/workspace/ILVR/checkpoints/"
     )
     assert command[-1] == f"{tmp_path}/checkpoint-copy/"
     assert "--checksum" not in command
@@ -1888,7 +1888,7 @@ def test_prepare_inference_mirrors_exact_artifact_to_remote_and_revalidates(
     } | {b"prepared-model.manifest.json"}
 
 
-def test_subprocess_runner_executes_resume_and_inference_file_lists(
+def test_subprocess_runner_resume_transfer_allows_exclusive_launch_then_inference(
     tmp_path, monkeypatch
 ):
     import src.multinode_artifacts as artifacts_module
@@ -1934,7 +1934,7 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         calls.append(argv)
         if argv[0] == "/usr/bin/rsync":
             files_path = Path(argv[argv.index("--files-from") + 1])
-            if argv[-1].startswith("korea@10.1.102.41:"):
+            if argv[-1].startswith("korea@172.16.11.41:"):
                 return subprocess.CompletedProcess(
                     command, 0, stdout="", stderr=""
                 )
@@ -1983,6 +1983,12 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         requested_identity=identity(),
         destination=canonical_checkpoint,
     )
+    # The real coordinator serializes its launch plan AFTER resume transfer.
+    # Keep both filesystem operations real: mocking prepare_plan hid the collision.
+    serialized = runtime_module.serialize_launch_plan(plan, log_root=runner.log_root)
+    assert json.loads(serialized.path.read_text())["attempt_id"] == plan.attempt_id
+    with pytest.raises(FileExistsError):
+        runtime_module.serialize_launch_plan(plan, log_root=runner.log_root)
     inference_destination = (
         repository
         / "checkpoints"
@@ -2021,6 +2027,25 @@ def test_subprocess_runner_executes_resume_and_inference_file_lists(
         "tokenizer_config.json",
         "tokenizer.json",
     }
+
+    # A later attempt must publish its own list, without replacing the first.
+    first_resume_list = Path(
+        rsync_calls[0][rsync_calls[0].index("--files-from") + 1]
+    )
+    first_contents = first_resume_list.read_bytes()
+    missing = next(
+        item for item in canonical.entries
+        if item.relative_path == Path("rng_state_0.pth")
+    )
+    (canonical_checkpoint / missing.relative_path).unlink()
+    runner.plan = dataclasses.replace(plan, attempt_id="resume-second")
+    runner.pull_resume_artifacts(canonical, (missing,), canonical_checkpoint)
+    second = runtime_module.serialize_launch_plan(
+        runner.plan, log_root=runner.log_root
+    )
+    assert second.path != serialized.path
+    assert first_resume_list.read_bytes() == first_contents
+    assert (canonical_checkpoint / missing.relative_path).stat().st_size == missing.byte_size
 
 
 @pytest.mark.parametrize(

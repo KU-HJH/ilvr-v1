@@ -10,15 +10,15 @@ Python installation.
 
 | Item | Required value |
 | --- | --- |
-| Remote SSH target | `korea@10.1.102.41` |
+| Remote SSH target | `korea@172.16.11.41` |
 | Remote container | `llm_kd` |
 | Repository inside both containers | `/root/workspace/ILVR` |
 | Remote host repository | `/home/korea/Workspace/hjh/workspace/ILVR` |
 | Python on both nodes | `/root/workspace/ILVR/venv/ilvr-venv/bin/python` |
-| Rendezvous/master | `10.1.102.41`, remote machine rank 0 |
+| Rendezvous/master | `172.16.11.41`, remote machine rank 0 |
 | Local machine rank | 1 |
 | Processes | 2 GPUs per node, 4 processes total |
-| Distributed interface | `bond1.102` for Gloo and NCCL |
+| Distributed interface | `bond0.11` for Gloo and NCCL |
 
 Provisioning is a one-time administrator action, not a launcher-time sync.
 Before the first run, the `llm_kd` container must be running; the same clean,
@@ -78,7 +78,7 @@ preflight_id="preflight-stage1-lora-zero3-$(date -u +%Y%m%d-%H%M%S)-$$"
 ```
 
 A live preflight must report matching commit, Python, PyTorch, Accelerate,
-DeepSpeed, two GPUs per node, `bond1.102`, fresh paths/sessions, readable
+DeepSpeed, two GPUs per node, `bond0.11`, fresh paths/sessions, readable
 inputs, writable roots, and the required free space. The subsequent launcher
 is still the authoritative final preflight.
 
@@ -206,7 +206,7 @@ TUNING_METHOD=dora \
 
 The opt-in entropy/Vision auxiliaries use the existing coordinator with
 explicit `--backend ddp`; they do not run through DeepSpeed/ZeRO. The fixed
-topology remains remote rank 0 at `10.1.102.41`, local rank 1, two GPUs per
+topology remains remote rank 0 at `172.16.11.41`, local rank 1, two GPUs per
 node, and four ranks. Native workers use Accelerate `--multi_gpu` and reject an
 active DeepSpeed, FSDP, Megatron, CPU, or Dynamo mode inherited from the
 environment. Do not start ranks manually or replace the coordinator.
@@ -233,7 +233,7 @@ both hosts. First integrate the feature delivery so both canonical repositories
 contain the same committed implementation; a worktree dry-run does not deploy
 it. Confirm identical committed code and environments, readable
 Stage1/data/image inputs at the same absolute paths, all four required GPUs and
-memory, `bond1.102`, the selected free port, and fresh destinations. The default
+memory, `bond0.11`, the selected free port, and fresh destinations. The default
 fresh Stage 2 DoRA source is the reproduced
 `checkpoints/stage1-reproduce-mn-egb8-s431-lr5e5-20260914-055210/checkpoint-431`,
 not `comt_ckpt` or checkpoint-215. Derive the Stage 2 step budget from retained
@@ -282,7 +282,7 @@ prepared_model_dir="/root/workspace/ILVR/checkpoints/evaluation-staging/$source_
 
 ./venv/ilvr-venv/bin/python -m src.multinode prepared-inference-show \
   --model-dir "$prepared_model_dir"
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/env PYTHONPATH=/root/workspace/ILVR /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode prepared-inference-show --model-dir '$prepared_model_dir'"
 ```
 
@@ -444,14 +444,14 @@ each node and decode ownership records through the bounded reader:
 
 ```bash
 tmux list-sessions -F '#{session_name} #{session_windows} #{session_attached}'
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec llm_kd /usr/bin/tmux list-sessions -F '#{session_name} #{session_windows} #{session_attached}'"
 
 run_id=RUN_ID
 attempt_id=initial
 ./venv/ilvr-venv/bin/python -m src.multinode ownership-show \
   --ownership-path "/root/workspace/ILVR/logs/multinode/$run_id/$attempt_id/ownership-rank1.json"
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/env PYTHONPATH=/root/workspace/ILVR /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode ownership-show --ownership-path '/root/workspace/ILVR/logs/multinode/$run_id/$attempt_id/ownership-rank0.json'"
 ```
 
@@ -462,7 +462,7 @@ start time, argv/environment digest, commit, run, attempt, and rank, then sends
 SIGTERM through a pidfd only:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/env PYTHONPATH=/root/workspace/ILVR /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode stop-owned --run-id '$run_id' --machine-rank 0"
 ./venv/ilvr-venv/bin/python -m src.multinode stop-owned \
   --run-id "$run_id" --machine-rank 1

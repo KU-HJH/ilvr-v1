@@ -94,12 +94,12 @@ class ClusterSpec:
     @classmethod
     def default(cls) -> "ClusterSpec":
         return cls(
-            remote_host="korea@10.1.102.41",
+            remote_host="korea@172.16.11.41",
             remote_container="llm_kd",
             remote_repo_root=_REPOSITORY_ROOT,
             remote_host_repo_root=Path("/home/korea/Workspace/hjh/workspace/ILVR"),
-            master_addr="10.1.102.41",
-            socket_ifname="bond1.102",
+            master_addr="172.16.11.41",
+            socket_ifname="bond0.11",
         )
 
 
@@ -1060,13 +1060,13 @@ def _repository_git_stdout(arguments: tuple[str, ...]) -> str:
 
 def _interface_name() -> str:
     completed = subprocess.run(
-        ("ip", "-o", "link", "show", "bond1.102"),
+        ("ip", "-o", "link", "show", "bond0.11"),
         capture_output=True,
         text=True,
         check=False,
         timeout=_CONTROL_TIMEOUT_SECONDS,
     )
-    return "bond1.102" if completed.returncode == 0 else ""
+    return "bond0.11" if completed.returncode == 0 else ""
 
 
 def _tmux_session_is_fresh(name: str) -> bool:
