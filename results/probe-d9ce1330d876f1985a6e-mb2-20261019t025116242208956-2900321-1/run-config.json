@@ -1,0 +1,39 @@
+{
+  "attention_implementation": "flash_attention_2",
+  "audit_digest": "3f7b0897dffd2be7e97fc735e6c7f3c3838edcd118dc04762a7c320c165506a5",
+  "config_digest": "ce093be15710069bdd27aa9b0712e5b95ecff08c6d25265498078d44d1ca12d5",
+  "data_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/probe-d9ce1330d876f1985a6e/probe-input.jsonl",
+  "data_stat": {
+    "device": 2049,
+    "inode": 633636583,
+    "mtime_ns": 1792385475815658783,
+    "size": 3
+  },
+  "deepspeed_config": "/root/.codex/worktrees/0121/ILVR/configs/deepspeed_zero3.json",
+  "deepspeed_config_digest": "10f4c1205115a424da6d143987aa962fa9533f62f7004fd36f780637626d1087",
+  "effective_global_batch": 8,
+  "epochs": 3,
+  "final_save": false,
+  "gradient_accumulation_steps": 2,
+  "image_root": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-interpreter-green-r1/test_batch_probe_keeps_attempt0/images",
+  "kind": "stage1-probe-run-manifest",
+  "learning_rate": 1e-05,
+  "max_steps": 3,
+  "maximum_config_digest": null,
+  "method": "full",
+  "micro_batch": 2,
+  "model": "model path;literal",
+  "output_dir": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/probe-d9ce1330d876f1985a6e-mb2-20261019t025116242208956-2900321-1",
+  "prerequisite_chain": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-interpreter-green-r1/test_batch_probe_keeps_attempt0/prerequisite-chain.json",
+  "prerequisite_chain_digest": "644ab51208c366824c808c1ad65305d0ec9a220f08a2aa1c056e8819b851b3cd",
+  "probe_row_indices": [
+    0
+  ],
+  "probe_rows": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-interpreter-green-r1/test_batch_probe_keeps_attempt0/rows.json",
+  "save_strategy": "no",
+  "schema_version": 1,
+  "seed": 42,
+  "source_data_path": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-interpreter-green-r1/test_batch_probe_keeps_attempt0/probe.jsonl",
+  "tuning_config": null,
+  "world_size": 2
+}

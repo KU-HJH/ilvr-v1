@@ -1,0 +1,106 @@
+{
+  "scope": "CPU inspection and metadata-only PEFT preflight; no training, GPU forward or evaluation",
+  "run_id": "stage1-visual-history-only-egb8-s431-20261019-050115",
+  "checkpoint": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/stage1-visual-history-only-egb8-s431-20261019-050115/checkpoint-431",
+  "checkpoint_physical": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-egb8-s431-20261019-050115/checkpoint-431",
+  "global_step": 431,
+  "epoch": 0.9988412514484357,
+  "last_training_log": {
+    "epoch": 0.9733487833140209,
+    "grad_norm": 0.7395473122596741,
+    "learning_rate": 1.306413301662708e-06,
+    "loss": 0.5359,
+    "step": 420
+  },
+  "mean_training_loss": 0.9029532109501743,
+  "producer_evidence": {
+    "checkpoint_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/stage1-visual-history-only-egb8-s431-20261019-050115/checkpoint-431",
+    "effective_global_batch": 8,
+    "ema_tau": 1.0,
+    "finite_loss": true,
+    "global_step": 431,
+    "gradient_accumulation_steps": 2,
+    "kind": "stage1-training-evidence",
+    "loss": 0.9029532109501743,
+    "method": "dora",
+    "micro_batch": 1,
+    "process_ranks": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "run_id": "stage1-visual-history-only-egb8-s431-20261019-050115",
+    "schema_version": 2,
+    "seed": 42,
+    "stage": "stage1",
+    "teacher_update_mode": "frozen",
+    "world_size": 4,
+    "zero_stage": 1
+  },
+  "complete_trainer_state_valid": true,
+  "peft_preflight_valid": true,
+  "full_peft_metadata_equal_historical_baseline": true,
+  "saved_training_argument_fields_equal_baseline": {
+    "per_device_train_batch_size": 1,
+    "gradient_accumulation_steps": 2,
+    "num_train_epochs": 1.0,
+    "max_steps": 431,
+    "warmup_steps": 10,
+    "learning_rate": 5e-05,
+    "lr_scheduler_type": "linear",
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "seed": 42,
+    "data_seed": null,
+    "bf16": true,
+    "fp16": false,
+    "tf32": null,
+    "optim": "adamw_torch_fused",
+    "gradient_checkpointing": true,
+    "gradient_checkpointing_kwargs": {
+      "use_reentrant": false,
+      "context_fn": "stage1.equivalence.stage1_checkpoint_context_fn"
+    },
+    "dataloader_num_workers": 0,
+    "dataloader_drop_last": false,
+    "save_strategy": "steps",
+    "save_steps": 431,
+    "save_total_limit": 1,
+    "packing": false,
+    "max_seq_length": 32768,
+    "dataset_kwargs": {
+      "skip_prepare_dataset": true
+    },
+    "remove_unused_columns": false,
+    "ddp_find_unused_parameters": false,
+    "report_to": [],
+    "use_cpu": false
+  },
+  "deepspeed_runtime": {
+    "config_digest": "c0922c8640778ae928c503f5bcacb070f2efaf34b7122431d9b4c2989e25debd",
+    "config_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/configs/deepspeed_zero1.json",
+    "enabled": true,
+    "schema_version": 1,
+    "world_size": 4,
+    "zero_stage": 1
+  },
+  "saved_model_state_deepspeed_version": "0.18.0",
+  "safetensors": {
+    "ilvr_token_rows.safetensors": {
+      "tensors": 2,
+      "all_finite": true
+    },
+    "adapter_model.safetensors": {
+      "tensors": 757,
+      "all_finite": true
+    }
+  },
+  "frozen_teacher_tensors_exactly_equal_historical_baseline": 758,
+  "four_rank_rng_files": [
+    "rng_state_0.pth",
+    "rng_state_1.pth",
+    "rng_state_2.pth",
+    "rng_state_3.pth"
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "attention_implementation": "flash_attention_2",
+  "audit_digest": "3affd287175d78a423f20f0be37d18870ce131742b4fecff064de7c6fac94846",
+  "config_digest": "a4c101c0bfbc1d925aea5e60ad5cadeb8cb26b92ce45ab2dad253e610370e27b",
+  "data_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/probe-72f5aa01b4328530d6f5/probe-input.jsonl",
+  "data_stat": {
+    "device": 2049,
+    "inode": 633509834,
+    "mtime_ns": 1792383956979614729,
+    "size": 3
+  },
+  "deepspeed_config": "/root/.codex/worktrees/0121/ILVR/configs/deepspeed_zero3.json",
+  "deepspeed_config_digest": "10f4c1205115a424da6d143987aa962fa9533f62f7004fd36f780637626d1087",
+  "effective_global_batch": 16,
+  "epochs": 3,
+  "final_save": false,
+  "gradient_accumulation_steps": 2,
+  "image_root": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_pre_fix_probe_argv_compat2/images",
+  "kind": "stage1-probe-run-manifest",
+  "learning_rate": 1e-05,
+  "max_steps": 3,
+  "maximum_config_digest": null,
+  "method": "full",
+  "micro_batch": 4,
+  "model": "model path;literal",
+  "output_dir": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/probe-72f5aa01b4328530d6f5-mb4-20261019t022557974532854-2892216-2",
+  "prerequisite_chain": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_pre_fix_probe_argv_compat2/prerequisite-chain.json",
+  "prerequisite_chain_digest": "ae0728850fc47f405721dda69afaf5c5b05cb65fa61ffaa91d7755edb316b179",
+  "probe_row_indices": [
+    0
+  ],
+  "probe_rows": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_pre_fix_probe_argv_compat2/rows.json",
+  "save_strategy": "no",
+  "schema_version": 1,
+  "seed": 42,
+  "source_data_path": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_pre_fix_probe_argv_compat2/probe.jsonl",
+  "tuning_config": null,
+  "world_size": 2
+}

@@ -1,0 +1,39 @@
+{
+  "attention_implementation": "flash_attention_2",
+  "audit_digest": "ebd5d562d7722d10183010f4d65a46c2b40f4dcc1a380e7849a25c4c5092fe80",
+  "config_digest": "f88a7f3cef27535e325b228ea30f93907a63bceaec4e290c25d1900a958d8904",
+  "data_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/p1a16c6ecf13d6cb648ab361eae9659fb1458ac9590a27af12162286824eb3970aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/probe-input.jsonl",
+  "data_stat": {
+    "device": 2049,
+    "inode": 633509582,
+    "mtime_ns": 1792383924506707867,
+    "size": 3
+  },
+  "deepspeed_config": "/root/.codex/worktrees/0121/ILVR/configs/deepspeed_zero3.json",
+  "deepspeed_config_digest": "10f4c1205115a424da6d143987aa962fa9533f62f7004fd36f780637626d1087",
+  "effective_global_batch": 8,
+  "epochs": 3,
+  "final_save": false,
+  "gradient_accumulation_steps": 2,
+  "image_root": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_probe_accepts_a_maximum_l0/images",
+  "kind": "stage1-probe-run-manifest",
+  "learning_rate": 1e-05,
+  "max_steps": 3,
+  "maximum_config_digest": null,
+  "method": "full",
+  "micro_batch": 2,
+  "model": "model path;literal",
+  "output_dir": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/p1a16c6ecf13d6cb648ab361eae9659fb1458ac9590a27af12162286824eb3970aaaaaaaaaaaaaaaaaaaaaaaa-mb2-20261019t022524937259395-2891052-1",
+  "prerequisite_chain": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_probe_accepts_a_maximum_l0/prerequisite-chain.json",
+  "prerequisite_chain_digest": "d0a7d749ca1f132d8eec7a6d8aba591f872b9b30b6c246fbf28669ccee4753fc",
+  "probe_row_indices": [
+    0
+  ],
+  "probe_rows": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_probe_accepts_a_maximum_l0/rows.json",
+  "save_strategy": "no",
+  "schema_version": 1,
+  "seed": 42,
+  "source_data_path": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_probe_accepts_a_maximum_l0/probe.jsonl",
+  "tuning_config": null,
+  "world_size": 2
+}

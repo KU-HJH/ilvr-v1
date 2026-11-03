@@ -1,0 +1,39 @@
+{
+  "attention_implementation": "flash_attention_2",
+  "audit_digest": "9c79784321dc0a5ba8b8d417314518e5e9ae72df158d1648ad291160f6e52107",
+  "config_digest": "7ad25cdf78b3218e277d7df047fdcd078809f6d9c3124baa0cd46f9d318e2da4",
+  "data_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/probe-f40d79be0c33f74fe4ad/probe-input.jsonl",
+  "data_stat": {
+    "device": 2049,
+    "inode": 633603232,
+    "mtime_ns": 1792384563982213751,
+    "size": 3
+  },
+  "deepspeed_config": "/root/.codex/worktrees/0121/ILVR/configs/deepspeed_zero3.json",
+  "deepspeed_config_digest": "10f4c1205115a424da6d143987aa962fa9533f62f7004fd36f780637626d1087",
+  "effective_global_batch": 64,
+  "epochs": 3,
+  "final_save": false,
+  "gradient_accumulation_steps": 2,
+  "image_root": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r2/test_concurrent_probe_controll0/images",
+  "kind": "stage1-probe-run-manifest",
+  "learning_rate": 1e-05,
+  "max_steps": 3,
+  "maximum_config_digest": null,
+  "method": "full",
+  "micro_batch": 16,
+  "model": "model path;literal",
+  "output_dir": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/probe-f40d79be0c33f74fe4ad-mb16-20261019t023608478368735-2896660-4",
+  "prerequisite_chain": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r2/test_concurrent_probe_controll0/prerequisite-chain.json",
+  "prerequisite_chain_digest": "adb9c6d46603932a9fc5c2097753aa9f53c94532d0e6236c1dbe14f8e2ce57c4",
+  "probe_row_indices": [
+    0
+  ],
+  "probe_rows": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r2/test_concurrent_probe_controll0/rows.json",
+  "save_strategy": "no",
+  "schema_version": 1,
+  "seed": 42,
+  "source_data_path": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r2/test_concurrent_probe_controll0/probe.jsonl",
+  "tuning_config": null,
+  "world_size": 2
+}

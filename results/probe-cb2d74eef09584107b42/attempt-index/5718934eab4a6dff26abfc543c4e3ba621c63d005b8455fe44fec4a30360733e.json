@@ -1,0 +1,7 @@
+{
+  "attempt_digest": "5718934eab4a6dff26abfc543c4e3ba621c63d005b8455fe44fec4a30360733e",
+  "attempt_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/probe-cb2d74eef09584107b42-mb32-20261019t023558758998067-2896336-4/attempt-record/evidence/attempt.json",
+  "kind": "stage1-probe-attempt-pointer",
+  "pointer_digest": "36c84edadc24744106acde945ef746be29cc3abc4a794d2386f7f41a980735fc",
+  "schema_version": 1
+}

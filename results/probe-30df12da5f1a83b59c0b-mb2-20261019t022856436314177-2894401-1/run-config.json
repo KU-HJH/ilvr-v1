@@ -1,0 +1,39 @@
+{
+  "attention_implementation": "flash_attention_2",
+  "audit_digest": "22c3a344f64349065a2da9f65bfdbcc8db9d540dfff5ea94267266d79ffbe3a4",
+  "config_digest": "f57930e3c1547930bbd6b4bd238614b8081ed94874e909bf6486b51c4ed487fe",
+  "data_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/probe-30df12da5f1a83b59c0b/probe-input.jsonl",
+  "data_stat": {
+    "device": 2049,
+    "inode": 633537402,
+    "mtime_ns": 1792384136010072534,
+    "size": 3
+  },
+  "deepspeed_config": "/root/.codex/worktrees/0121/ILVR/configs/deepspeed_zero3.json",
+  "deepspeed_config_digest": "10f4c1205115a424da6d143987aa962fa9533f62f7004fd36f780637626d1087",
+  "effective_global_batch": 8,
+  "epochs": 3,
+  "final_save": false,
+  "gradient_accumulation_steps": 2,
+  "image_root": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-negative-green-r1/test_batch_probe_constructs_ch0/images",
+  "kind": "stage1-probe-run-manifest",
+  "learning_rate": 1e-05,
+  "max_steps": 3,
+  "maximum_config_digest": null,
+  "method": "full",
+  "micro_batch": 2,
+  "model": "model path;literal",
+  "output_dir": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/probe-30df12da5f1a83b59c0b-mb2-20261019t022856436314177-2894401-1",
+  "prerequisite_chain": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-negative-green-r1/test_batch_probe_constructs_ch0/prerequisite-chain.json",
+  "prerequisite_chain_digest": "cbaa335986f44d2be202160182adf8242ecc77348780ac6b14fb5296db1531e7",
+  "probe_row_indices": [
+    0
+  ],
+  "probe_rows": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-negative-green-r1/test_batch_probe_constructs_ch0/rows.json",
+  "save_strategy": "no",
+  "schema_version": 1,
+  "seed": 42,
+  "source_data_path": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-negative-green-r1/test_batch_probe_constructs_ch0/probe.jsonl",
+  "tuning_config": null,
+  "world_size": 2
+}

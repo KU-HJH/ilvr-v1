@@ -1,0 +1,39 @@
+{
+  "attention_implementation": "flash_attention_2",
+  "audit_digest": "0b6cf88e7b9877c03a0413f79c1d342c110b4491790b475cc8ee92c85c39f1a7",
+  "config_digest": "cdfff2ebbacf49676cefeb44ff010173bf7f5b2e56c7a84c0dc5ad487e8ed766",
+  "data_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/p2da290a0a68d6250f3f425fae93284577f4ff68b6950b91c338df3d4458f7000aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/probe-input.jsonl",
+  "data_stat": {
+    "device": 2049,
+    "inode": 633603110,
+    "mtime_ns": 1792384548924967820,
+    "size": 3
+  },
+  "deepspeed_config": "/root/.codex/worktrees/0121/ILVR/configs/deepspeed_zero3.json",
+  "deepspeed_config_digest": "10f4c1205115a424da6d143987aa962fa9533f62f7004fd36f780637626d1087",
+  "effective_global_batch": 8,
+  "epochs": 3,
+  "final_save": false,
+  "gradient_accumulation_steps": 2,
+  "image_root": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r2/test_probe_accepts_a_maximum_l0/images",
+  "kind": "stage1-probe-run-manifest",
+  "learning_rate": 1e-05,
+  "max_steps": 3,
+  "maximum_config_digest": null,
+  "method": "full",
+  "micro_batch": 2,
+  "model": "model path;literal",
+  "output_dir": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/p2da290a0a68d6250f3f425fae93284577f4ff68b6950b91c338df3d4458f7000aaaaaaaaaaaaaaaaaaaaaaaa-mb2-20261019t023549352243038-2896051-1",
+  "prerequisite_chain": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r2/test_probe_accepts_a_maximum_l0/prerequisite-chain.json",
+  "prerequisite_chain_digest": "624df80f0588497d93a6d17f5790a98d8dea145703bc3683ea3ab96752c32010",
+  "probe_row_indices": [
+    0
+  ],
+  "probe_rows": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r2/test_probe_accepts_a_maximum_l0/rows.json",
+  "save_strategy": "no",
+  "schema_version": 1,
+  "seed": 42,
+  "source_data_path": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/final-pytest-r2/test_probe_accepts_a_maximum_l0/probe.jsonl",
+  "tuning_config": null,
+  "world_size": 2
+}

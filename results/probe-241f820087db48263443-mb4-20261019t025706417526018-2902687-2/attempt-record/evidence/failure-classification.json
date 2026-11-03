@@ -1,0 +1,10 @@
+{
+  "attempt_config_digest": "0083a9ac0eca85d37295dc65ea36f764a5c0619b11f601aeafb9b071c55b81eb",
+  "attempt_digest": "dacdc0d052c392b07edca1e71438cf6554e9eb467daa480364873ec6f7c1bcaa",
+  "classification": "integration_failure",
+  "classification_digest": "a19521bdaf9e9a648148683943822090903fee1b4fceab4295ffe1a66e7dd2d9",
+  "kind": "stage1-probe-failure-classification",
+  "method": "full",
+  "micro_batch": 4,
+  "schema_version": 1
+}

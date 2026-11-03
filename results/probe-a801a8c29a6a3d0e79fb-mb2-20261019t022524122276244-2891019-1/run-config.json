@@ -1,0 +1,39 @@
+{
+  "attention_implementation": "flash_attention_2",
+  "audit_digest": "de46a49dc84f9a45dec6b6ec236240ef625a47614cef074bfb1aaefad7d13809",
+  "config_digest": "17624a5e3afddf8e60e65ad89e5a795e36ceff2540ba87510b77a9fdf87ff236",
+  "data_path": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/results/probe-a801a8c29a6a3d0e79fb/probe-input.jsonl",
+  "data_stat": {
+    "device": 2049,
+    "inode": 633509571,
+    "mtime_ns": 1792383923694684748,
+    "size": 3
+  },
+  "deepspeed_config": "/root/.codex/worktrees/0121/ILVR/configs/deepspeed_zero3.json",
+  "deepspeed_config_digest": "10f4c1205115a424da6d143987aa962fa9533f62f7004fd36f780637626d1087",
+  "effective_global_batch": 8,
+  "epochs": 3,
+  "final_save": false,
+  "gradient_accumulation_steps": 2,
+  "image_root": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_probe_launches_each_candi0/images",
+  "kind": "stage1-probe-run-manifest",
+  "learning_rate": 1e-05,
+  "max_steps": 3,
+  "maximum_config_digest": null,
+  "method": "full",
+  "micro_batch": 2,
+  "model": "model path;literal",
+  "output_dir": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/probe-a801a8c29a6a3d0e79fb-mb2-20261019t022524122276244-2891019-1",
+  "prerequisite_chain": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_probe_launches_each_candi0/prerequisite-chain.json",
+  "prerequisite_chain_digest": "5dd549cd87080b1797aa5391a8ebb78db945ee342d1ddd5092a066c0cfd8e43d",
+  "probe_row_indices": [
+    0
+  ],
+  "probe_rows": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_probe_launches_each_candi0/rows.json",
+  "save_strategy": "no",
+  "schema_version": 1,
+  "seed": 42,
+  "source_data_path": "/raid/workspace/ILVR/checkpoints/stage1-visual-history-only-dev-20261019/task2-producer-focused-r1/test_probe_launches_each_candi0/probe.jsonl",
+  "tuning_config": null,
+  "world_size": 2
+}

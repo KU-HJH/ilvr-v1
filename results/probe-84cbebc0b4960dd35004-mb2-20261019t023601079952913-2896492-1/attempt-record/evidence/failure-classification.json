@@ -1,0 +1,10 @@
+{
+  "attempt_config_digest": "84658df6ce58a647b624804ef6361de14cd680f7877cb4844c33d8df618678a9",
+  "attempt_digest": "b82d177d598da331736013486e73320636a553b34b86e131a51ed3e5e5c202bf",
+  "classification": "capacity_oom",
+  "classification_digest": "386eabc0001e1169950bd2f5c16c992ce20309fa3949f90e771b01a9eef597d4",
+  "kind": "stage1-probe-failure-classification",
+  "method": "full",
+  "micro_batch": 2,
+  "schema_version": 1
+}

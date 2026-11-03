@@ -1,0 +1,37 @@
+{
+  "run_id": "stage1-visual-history-only-egb8-s431-20261019-050115",
+  "training_commit": "333a11b0baaef1e5f121de791ed77e50e0fcf1b0",
+  "nominal_epochs": 1,
+  "saved_epoch": 0.9988412514484357,
+  "global_step": 431,
+  "mean_training_loss": 0.9029532109501743,
+  "last_logged_loss": 0.5359,
+  "local_machine_exit": {
+    "attempt_id": "initial",
+    "command_digest": "0eaf8854287b2a774d9bab98b82b23c9a14bd5a0178b8d268113432567cad0cd",
+    "commit": "333a11b0baaef1e5f121de791ed77e50e0fcf1b0",
+    "exit_code": 0,
+    "machine_rank": 1,
+    "pid": 2906570,
+    "process_start_ticks": 320862995,
+    "run_id": "stage1-visual-history-only-egb8-s431-20261019-050115",
+    "schema_version": 1
+  },
+  "remote_machine_exit": {
+    "attempt_id": "initial",
+    "command_digest": "5fd578eb9f3955eb8052b35338b8786eb3c1ab6e882a12979bf96a204b9c5a45",
+    "commit": "333a11b0baaef1e5f121de791ed77e50e0fcf1b0",
+    "exit_code": 0,
+    "machine_rank": 0,
+    "pid": 3655423,
+    "process_start_ticks": 320861461,
+    "run_id": "stage1-visual-history-only-egb8-s431-20261019-050115",
+    "schema_version": 1
+  },
+  "coordinator_exit_code": 0,
+  "remote_complete_checkpoint": "/root/workspace/ILVR/.worktrees/stage1-visual-history-only-20261019/checkpoints/stage1-visual-history-only-egb8-s431-20261019-050115/checkpoint-431",
+  "local_prepared_model": "/root/workspace/ILVR/checkpoints/evaluation-staging/stage1-visual-history-only-egb8-s431-20261019-050115/prepared-checkpoint-431",
+  "evaluation_run": false,
+  "verification": "fullsuite2385pass6skip plus actual four ranks, saved baseline settings, PEFT/finite tensors, EMA758 exact, complete four-rank Trainer state, savedDS0.18.0 and both-node prepared manifest checks",
+  "branch_disposition": "human decision pending"
+}
