@@ -221,7 +221,7 @@ def assert_four_rank_prefix(tokens, rank, port):
         "--num_machines": "2",
         "--num_processes": "4",
         "--machine_rank": str(rank),
-        "--main_process_ip": "10.1.102.41",
+        "--main_process_ip": "172.16.11.41",
         "--main_process_port": str(port),
     }
     for flag, value in expected.items():
@@ -236,9 +236,9 @@ def test_stage2_multinode_dry_run_emits_rank_zero_four_process_command():
                 "ILVR_NUM_MACHINES": "2",
                 "ILVR_NUM_PROCESSES": "4",
                 "ILVR_MACHINE_RANK": "0",
-                "ILVR_MAIN_PROCESS_IP": "10.1.102.41",
+                "ILVR_MAIN_PROCESS_IP": "172.16.11.41",
                 "ILVR_MAIN_PROCESS_PORT": "29622",
-                "ILVR_SOCKET_IFNAME": "bond1.102",
+                "ILVR_SOCKET_IFNAME": "bond0.11",
                 "DEEPSPEED_CONFIG": str(REPO_ROOT / "configs/deepspeed_zero2.json"),
             }
         )

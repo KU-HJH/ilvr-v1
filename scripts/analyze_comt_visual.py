@@ -7,13 +7,16 @@ import argparse
 import csv
 import hashlib
 import importlib
+from importlib import metadata as importlib_metadata
 import json
 import math
 import os
 from pathlib import Path
+import platform
 import shlex
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, Callable
@@ -36,6 +39,27 @@ MASKED_MODES = {
     "latent_image_attention_block",
     "global_image_attention_block",
 }
+PARTIAL_ROW_REQUIRED_FIELDS = {
+    "index",
+    "sample_id",
+    "checkpoint",
+    "condition",
+    "category",
+    "category_source",
+    "gold_source",
+    "generated_suffix_token_ids",
+    "prediction_parse_status",
+    "gold_parse_status",
+    "match",
+    "logits_events",
+    "intervention_forward_records",
+    "stop_reason",
+    "error",
+}
+
+
+class ResumeIdentityError(ValueError):
+    """Raised when partial rows do not belong to the requested run."""
 
 
 def _read_jsonl(path: str | os.PathLike[str]) -> list[dict[str, Any]]:
@@ -89,12 +113,338 @@ def _write_json(path: Path, value: object) -> None:
     )
 
 
-def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
+def _atomic_write_json(path: Path, value: object) -> None:
+    """Durably replace one JSON object without exposing a partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(
-                json.dumps(_json_safe(row), ensure_ascii=False, allow_nan=False) + "\n"
+                json.dumps(
+                    _json_safe(value),
+                    indent=2,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
+                + "\n"
             )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_jsonl(path: Path, rows: Iterable[Mapping[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(
+                    json.dumps(_json_safe(row), ensure_ascii=False, allow_nan=False)
+                    + "\n"
+                )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp"
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _restore_file(path: Path, previous: bytes | None) -> None:
+    if previous is not None:
+        _atomic_write_bytes(path, previous)
+        return
+    path.unlink(missing_ok=True)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
+def _publish_canonical(
+    output: Path, rows: Iterable[Mapping[str, Any]], metadata: Mapping[str, Any]
+) -> None:
+    """Publish predictions and metadata as one rollback-safe logical pair."""
+    predictions_path = output / "predictions.jsonl"
+    metadata_path = output / "metadata.json"
+    previous_predictions = (
+        predictions_path.read_bytes() if predictions_path.is_file() else None
+    )
+    previous_metadata = metadata_path.read_bytes() if metadata_path.is_file() else None
+    try:
+        _write_jsonl(predictions_path, rows)
+        _atomic_write_json(metadata_path, metadata)
+    except BaseException as publication_error:
+        try:
+            _restore_file(predictions_path, previous_predictions)
+            _restore_file(metadata_path, previous_metadata)
+        except BaseException as rollback_error:
+            raise RuntimeError(
+                "canonical publication failed and the previous pair could not be restored"
+            ) from rollback_error
+        raise publication_error
+
+
+def _artifact_identity(path: str | os.PathLike[str] | None) -> dict[str, Any] | None:
+    """Bind a declared artifact path to the bytes currently stored there."""
+    if path is None:
+        return None
+    source = Path(path)
+    resolved = source.resolve(strict=False)
+    if not resolved.exists():
+        return {"path": str(source), "resolved_path": str(resolved), "exists": False}
+    files = [resolved] if resolved.is_file() else sorted(
+        item for item in resolved.rglob("*") if item.is_file()
+    )
+    root = resolved.parent if resolved.is_file() else resolved
+    return {
+        "path": str(source),
+        "resolved_path": str(resolved),
+        "exists": True,
+        "files": [
+            {
+                "path": str(item.relative_to(root)),
+                "size": item.stat().st_size,
+                "sha256": _sha256(item),
+            }
+            for item in files
+        ],
+    }
+
+
+def _git_dirty_identity(root: Path) -> dict[str, Any]:
+    """Bind all tracked edits plus source-like untracked files in one repository."""
+    diff = subprocess.run(
+        ["git", "diff", "--binary", "--no-ext-diff", "HEAD", "--", "."],
+        cwd=root,
+        check=False,
+        capture_output=True,
+    )
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=root,
+        check=False,
+        capture_output=True,
+    )
+    if diff.returncode != 0 or untracked.returncode != 0:
+        raise RuntimeError("unable to determine repository dirty-state identity")
+    excluded_roots = {
+        ".pytest_cache",
+        "checkpoints",
+        "data",
+        "logs",
+        "results",
+        "venv",
+    }
+    untracked_paths = []
+    for raw_path in untracked.stdout.split(b"\0"):
+        if not raw_path:
+            continue
+        relative = Path(raw_path.decode("utf-8", errors="surrogateescape"))
+        if (
+            relative.parts[0] in excluded_roots
+            or "__pycache__" in relative.parts
+            or relative.suffix in {".pyc", ".pyo"}
+        ):
+            continue
+        candidate = root / relative
+        if candidate.is_file():
+            untracked_paths.append(_artifact_identity(candidate))
+    return {
+        "tracked_diff_size": len(diff.stdout),
+        "tracked_diff_sha256": hashlib.sha256(diff.stdout).hexdigest(),
+        "untracked": untracked_paths,
+    }
+
+
+def _runtime_code_identity() -> dict[str, Any]:
+    """Bind committed code and every local source/configuration change."""
+    root = Path(__file__).resolve().parents[1]
+    return {
+        "repository_root": str(root),
+        "dirty_state": _git_dirty_identity(root),
+    }
+
+
+def _resume_identity(
+    *,
+    model_dir: str | os.PathLike[str],
+    base_model_dir: str | os.PathLike[str] | None,
+    test_path: Path,
+    source_path: Path,
+    selected_indices: Sequence[int],
+    visual_ablation_mode: str,
+    attention_backend: str,
+    replacements: Mapping[int, int],
+    effective_images: Sequence[Mapping[str, Any]],
+    generation: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+) -> dict[str, Any]:
+    runtime_identity = {
+        key: value
+        for key, value in runtime.items()
+        if key != "input_tensor_dtypes"
+    }
+    return _json_safe(
+        {
+            "schema_version": 1,
+            "commit": _git_commit(),
+            "code": _runtime_code_identity(),
+            "model": _artifact_identity(model_dir),
+            "base_model": _artifact_identity(base_model_dir),
+            "test_data": {"path": str(test_path), "sha256": _sha256(test_path)},
+            "source_data": {
+                "path": str(source_path),
+                "sha256": _sha256(source_path),
+            },
+            "selected_indices": list(selected_indices),
+            "condition": visual_ablation_mode,
+            "attention_backend": attention_backend,
+            "replacement_map": dict(replacements),
+            "effective_images": list(effective_images),
+            "generation": dict(generation),
+            "runtime": runtime_identity,
+        }
+    )
+
+
+def _effective_image_identity(
+    *,
+    selected: Sequence[tuple[int, Mapping[str, Any] | None]],
+    source: Mapping[int, Mapping[str, Any]],
+    replacements: Mapping[int, int],
+    visual_ablation_mode: str,
+    source_parent: Path,
+    resolve_paths: Callable[[object, Path], list[str]],
+) -> list[dict[str, Any]]:
+    result = []
+    for position, (index, original_sample) in enumerate(selected):
+        sample = original_sample
+        if visual_ablation_mode == "image_replacement" and index in replacements:
+            sample = source.get(replacements[index])
+        image_input = [] if visual_ablation_mode == "no_input_image" or sample is None else sample.get("image_input", [])
+        try:
+            paths = resolve_paths(image_input, source_parent) if image_input else []
+        except Exception as error:
+            result.append(
+                {
+                    "position": position,
+                    "index": index,
+                    "image_input": _json_safe(image_input),
+                    "resolution_error": {
+                        "type": type(error).__name__,
+                        "message": str(error),
+                    },
+                }
+            )
+            continue
+        result.append(
+            {
+                "position": position,
+                "index": index,
+                "files": [_artifact_identity(path) for path in paths],
+            }
+        )
+    return result
+
+
+def _partial_path(output: Path, position: int, index: int) -> Path:
+    return output / "partial" / f"{position:06d}-{index}.json"
+
+
+def _load_partial_rows(
+    output: Path, selected_indices: Sequence[int], identity_digest: str
+) -> dict[int, dict[str, Any]]:
+    loaded: dict[int, dict[str, Any]] = {}
+    for position, index in enumerate(selected_indices):
+        path = _partial_path(output, position, index)
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            if (
+                isinstance(record, dict)
+                and record.get("schema_version") == 2
+                and record.get("position") == position
+                and record.get("index") == index
+                and record.get("identity_sha256") == identity_digest
+                and isinstance(record.get("row"), dict)
+                and record["row"].get("index") == index
+                and PARTIAL_ROW_REQUIRED_FIELDS.issubset(record["row"])
+                and record.get("row_sha256") == _value_identity(record["row"])
+            ):
+                loaded[position] = record["row"]
+        except (
+            FileNotFoundError,
+            UnicodeError,
+            json.JSONDecodeError,
+            OSError,
+            TypeError,
+            ValueError,
+            OverflowError,
+            RecursionError,
+        ):
+            continue
+    return loaded
+
+
+def _save_partial_row(
+    output: Path,
+    position: int,
+    index: int,
+    row: Mapping[str, Any],
+    identity_digest: str,
+) -> None:
+    safe_row = _json_safe(row)
+    _atomic_write_json(
+        _partial_path(output, position, index),
+        {
+            "schema_version": 2,
+            "position": position,
+            "index": index,
+            "identity_sha256": identity_digest,
+            "row_sha256": _value_identity(safe_row),
+            "row": safe_row,
+        },
+    )
 
 
 def _git_commit() -> str | None:
@@ -281,12 +631,61 @@ def _attention_classes(qwen_model: Any) -> tuple[list[str], list[str]]:
     return decoder, vision
 
 
+def _distribution_version(name: str) -> str | None:
+    try:
+        return importlib_metadata.version(name)
+    except importlib_metadata.PackageNotFoundError:
+        return None
+
+
 def _runtime_metadata(model: Any, qwen_model: Any, attention_backend: str) -> dict[str, Any]:
+    import torch
+    import transformers
+
     decoder, vision = _attention_classes(qwen_model)
     parameters = list(model.parameters()) if hasattr(model, "parameters") else []
     config = qwen_model.config
     vision_config = getattr(config, "vision_config", None)
+    device = getattr(model, "device", getattr(qwen_model, "device", None))
+    device_type = getattr(device, "type", str(device).split(":", 1)[0])
+    device_identity: dict[str, Any] = {
+        "type": device_type,
+        "declared": str(device),
+    }
+    if device_type == "cuda" and torch.cuda.is_available():
+        device_index = getattr(device, "index", None)
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        properties = torch.cuda.get_device_properties(device_index)
+        device_identity.update(
+            {
+                "index": device_index,
+                "name": properties.name,
+                "capability": [properties.major, properties.minor],
+                "total_memory": properties.total_memory,
+                "uuid": str(getattr(properties, "uuid", "")) or None,
+            }
+        )
     return {
+        "software": {
+            "python": platform.python_version(),
+            "torch": torch.__version__,
+            "transformers": transformers.__version__,
+            "peft": _distribution_version("peft"),
+            "flash_attn": _distribution_version("flash-attn"),
+            "cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+        },
+        "device": device_identity,
+        "determinism": {
+            "algorithms_enabled": torch.are_deterministic_algorithms_enabled(),
+            "warn_only_enabled": torch.is_deterministic_algorithms_warn_only_enabled(),
+            "cudnn_deterministic": torch.backends.cudnn.deterministic,
+            "cudnn_benchmark": torch.backends.cudnn.benchmark,
+            "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+            "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+        },
         "requested_attention_backend": attention_backend,
         "stage": getattr(config, "stage", None),
         "decoder_attention_classes": decoder,
@@ -410,15 +809,25 @@ def run_analysis(
     temperature: float,
     top_p: float,
     limit: int | None,
+    resume: bool = False,
     artifact_loader: Callable[..., tuple[Any, Any]] | None = None,
     generation_runner: Callable[..., Any] | None = None,
     image_loader: Callable[[list[str]], Any] | None = None,
 ) -> dict[str, Any]:
-    """Run one fresh intervention condition and serialize complete row evidence."""
+    """Run one intervention condition with durable sample-boundary resume."""
     if visual_ablation_mode not in VISUAL_ABLATION_MODES:
         raise ValueError(f"unknown visual ablation mode: {visual_ablation_mode}")
+    if resume and temperature > 0:
+        raise ResumeIdentityError(
+            "resume is unavailable for stochastic generation because sample-boundary "
+            "RNG state is not persisted"
+        )
     output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=False)
+    if resume:
+        if not output.is_dir():
+            raise ResumeIdentityError(f"resume output directory is missing: {output}")
+    else:
+        output.mkdir(parents=True, exist_ok=False)
     test_path = Path(test_data_path).resolve(strict=True)
     source_path = Path(source_data_path).resolve(strict=True)
     started = time.perf_counter()
@@ -448,6 +857,7 @@ def run_analysis(
         test_rows = _read_jsonl(test_path)
         source_rows = test_rows if test_path == source_path else _read_jsonl(source_path)
         selected = _select_samples(test_rows, source_rows, indices, limit)
+        selected_indices = [index for index, _ in selected]
         source = _source_index(source_rows)
         replacements = _normalize_replacement_map(replacement_map)
         if visual_ablation_mode == "image_replacement" and not replacements:
@@ -492,6 +902,52 @@ def run_analysis(
                 "end": token_ids.end_token_id,
             },
         }
+        effective_images = _effective_image_identity(
+            selected=selected,
+            source=source,
+            replacements=replacements,
+            visual_ablation_mode=visual_ablation_mode,
+            source_parent=source_path.parent,
+            resolve_paths=resolve_evaluation_image_paths,
+        )
+        identity = _resume_identity(
+            model_dir=model_dir,
+            base_model_dir=base_model_dir,
+            test_path=test_path,
+            source_path=source_path,
+            selected_indices=selected_indices,
+            visual_ablation_mode=visual_ablation_mode,
+            attention_backend=attention_backend,
+            replacements=replacements,
+            effective_images=effective_images,
+            generation=metadata["generation"],
+            runtime=runtime,
+        )
+        identity_digest = _value_identity(identity)
+        manifest_path = output / "resume-manifest.json"
+        if resume:
+            try:
+                previous_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except (FileNotFoundError, json.JSONDecodeError, OSError) as error:
+                raise ResumeIdentityError(
+                    f"resume identity manifest is unavailable: {manifest_path}"
+                ) from error
+            if previous_manifest != {"schema_version": 1, "identity": identity}:
+                raise ResumeIdentityError("resume identity mismatch")
+            reused = _load_partial_rows(output, selected_indices, identity_digest)
+        else:
+            (output / "partial").mkdir()
+            _atomic_write_json(
+                manifest_path, {"schema_version": 1, "identity": identity}
+            )
+            reused = {}
+        metadata["resume"] = {
+            "enabled": resume,
+            "reused_count": len(reused),
+            "recomputed_count": len(selected) - len(reused),
+        }
+        if not resume:
+            _atomic_write_json(output / "metadata.json", metadata)
         opener = image_loader or official.open_images
         generate = generation_runner or _default_generation_runner
         effective_device = getattr(model, "device", getattr(qwen_model, "device", None))
@@ -499,12 +955,16 @@ def run_analysis(
             raise ValueError("unable to determine the evaluation device")
         observed_input_dtypes: dict[str, set[str]] = {}
 
-        for index, original_sample in selected:
+        for position, (index, original_sample) in enumerate(selected):
+            if position in reused:
+                rows.append(reused[position])
+                continue
             if original_sample is None:
                 missing = _error_row(index, None, f"source index {index} is missing")
                 missing["condition"] = visual_ablation_mode
                 missing["checkpoint"] = str(model_dir)
                 rows.append(missing)
+                _save_partial_row(output, position, index, missing, identity_digest)
                 continue
             sample_started = time.perf_counter()
             sample = dict(original_sample)
@@ -639,12 +1099,13 @@ def run_analysis(
                 failed["gold_source"] = gold_source
                 failed["wall_time_sec"] = time.perf_counter() - sample_started
                 rows.append(failed)
+            _save_partial_row(output, position, index, rows[-1], identity_digest)
 
         runtime["input_tensor_dtypes"] = {
             name: sorted(dtypes) for name, dtypes in sorted(observed_input_dtypes.items())
         }
         metadata["selection"] = {
-            "requested_indices": [index for index, _ in selected],
+            "requested_indices": selected_indices,
             "requested_count": len(selected),
         }
         metadata["completed_count"] = sum(row.get("error") in (None, "") for row in rows)
@@ -652,6 +1113,8 @@ def run_analysis(
         metadata["status"] = "failed" if metadata["error_count"] else "completed"
         metadata["aggregate"] = aggregate_rows(rows)
     except Exception as error:
+        if resume:
+            raise
         metadata["status"] = "failed"
         metadata["error"] = str(error)
         metadata.setdefault("completed_count", 0)
@@ -659,8 +1122,7 @@ def run_analysis(
     metadata["wall_time_sec"] = time.perf_counter() - started
     metadata = _json_safe(metadata)
     rows = _json_safe(rows)
-    _write_jsonl(output / "predictions.jsonl", rows)
-    _write_json(output / "metadata.json", metadata)
+    _publish_canonical(output, rows, metadata)
     return {"rows": rows, "metadata": metadata}
 
 
@@ -875,6 +1337,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--temperature", type=float, default=0.0)
     run.add_argument("--top-p", type=float, default=1.0)
     run.add_argument("--limit", type=int)
+    run.add_argument("--resume", action="store_true")
 
     compare = subcommands.add_parser("compare", help="compare paired prediction JSONL files")
     compare.add_argument("--baseline-jsonl", required=True)
@@ -906,6 +1369,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             temperature=args.temperature,
             top_p=args.top_p,
             limit=args.limit,
+            resume=args.resume,
         )
         return 0 if result["metadata"]["status"] == "completed" else 1
     if args.command == "compare":

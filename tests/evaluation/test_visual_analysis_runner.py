@@ -342,6 +342,443 @@ def test_cli_accepts_neutral_control():
     assert args.visual_ablation_mode == "causal_mask_control"
 
 
+def _scientific_rows(rows):
+    ignored = {"inference_time_sec", "wall_time_sec"}
+    return [
+        {key: value for key, value in row.items() if key not in ignored}
+        for row in rows
+    ]
+
+
+def test_interrupted_run_resumes_completed_samples_without_changing_results(tmp_path):
+    """Catches resume discarding or regenerating a completed sample."""
+    rows = [
+        {"text_input": "question A", "image_input": [], "original_final_answer": "10"},
+        {"text_input": "question B", "image_input": [], "original_final_answer": "10"},
+    ]
+    calls = []
+
+    def interrupt_second(**context):
+        calls.append(context["sample"]["text_input"])
+        if len(calls) == 2:
+            raise KeyboardInterrupt("controlled interruption")
+        return _successful_generator(**context)
+
+    with pytest.raises(KeyboardInterrupt, match="controlled interruption"):
+        _run(tmp_path / "resumed", rows, generation_runner=interrupt_second)
+
+    output = tmp_path / "resumed" / "results" / "run"
+    partials = sorted((output / "partial").glob("*.json"))
+    assert [path.name for path in partials] == ["000000-0.json"]
+
+    resumed_calls = []
+
+    def resume_generator(**context):
+        resumed_calls.append(context["sample"]["text_input"])
+        return _successful_generator(**context)
+
+    resumed, _, _ = _run(
+        tmp_path / "resumed",
+        rows,
+        resume=True,
+        generation_runner=resume_generator,
+    )
+    uninterrupted, _, _ = _run(tmp_path / "uninterrupted", rows)
+
+    assert resumed_calls == ["question B"]
+    assert resumed["metadata"]["resume"]["reused_count"] == 1
+    assert _scientific_rows(resumed["rows"]) == _scientific_rows(
+        uninterrupted["rows"]
+    )
+    assert [json.loads(line)["index"] for line in (output / "predictions.jsonl").read_text().splitlines()] == [0, 1]
+
+
+def test_resume_rejects_generation_identity_mismatch_before_inference(tmp_path):
+    """Catches resume mixing rows produced with different generation settings."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    _run(tmp_path, rows)
+    calls = []
+
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _run(
+            tmp_path,
+            rows,
+            resume=True,
+            max_new_tokens=9,
+            generation_runner=lambda **context: calls.append(context) or _successful_generator(**context),
+        )
+
+    assert calls == []
+
+
+def test_resume_rejects_changed_model_artifact_before_inference(tmp_path):
+    """Catches resume trusting a reused model path whose bytes changed."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    model = tmp_path / "model"
+    model.mkdir()
+    weights = model / "weights.bin"
+    weights.write_bytes(b"model-v1")
+    _run(tmp_path, rows, model_dir=model)
+    weights.write_bytes(b"model-v2")
+    calls = []
+
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _run(
+            tmp_path,
+            rows,
+            model_dir=model,
+            resume=True,
+            generation_runner=lambda **context: calls.append(context) or _successful_generator(**context),
+        )
+
+    assert calls == []
+
+
+def test_resume_rejects_changed_effective_image_before_inference(tmp_path):
+    """Catches resume mixing rows after an image changed behind a stable JSONL path."""
+    rows = [{
+        "text_input": "question",
+        "image_input": ["images_comt/deletion/a.png"],
+        "original_final_answer": "10",
+    }]
+    dataset = tmp_path / "dataset"
+    source = _write_source(dataset, rows)
+    output = tmp_path / "results" / "run"
+    harness = tmp_path / "harness"
+    _run(
+        harness,
+        rows,
+        test_data_path=source,
+        source_data_path=source,
+        output_dir=output,
+    )
+    (dataset / "images_comt/deletion/a.png").write_bytes(b"changed-image")
+    calls = []
+
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _run(
+            harness,
+            rows,
+            test_data_path=source,
+            source_data_path=source,
+            output_dir=output,
+            resume=True,
+            generation_runner=lambda **context: calls.append(context) or _successful_generator(**context),
+        )
+
+    assert calls == []
+
+
+def test_resume_identity_scan_preserves_missing_image_error_row(tmp_path):
+    """Catches pre-resume hashing turning one missing image into a run-level failure."""
+    rows = [{
+        "text_input": "question",
+        "image_input": ["images_comt/deletion/missing.png"],
+        "original_final_answer": "10",
+    }]
+    dataset = tmp_path / "dataset"
+    source = _write_source(dataset, rows)
+    (dataset / "images_comt/deletion/missing.png").unlink()
+
+    result, _, _ = _run(
+        tmp_path / "harness",
+        rows,
+        test_data_path=source,
+        source_data_path=source,
+        output_dir=tmp_path / "results" / "run",
+    )
+
+    assert len(result["rows"]) == 1
+    assert result["rows"][0]["index"] == 0
+    assert "Image not found" in result["rows"][0]["error"]
+
+
+def test_resume_reruns_corrupt_partial_record(tmp_path):
+    """Catches a malformed partial row being trusted or blocking recovery."""
+    rows = [
+        {"text_input": "question A", "image_input": [], "original_final_answer": "10"},
+        {"text_input": "question B", "image_input": [], "original_final_answer": "10"},
+    ]
+    calls = []
+
+    def interrupt_second(**context):
+        calls.append(context["sample"]["text_input"])
+        if len(calls) == 2:
+            raise KeyboardInterrupt("controlled interruption")
+        return _successful_generator(**context)
+
+    with pytest.raises(KeyboardInterrupt):
+        _run(tmp_path, rows, generation_runner=interrupt_second)
+
+    partial = tmp_path / "results" / "run" / "partial" / "000000-0.json"
+    partial.write_text("{truncated", encoding="utf-8")
+    resumed_calls = []
+
+    result, _, _ = _run(
+        tmp_path,
+        rows,
+        resume=True,
+        generation_runner=lambda **context: resumed_calls.append(context["sample"]["text_input"])
+        or _successful_generator(**context),
+    )
+
+    assert resumed_calls == ["question A", "question B"]
+    assert result["metadata"]["resume"]["reused_count"] == 0
+
+
+def test_failed_resume_preserves_completed_canonical_outputs(tmp_path):
+    """Catches a run-level resume failure erasing a previously completed result."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    _run(tmp_path, rows)
+    output = tmp_path / "results" / "run"
+    predictions_before = (output / "predictions.jsonl").read_bytes()
+    metadata_before = (output / "metadata.json").read_bytes()
+
+    def fail_loader(**_kwargs):
+        raise RuntimeError("loader failed during resume")
+
+    with pytest.raises(RuntimeError, match="loader failed during resume"):
+        _run(tmp_path, rows, resume=True, artifact_loader=fail_loader)
+
+    assert (output / "predictions.jsonl").read_bytes() == predictions_before
+    assert (output / "metadata.json").read_bytes() == metadata_before
+
+
+def test_resume_rejects_stochastic_generation_without_rng_boundary_state(tmp_path):
+    """Catches stochastic resume claiming equivalence without restoring RNG state."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    _run(tmp_path, rows, temperature=0.7)
+
+    with pytest.raises(ValueError, match="stochastic generation"):
+        _run(tmp_path, rows, temperature=0.7, resume=True)
+
+
+def test_resume_reruns_checksum_valid_but_structurally_incomplete_partial(tmp_path):
+    """Catches a syntactically valid partial with missing scientific fields being reused."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    _run(tmp_path, rows)
+    partial = tmp_path / "results" / "run" / "partial" / "000000-0.json"
+    record = json.loads(partial.read_text(encoding="utf-8"))
+    record["row"].pop("condition")
+    record["row_sha256"] = runner._value_identity(record["row"])
+    partial.write_text(json.dumps(record), encoding="utf-8")
+    calls = []
+
+    result, _, _ = _run(
+        tmp_path,
+        rows,
+        resume=True,
+        generation_runner=lambda **context: calls.append(context["sample"]["text_input"])
+        or _successful_generator(**context),
+    )
+
+    assert calls == ["question"]
+    assert result["metadata"]["resume"]["reused_count"] == 0
+    assert result["rows"][0]["condition"] == "baseline"
+
+
+def test_resume_reruns_partial_whose_row_bytes_changed(tmp_path):
+    """Catches a valid-looking partial whose persisted row no longer matches its digest."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    _run(tmp_path, rows)
+    partial = tmp_path / "results" / "run" / "partial" / "000000-0.json"
+    record = json.loads(partial.read_text(encoding="utf-8"))
+    record["row"]["generated_suffix_token_ids"] = [999]
+    partial.write_text(json.dumps(record), encoding="utf-8")
+    calls = []
+
+    result, _, _ = _run(
+        tmp_path,
+        rows,
+        resume=True,
+        generation_runner=lambda **context: calls.append(context["sample"]["text_input"])
+        or _successful_generator(**context),
+    )
+
+    assert calls == ["question"]
+    assert result["metadata"]["resume"]["reused_count"] == 0
+    assert result["rows"][0]["generated_suffix_token_ids"] != [999]
+
+
+def test_resume_reruns_partial_copied_from_another_run_identity(tmp_path):
+    """Catches a checksum-valid partial from a different run being reused."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    model_a = tmp_path / "model-a"
+    model_b = tmp_path / "model-b"
+    model_a.mkdir()
+    model_b.mkdir()
+    (model_a / "weights.bin").write_bytes(b"model-a")
+    (model_b / "weights.bin").write_bytes(b"model-b")
+    _run(tmp_path / "a", rows, model_dir=model_a)
+    _run(tmp_path / "b", rows, model_dir=model_b)
+    partial_a = tmp_path / "a" / "results" / "run" / "partial" / "000000-0.json"
+    partial_b = tmp_path / "b" / "results" / "run" / "partial" / "000000-0.json"
+    partial_b.write_bytes(partial_a.read_bytes())
+    calls = []
+
+    result, _, _ = _run(
+        tmp_path / "b",
+        rows,
+        model_dir=model_b,
+        resume=True,
+        generation_runner=lambda **context: calls.append(context["sample"]["text_input"])
+        or _successful_generator(**context),
+    )
+
+    assert calls == ["question"]
+    assert result["metadata"]["resume"]["reused_count"] == 0
+
+
+@pytest.mark.parametrize("corruption", ["invalid_utf8", "nonfinite_json"])
+def test_resume_reruns_partial_with_unreadable_or_unhashable_content(
+    tmp_path, corruption
+):
+    """Catches corrupt bytes or non-finite JSON aborting the whole resume."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    _run(tmp_path, rows)
+    partial = tmp_path / "results" / "run" / "partial" / "000000-0.json"
+    if corruption == "invalid_utf8":
+        partial.write_bytes(b"\xff\xfe")
+    else:
+        record = json.loads(partial.read_text(encoding="utf-8"))
+        record["row"]["inference_time_sec"] = float("nan")
+        partial.write_text(json.dumps(record), encoding="utf-8")
+    calls = []
+
+    result, _, _ = _run(
+        tmp_path,
+        rows,
+        resume=True,
+        generation_runner=lambda **context: calls.append(context["sample"]["text_input"])
+        or _successful_generator(**context),
+    )
+
+    assert calls == ["question"]
+    assert result["metadata"]["resume"]["reused_count"] == 0
+
+
+def test_jsonl_publication_interruption_preserves_existing_file(tmp_path, monkeypatch):
+    """Catches final publication truncating the previous canonical predictions."""
+    output = tmp_path / "predictions.jsonl"
+    output.write_bytes(b"old-canonical-result\n")
+    real_dumps = runner.json.dumps
+    calls = 0
+
+    def interrupt_second_row(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise KeyboardInterrupt("publication interrupted")
+        return real_dumps(*args, **kwargs)
+
+    monkeypatch.setattr(runner.json, "dumps", interrupt_second_row)
+    with pytest.raises(KeyboardInterrupt, match="publication interrupted"):
+        runner._write_jsonl(output, [{"index": 0}, {"index": 1}])
+
+    assert output.read_bytes() == b"old-canonical-result\n"
+
+
+def test_metadata_publication_failure_rolls_back_both_canonical_files(
+    tmp_path, monkeypatch
+):
+    """Catches a new predictions file being paired with old metadata."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    _run(tmp_path, rows)
+    output = tmp_path / "results" / "run"
+    predictions = output / "predictions.jsonl"
+    metadata = output / "metadata.json"
+    predictions.write_bytes(b"old-canonical-predictions\n")
+    predictions_before = predictions.read_bytes()
+    metadata_before = metadata.read_bytes()
+    real_atomic_write_json = runner._atomic_write_json
+
+    def interrupt_metadata(path, value):
+        if path == metadata:
+            raise KeyboardInterrupt("metadata publication interrupted")
+        return real_atomic_write_json(path, value)
+
+    monkeypatch.setattr(runner, "_atomic_write_json", interrupt_metadata)
+    with pytest.raises(KeyboardInterrupt, match="metadata publication interrupted"):
+        _run(tmp_path, rows, resume=True)
+
+    assert predictions.read_bytes() == predictions_before
+    assert metadata.read_bytes() == metadata_before
+
+
+def test_git_dirty_identity_changes_for_any_tracked_source_edit(tmp_path):
+    """Catches a hand-maintained dependency list missing behavior-affecting edits."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    dependency = tmp_path / "previously-unlisted-dependency.py"
+    dependency.write_text("VERSION = 1\n", encoding="utf-8")
+    subprocess.run(["git", "add", dependency.name], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=tmp_path, check=True)
+    identity = getattr(runner, "_git_dirty_identity", lambda _root: None)
+    before = identity(tmp_path)
+    dependency.write_text("VERSION = 2\n", encoding="utf-8")
+    after = identity(tmp_path)
+
+    assert before != after
+
+
+def test_resume_rejects_changed_runtime_code_bytes(tmp_path, monkeypatch):
+    """Catches dirty behavior code changing without a Git commit change."""
+    rows = [{"text_input": "question", "image_input": [], "original_final_answer": "10"}]
+    code_path = tmp_path / "runtime_behavior.py"
+    code_path.write_text("VERSION = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        runner,
+        "_runtime_code_identity",
+        lambda: [runner._artifact_identity(code_path)],
+        raising=False,
+    )
+    _run(tmp_path, rows)
+    code_path.write_text("VERSION = 2\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="resume identity mismatch"):
+        _run(tmp_path, rows, resume=True)
+
+
+def test_runtime_metadata_records_software_device_and_determinism():
+    """Catches resume identity omitting result-affecting runtime characteristics."""
+    model = FakeModel()
+    runtime = runner._runtime_metadata(model, model, "sdpa")
+
+    assert runtime["software"]["python"]
+    assert runtime["software"]["torch"] == torch.__version__
+    assert "peft" in runtime["software"]
+    assert "flash_attn" in runtime["software"]
+    assert runtime["device"]["type"] == "cpu"
+    assert isinstance(runtime["determinism"]["algorithms_enabled"], bool)
+
+
+def test_cli_accepts_resume():
+    """Catches the durable resume behavior being unreachable from the CLI."""
+    args = runner.build_parser().parse_args(
+        [
+            "run",
+            "--model-dir",
+            "checkpoints/fake",
+            "--test-data-path",
+            "data/TEST.jsonl",
+            "--source-data-path",
+            "data/TEST.jsonl",
+            "--output-dir",
+            "results/fake",
+            "--visual-ablation-mode",
+            "baseline",
+            "--attention-backend",
+            "sdpa",
+            "--resume",
+        ]
+    )
+
+    assert args.resume is True
+
+
 def test_replacement_keeps_recipient_text_and_scores_only_valid_matched_donor_gold(tmp_path):
     """Catches image replacement swapping the question or accepting an unmatched donor."""
     rows = [
