@@ -47,7 +47,7 @@ _REMOTE_HOST_REPOSITORY = (
     Path("/home/korea/Workspace/hjh/workspace/ILVR")
     / _LOCAL_REPOSITORY.relative_to(Path("/root/workspace/ILVR"))
 )
-_REMOTE_HOST = "korea@10.1.102.41"
+_REMOTE_HOST = "korea@172.16.11.41"
 _RSYNC_SSH = "/usr/bin/ssh -o BatchMode=yes -o ConnectTimeout=8"
 _MAX_COMMON_METADATA_BYTES = 4 * 1024 * 1024
 _MAX_LATEST_BYTES = 1024

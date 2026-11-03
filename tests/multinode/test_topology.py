@@ -41,7 +41,7 @@ def test_default_cluster_is_fixed_two_node_four_process_topology():
     """Catches a launch silently drifting from the approved four-GPU topology."""
     spec = ClusterSpec.default()
 
-    assert spec.remote_host == "korea@10.1.102.41"
+    assert spec.remote_host == "korea@172.16.11.41"
     assert spec.remote_container == "llm_kd"
     assert spec.remote_repo_root == REPO_ROOT
     relative = REPO_ROOT.relative_to(Path("/root/workspace/ILVR"))
@@ -50,8 +50,8 @@ def test_default_cluster_is_fixed_two_node_four_process_topology():
     )
     assert (spec.num_machines, spec.gpus_per_node, spec.num_processes) == (2, 2, 4)
     assert (spec.remote_rank, spec.local_rank) == (0, 1)
-    assert spec.master_addr == "10.1.102.41"
-    assert spec.socket_ifname == "bond1.102"
+    assert spec.master_addr == "172.16.11.41"
+    assert spec.socket_ifname == "bond0.11"
 
 
 @pytest.mark.parametrize("zero_stage", (1, 2, 3))
