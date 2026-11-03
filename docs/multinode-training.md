@@ -48,15 +48,15 @@ Python installation.
 
 | Item | Required value |
 | --- | --- |
-| Remote SSH target | `korea@10.1.102.41` |
+| Remote SSH target | `korea@172.16.11.41` |
 | Remote container | `llm_kd` |
 | Repository inside both containers | `/root/workspace/ILVR` |
 | Remote host repository | `/home/korea/Workspace/hjh/workspace/ILVR` |
 | Python on both nodes | `/root/workspace/ILVR/venv/ilvr-venv/bin/python` |
-| Rendezvous/master | `10.1.102.41`, remote machine rank 0 |
+| Rendezvous/master | `172.16.11.41`, remote machine rank 0 |
 | Local machine rank | 1 |
 | Processes | 2 GPUs per node, 4 processes total |
-| Distributed interface | `bond1.102` for Gloo and NCCL |
+| Distributed interface | `bond0.11` for Gloo and NCCL |
 
 Provisioning is a one-time administrator action, not a launcher-time sync.
 Before the first run, the `llm_kd` container must be running; the same clean,
@@ -116,7 +116,7 @@ preflight_id="preflight-stage1-lora-zero3-$(date -u +%Y%m%d-%H%M%S)-$$"
 ```
 
 A live preflight must report matching commit, Python, PyTorch, Accelerate,
-DeepSpeed, two GPUs per node, `bond1.102`, fresh paths/sessions, readable
+DeepSpeed, two GPUs per node, `bond0.11`, fresh paths/sessions, readable
 inputs, writable roots, and the required free space. The subsequent launcher
 is still the authoritative final preflight.
 
@@ -265,7 +265,7 @@ prepared_model_dir="/root/workspace/ILVR/checkpoints/evaluation-staging/$source_
 
 ./venv/ilvr-venv/bin/python -m src.multinode prepared-inference-show \
   --model-dir "$prepared_model_dir"
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/env PYTHONPATH=/root/workspace/ILVR /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode prepared-inference-show --model-dir '$prepared_model_dir'"
 ```
 
@@ -427,14 +427,14 @@ each node and decode ownership records through the bounded reader:
 
 ```bash
 tmux list-sessions -F '#{session_name} #{session_windows} #{session_attached}'
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec llm_kd /usr/bin/tmux list-sessions -F '#{session_name} #{session_windows} #{session_attached}'"
 
 run_id=RUN_ID
 attempt_id=initial
 ./venv/ilvr-venv/bin/python -m src.multinode ownership-show \
   --ownership-path "/root/workspace/ILVR/logs/multinode/$run_id/$attempt_id/ownership-rank1.json"
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/env PYTHONPATH=/root/workspace/ILVR /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode ownership-show --ownership-path '/root/workspace/ILVR/logs/multinode/$run_id/$attempt_id/ownership-rank0.json'"
 ```
 
@@ -445,7 +445,7 @@ start time, argv/environment digest, commit, run, attempt, and rank, then sends
 SIGTERM through a pidfd only:
 
 ```bash
-ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@10.1.102.41 \
+ssh -o BatchMode=yes -o ConnectTimeout=8 -- korea@172.16.11.41 \
   "/usr/bin/docker exec --workdir /root/workspace/ILVR llm_kd /usr/bin/env PYTHONPATH=/root/workspace/ILVR /root/workspace/ILVR/venv/ilvr-venv/bin/python -m src.multinode stop-owned --run-id '$run_id' --machine-rank 0"
 ./venv/ilvr-venv/bin/python -m src.multinode stop-owned \
   --run-id "$run_id" --machine-rank 1
