@@ -638,9 +638,9 @@ This catches a shared stale-teacher bug that paired B=1/B=2 equality would not.
 ### 8.3 Real 3B, four-GPU online control audit
 
 The approved multi-node route starts the fresh B=1 and B=2 jobs sequentially
-in the `llm_kd` container on `10.1.102.41` and the local node, using four GPUs
+in the `llm_kd` container on `172.16.11.41` and the local node, using four GPUs
 total: remote rank 0, local rank 1, two visible GPUs per node,
-`MASTER_ADDR=10.1.102.41`, and both NCCL/GLOO interfaces `bond1.102`. It reuses
+`MASTER_ADDR=172.16.11.41`, and both NCCL/GLOO interfaces `bond0.11`. It reuses
 `run_stage1_training.sh` through `python -m src.multinode train-stage1`; no new
 distributed launcher is introduced.
 
