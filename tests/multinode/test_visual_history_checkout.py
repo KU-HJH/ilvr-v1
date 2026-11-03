@@ -74,11 +74,11 @@ def test_plan_binds_both_nodes_to_fixed_checkout_without_changing_topology():
     assert cluster.remote_repo_root == EXECUTION_ROOT
     assert cluster.remote_host_repo_root == HOST_ROOT
     assert (cluster.remote_host, cluster.remote_container) == (
-        "korea@10.1.102.41", "llm_kd"
+        "korea@172.16.11.41", "llm_kd"
     )
     assert (cluster.remote_rank, cluster.local_rank) == (0, 1)
     assert (cluster.num_machines, cluster.gpus_per_node, plan.world_size) == (2, 2, 4)
-    assert (cluster.master_addr, cluster.socket_ifname) == ("10.1.102.41", "bond1.102")
+    assert (cluster.master_addr, cluster.socket_ifname) == ("172.16.11.41", "bond0.11")
     assert plan.deepspeed_config == EXECUTION_ROOT / "configs/deepspeed_zero2.json"
     assert (EXECUTION_ROOT / "configs/deepspeed_zero2.json").read_bytes() == (
         REPOSITORY / "configs/deepspeed_zero2.json"
@@ -94,7 +94,7 @@ def test_both_owned_commands_bind_checkout_scripts_python_outputs_and_environmen
     )
     docker, remote = remote_argv(commands.remote)
     assert docker[docker.index("--workdir") + 1] == str(EXECUTION_ROOT)
-    assert commands.remote[5] == "korea@10.1.102.41"
+    assert commands.remote[5] == "korea@172.16.11.41"
     for rank, spec in enumerate(commands.node_specs):
         environment = dict(spec.environment)
         assert spec.machine_rank == rank
@@ -107,8 +107,8 @@ def test_both_owned_commands_bind_checkout_scripts_python_outputs_and_environmen
         assert environment["ILVR_MACHINE_RANK"] == str(rank)
         assert environment["ILVR_NUM_MACHINES"] == "2"
         assert environment["ILVR_NUM_PROCESSES"] == "4"
-        assert environment["ILVR_MAIN_PROCESS_IP"] == "10.1.102.41"
-        assert environment["ILVR_SOCKET_IFNAME"] == "bond1.102"
+        assert environment["ILVR_MAIN_PROCESS_IP"] == "172.16.11.41"
+        assert environment["ILVR_SOCKET_IFNAME"] == "bond0.11"
         assert spec.ownership_path == EXECUTION_ROOT / f"logs/multinode/{RUN_ID}/initial/ownership-rank{rank}.json"
         assert spec.exit_path == EXECUTION_ROOT / f"logs/multinode/{RUN_ID}/initial/exit-rank{rank}.json"
         child = spec.command[spec.command.index("--") + 1:]
@@ -169,7 +169,7 @@ def test_artifact_and_transfer_paths_stay_checkout_owned_and_use_physical_checkp
         process_ranks=(2, 3), entries=(), runtime_identity={},
     )
     transfer = build_push_command(manifest)
-    assert transfer[-2:] == (f"{logical}/", f"korea@10.1.102.41:{logical}/")
+    assert transfer[-2:] == (f"{logical}/", f"korea@172.16.11.41:{logical}/")
     assert transfer[transfer.index("--files-from") + 1] == str(
         EXECUTION_ROOT / f"logs/multinode/{RUN_ID}/artifact-push-rank1.files"
     )
@@ -178,7 +178,7 @@ def test_artifact_and_transfer_paths_stay_checkout_owned_and_use_physical_checkp
         paths.result_dir, files_from=EXECUTION_ROOT / "logs/evaluation.files"
     )
     assert result_transfer[-2:] == (
-        f"korea@10.1.102.41:{paths.result_dir}/", f"{paths.result_dir}/"
+        f"korea@172.16.11.41:{paths.result_dir}/", f"{paths.result_dir}/"
     )
 
 
