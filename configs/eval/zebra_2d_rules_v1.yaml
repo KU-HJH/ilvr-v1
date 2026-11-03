@@ -1,0 +1,10 @@
+schema_version: 1
+benchmark: zebra_2d
+profile: zebra_2d_rules_v1
+categories: [Jigsaw, Search]
+dataset_root: data/evaluation/zebra-2d400-v1
+# Actual scoring requires the actual generation identity/settings; this config defines no Zebra generation prompt.
+run_metadata:
+  model_identity: external:model
+  prompt_template_identity: zebra-2d400-v1
+  generation_config: {}

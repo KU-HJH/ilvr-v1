@@ -1,0 +1,291 @@
+{
+  "schema_version": 1,
+  "repositories": [
+    {
+      "name": "Visual-Spatial-Planning",
+      "upstream_url": "https://github.com/UCSB-NLP-Chang/Visual-Spatial-Planning.git",
+      "local_dir": "Reference/Visual-Spatial-Planning",
+      "commit": "6d74d7bb46ae71bf41aa4d3d874a4f31fc5f0366",
+      "source_ref": "refs/remotes/origin/main",
+      "license_status": "present",
+      "license_files": [
+        {
+          "path": "LICENSE",
+          "sha256": "29b3b571a94870d6ccaa3e937f8b5720a2b4814519433a6277f0f3a3cca86385"
+        }
+      ],
+      "evidence_files": [
+        {
+          "path": "README.md",
+          "sha256": "4451feb4534475f699ae8fb9215b2e7f1f9ebbdb3003490e00aa3d6ea360b2e6",
+          "symbols": []
+        },
+        {
+          "path": "VSP-main/gemini.yml",
+          "sha256": "b60e80987b6dc465aa15b9ef14f899da3ff97c5af71b92768d437ab0a69a8f09",
+          "symbols": []
+        },
+        {
+          "path": "VSP-main/maze/task-main/eval.py",
+          "sha256": "4e4f6c9cad3fd9557167162109b3d3248419142a9404c198338dda2972f14211",
+          "symbols": [
+            "<module>"
+          ]
+        },
+        {
+          "path": "VSP-main/maze/task-main/test.py",
+          "sha256": "ee0160e0c0114467c1c2779b51c841f85277aeec4a817e6bb65a898425bb01d8",
+          "symbols": [
+            "<module>"
+          ]
+        },
+        {
+          "path": "VSP-main/maze/task-main/maps/level5/table/0.txt",
+          "sha256": "89e9b2731adb7f032d75df7c49b856463ad2332cbbc8dd76422d9cfa2a238187",
+          "symbols": []
+        },
+        {
+          "path": "VSP-main/maze/task-main/maps/level5/pure_text/0.txt",
+          "sha256": "c8c40c8167ff9c9830be879331af56539d656d4389300d38ae6964d3344a7d2f",
+          "symbols": []
+        },
+        {
+          "path": "VSP-main/maze/task-main/prompt-text/prompt-text.txt",
+          "sha256": "6d10655a588d3b97ac8d6b07d591da30b6643045ca7a925bb08fd1f57280a185",
+          "symbols": []
+        },
+        {
+          "path": "VSP-main/maze/task-main/prompt-visual-images/system-figure-1.png",
+          "sha256": "7321fc3f75b4a763f4c2e5965a513c281bd8542cec31bb90b9f60eff63035b08",
+          "symbols": []
+        },
+        {
+          "path": "VSP-main/maze/task-main/prompt-visual-images/system-figure-2.png",
+          "sha256": "1cc4ae6e6474849687801599ffa7b112ce7044ae74bbd612fa01c8619afff9c1",
+          "symbols": []
+        }
+      ]
+    },
+    {
+      "name": "CoMT",
+      "upstream_url": "https://github.com/gogoczh/CoMT.git",
+      "local_dir": "Reference/CoMT",
+      "commit": "01095663a1d1f3b4818d255e0a8f02ef754bddc4",
+      "source_ref": "refs/remotes/origin/main",
+      "license_status": "no_license_file_found",
+      "license_files": [],
+      "evidence_files": [
+        {
+          "path": "README.md",
+          "sha256": "562a6c752a09b2d79b4b04b0e7e7ca2b7bcb7c35642efc8111e5e751f39e8e99",
+          "symbols": []
+        },
+        {
+          "path": "evaluate.py",
+          "sha256": "fbe95d592ecd6a1b9eac97321c5c2b4690fdab7ff3b8a57af678c31426cf5596",
+          "symbols": [
+            "judge_answer",
+            "run"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "EMMA",
+      "upstream_url": "https://github.com/EMMA-Bench/EMMA.git",
+      "local_dir": "Reference/EMMA",
+      "commit": "47259952dd8e95bc1e3855a4164ccd3634f8eb1e",
+      "source_ref": "refs/remotes/origin/main",
+      "license_status": "no_license_file_found",
+      "license_files": [],
+      "evidence_files": [
+        {
+          "path": "README.md",
+          "sha256": "1bce18af6db2a5a1971ad6c2708fecbdb7266b322cb90bcb1c52aef69e2aab68",
+          "symbols": []
+        },
+        {
+          "path": "evaluation/evaluate.py",
+          "sha256": "2b6fc041c91955a116f8a17e0954e4e701c178a83b0c1ac6a0031ea35020c6ff",
+          "symbols": [
+            "fast_extract_answer",
+            "create_test_prompt",
+            "call_gpt",
+            "gen_true_false",
+            "main"
+          ]
+        },
+        {
+          "path": "evaluation/utils.py",
+          "sha256": "dbf584bb47a568bfed8df2194ee5690e3c76c0daf5dc3b670672d6794eb94028",
+          "symbols": [
+            "verify_extraction",
+            "is_number",
+            "extract_full_boxed_content",
+            "is_equal"
+          ]
+        },
+        {
+          "path": "evaluation/calculate_acc.py",
+          "sha256": "453fb0ae9315b9e941725ccc93c2fe76d970e3427ce709f14b9fd711a6142767",
+          "symbols": [
+            "gen_score"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "VisuLogic-Eval",
+      "upstream_url": "https://github.com/VisuLogic-Benchmark/VisuLogic-Eval.git",
+      "local_dir": "Reference/VisuLogic-Eval",
+      "commit": "00fba6ddafdc0d6805a4b9455c8df36502aeda2a",
+      "source_ref": "refs/remotes/origin/main",
+      "license_status": "present",
+      "license_files": [
+        {
+          "path": "LICENSE",
+          "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1"
+        }
+      ],
+      "evidence_files": [
+        {
+          "path": "README.md",
+          "sha256": "c05075de4fdd84186bc285434b46ecfd668836cbeef798b6c0a4177977f5272d",
+          "symbols": []
+        },
+        {
+          "path": "evaluation/eval_model.py",
+          "sha256": "e38c1ebed313a99573ba0c09cbd10b29c85ad0427e9cea3cf29f7fee5635c2b7",
+          "symbols": [
+            "ModelEvaluator",
+            "ModelEvaluator.__init__",
+            "ModelEvaluator.extract_answer_v1",
+            "ModelEvaluator.extract_gpt",
+            "ModelEvaluator.calculate_scores",
+            "ModelEvaluator.evaluate",
+            "main"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "VLMEvalKit",
+      "upstream_url": "https://github.com/open-compass/VLMEvalKit.git",
+      "local_dir": "Reference/VLMEvalKit",
+      "commit": "b06e0716f22127c1920364c6f4d80b9c32e42c09",
+      "source_ref": "refs/remotes/origin/main",
+      "license_status": "present",
+      "license_files": [
+        {
+          "path": "LICENSE",
+          "sha256": "5f0538b314b13e062d1fed3991ec1868cc71c49d0838cd7bc6ef563be06a5ad3"
+        }
+      ],
+      "evidence_files": [
+        {
+          "path": "vlmeval/dataset/utils/visulogic.py",
+          "sha256": "3abdd60d6e53abb0983b1cb57e82cea0195ab9f1080f70d72fd08ce3932f0249",
+          "symbols": [
+            "extract_last_boxed_content",
+            "extract_lang_content",
+            "extract_answer",
+            "VisuLogic_acc"
+          ]
+        },
+        {
+          "path": "vlmeval/dataset/image_mcq.py",
+          "sha256": "9f619bec3abc784ca647ae8fb78f2dc6d5ff6209b8d525a0d0be3ead868c5c73",
+          "symbols": [
+            "VisuLogic",
+            "VisuLogic.build_prompt",
+            "VisuLogic.evaluate"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Bagel-Zebra-CoT",
+      "upstream_url": "https://github.com/multimodal-reasoning-lab/Bagel-Zebra-CoT.git",
+      "local_dir": "Reference/Bagel-Zebra-CoT",
+      "commit": "bbf53c327889a1764d27989d117d1a6b73ffdd3f",
+      "source_ref": "refs/remotes/origin/main",
+      "license_status": "present",
+      "license_files": [
+        {
+          "path": "LICENSE",
+          "sha256": "43070e2d4e532684de521b885f385d0841030efa2b1a20bafb76133a5e1379c1"
+        }
+      ],
+      "evidence_files": [
+        {
+          "path": "README.md",
+          "sha256": "c2a98969771d87a54dcf612784e2655255e17005be116f17953e920d6afb72fe",
+          "symbols": []
+        },
+        {
+          "path": "EVAL.md",
+          "sha256": "cf62a3d8e834d6443b33b6d8073f7e05aa246890dabd7d35a79d9d69f4bf7547",
+          "symbols": []
+        },
+        {
+          "path": "scripts/eval/eval_vlm.sh",
+          "sha256": "2dc39b74115d5b0e12b8aec09cccad0d65c30ee6018a9a3c3d0d0bf1c18a0edb",
+          "symbols": []
+        },
+        {
+          "path": "scripts/eval/run_eval_vlm.sh",
+          "sha256": "bb868f253e662aa36fcd2a019628fb90c8f9bafdd82566418ce24ce4efc750d7",
+          "symbols": []
+        },
+        {
+          "path": "data/dataset_info.py",
+          "sha256": "5bfa4f5c1b73afd403020c3dbcad12d35d5c27cf142a7be4f87d532208b1193d",
+          "symbols": [
+            "<module>"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "MathRuler",
+      "upstream_url": "https://github.com/hiyouga/MathRuler.git",
+      "local_dir": "Reference/MathRuler",
+      "commit": "1cf48eb78b244e3e231565bcfb184f2b294e3d3f",
+      "source_ref": "refs/tags/v0.1.0",
+      "license_status": "present",
+      "license_files": [
+        {
+          "path": "LICENSE",
+          "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+        }
+      ],
+      "evidence_files": [
+        {
+          "path": "README.md",
+          "sha256": "7bcbb3181a786d4dc4ec5da71e9fdee3b7ea710227ce783f549a8756d867cd30",
+          "symbols": []
+        },
+        {
+          "path": "mathruler/grader.py",
+          "sha256": "39c3dacb684eabb29785a80fc4d0b3e0177d97753cb83d6d92835ca2e5c9728c",
+          "symbols": [
+            "extract_boxed_content",
+            "grade_answer"
+          ]
+        },
+        {
+          "path": "requirements.txt",
+          "sha256": "245e2e008d7968edbf1489a96798a71e07167144df43f3e39f7b95310f1fe7c1",
+          "symbols": []
+        },
+        {
+          "path": "setup.py",
+          "sha256": "fe11ce229ff3c019ccd37ee02ebab4ac95adcf6266629d6d77349571f9eb0198",
+          "symbols": [
+            "get_requires"
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+schema_version: 1
+benchmark: vsp
+profile: vsp_validated_v1
+categories:
+  - level3
+  - level4
+  - level5
+  - level6
+  - level7
+  - level8
+dataset_root: data/evaluation/vsp-pinned-6d74d7bb46ae-v1
+max_steps: 100
+run_metadata:
+  model_identity: stage1-dora-continuous-v29
+  prompt_template_identity: vsp-ilvr-three-images-v1:8034d008ea5ca5e693c73b5bc8a079e2aa55a1270bbe7e5a4e78c706037af03d
+  generation_config:
+    max_new_tokens: 4096
+    max_sequence_length: 32768
+    repetition_penalty: 1.05
+    temperature: 0.0
+    top_p: 1.0
+    do_sample: false

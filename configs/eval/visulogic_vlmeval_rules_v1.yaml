@@ -1,0 +1,13 @@
+schema_version: 1
+benchmark: visulogic
+profile: visulogic_vlmeval_rules_v1
+categories:
+  - Position
+  - Quantity
+  - Style
+dataset_root: data/evaluation/visulogic-pqs579-v1-r02
+# Replace this template with the actual generation identity/settings before scoring.
+run_metadata:
+  model_identity: external:model
+  prompt_template_identity: visulogic-pqs579-v1
+  generation_config: {}

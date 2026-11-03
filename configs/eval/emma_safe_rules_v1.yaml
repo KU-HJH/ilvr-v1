@@ -1,0 +1,10 @@
+schema_version: 1
+benchmark: emma
+profile: emma_safe_rules_v1
+categories: [Chemistry, Coding, Math, Physics]
+dataset_root: data/evaluation/emma-mini400-v1-r02
+# Actual scoring requires the actual generation identity/settings; this config defines no EMMA generation prompt.
+run_metadata:
+  model_identity: external:model
+  prompt_template_identity: emma-mini400-v1
+  generation_config: {}

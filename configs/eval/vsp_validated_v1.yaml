@@ -1,0 +1,14 @@
+schema_version: 1
+benchmark: vsp
+profile: vsp_validated_v1
+categories:
+  - planning
+  - planning-empty
+dataset_root: data/evaluation/vsp-synthetic-v1
+max_steps: 100
+run_metadata:
+  model_identity: synthetic:deterministic-responses-v1
+  prompt_template_identity: synthetic:vsp-contract-v1
+  generation_config:
+    do_sample: false
+    max_new_tokens: 16

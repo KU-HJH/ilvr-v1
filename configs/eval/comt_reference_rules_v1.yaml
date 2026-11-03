@@ -1,0 +1,13 @@
+schema_version: 1
+benchmark: comt
+profile: comt_reference_rules_v1
+categories:
+  - creation
+  - deletion
+  - update
+  - selection
+dataset_root: data
+run_metadata:
+  model_identity: external:model
+  prompt_template_identity: ilvr-test400-corrected-v1
+  generation_config: {}

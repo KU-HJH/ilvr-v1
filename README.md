@@ -97,7 +97,7 @@ The dataset follows the JSONL format:
 
 For canonical ZeRO-1/2/3 configuration selection, artifact ownership, and
 same-identity resume commands, see [the ZeRO stage training guide](docs/zero-stage-training.md).
-For the fixed `korea@10.1.102.41` / `llm_kd` two-node four-GPU topology,
+For the fixed `korea@172.16.11.41` / `llm_kd` two-node four-GPU topology,
 including exact preflight, training, resume, evaluation, capacity, lifecycle,
 validation, and exact-owned cleanup commands, see
 [the four-GPU multi-node operator guide](docs/multinode-training.md).
