@@ -141,7 +141,7 @@ def test_worker_dry_run_and_actual_parser_agree(tmp_path, mode, expected):
     flags = validate_stage1_arguments(('--stage1-variant=v3', '--stage1-v3-gain-entropy-mode=' + mode))
     flags = resume.resolve_coordinator_arguments(flags, tmp_path / 'out')
     env = dict(os.environ, ILVR_NUM_MACHINES='2', ILVR_NUM_PROCESSES='4', ILVR_MACHINE_RANK='1',
-        ILVR_MAIN_PROCESS_IP='10.1.102.41', ILVR_MAIN_PROCESS_PORT='29579', ILVR_SOCKET_IFNAME='bond1.102')
+        ILVR_MAIN_PROCESS_IP='172.16.11.41', ILVR_MAIN_PROCESS_PORT='29579', ILVR_SOCKET_IFNAME='bond0.11')
     result = subprocess.run([str(ROOT / 'run_stage1_training.sh'), '--dry-run',
         '--data-path', str(ROOT / 'data/TRAIN.jsonl'), '--image-root', str(ROOT / 'data/images'),
         '--output-dir', str(tmp_path / 'out'), *flags], cwd=ROOT, env=env, text=True, capture_output=True)

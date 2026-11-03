@@ -110,11 +110,11 @@ class ClusterSpec:
                 raise ValueError("native checkout requires explicit remote repository roots") from error
             remote_repo_root = local
         return cls(
-            remote_host="korea@10.1.102.41", remote_container="llm_kd",
+            remote_host="korea@172.16.11.41", remote_container="llm_kd",
             local_repo_root=local,
             remote_repo_root=_repository_root(remote_repo_root),
             remote_host_repo_root=_repository_root(remote_host_repo_root),
-            master_addr="10.1.102.41", socket_ifname="bond1.102",
+            master_addr="172.16.11.41", socket_ifname="bond0.11",
         )
 
 
@@ -128,8 +128,8 @@ def _repository_root(value: str | Path) -> Path:
 
 
 def validate_cluster_topology(cluster: ClusterSpec) -> None:
-    expected = dict(remote_host="korea@10.1.102.41", remote_container="llm_kd",
-        master_addr="10.1.102.41", socket_ifname="bond1.102", remote_rank=0,
+    expected = dict(remote_host="korea@172.16.11.41", remote_container="llm_kd",
+        master_addr="172.16.11.41", socket_ifname="bond0.11", remote_rank=0,
         local_rank=1, num_machines=2, gpus_per_node=2, num_processes=4)
     for name, value in expected.items():
         actual = getattr(cluster, name)
@@ -1068,13 +1068,13 @@ def _repository_git_stdout(arguments: tuple[str, ...]) -> str:
 
 def _interface_name() -> str:
     completed = subprocess.run(
-        ("ip", "-o", "link", "show", "bond1.102"),
+        ("ip", "-o", "link", "show", "bond0.11"),
         capture_output=True,
         text=True,
         check=False,
         timeout=_CONTROL_TIMEOUT_SECONDS,
     )
-    return "bond1.102" if completed.returncode == 0 else ""
+    return "bond0.11" if completed.returncode == 0 else ""
 
 
 def _tmux_session_is_fresh(name: str) -> bool:
@@ -1091,7 +1091,7 @@ def _tmux_session_is_fresh(name: str) -> bool:
 def _remote_master_port_is_free(port: int) -> bool:
     probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        probe.bind(("10.1.102.41", port))
+        probe.bind(("172.16.11.41", port))
     except OSError:
         return False
     finally:
@@ -1409,7 +1409,7 @@ def _ownership_ready(argv: list[str]) -> int:
     ownership = read_ownership(args.ownership_path)
     if ownership.command_digest != args.command_digest:
         raise ValueError("ownership command digest mismatch")
-    if args.master_addr != "10.1.102.41":
+    if args.master_addr != "172.16.11.41":
         raise ValueError("readiness master address must match the fixed topology")
     if not 1024 <= args.main_process_port <= 65535:
         raise ValueError("readiness port must be between 1024 and 65535")

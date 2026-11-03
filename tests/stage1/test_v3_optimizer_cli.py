@@ -90,7 +90,7 @@ def test_shell_dry_run_passes_optimizer_flags_without_launch(inline):
     pairs=[('--stage1-v3-gain-update-mode','adamw_projected'),('--stage1-v3-gain-optimizer-weight','.25')]
     extra=[f'{k}={v}' for k,v in pairs] if inline else [x for p in pairs for x in p]
     env=dict(os.environ,ILVR_NUM_MACHINES='2',ILVR_NUM_PROCESSES='4',ILVR_MACHINE_RANK='1',
-        ILVR_MAIN_PROCESS_IP='10.1.102.41',ILVR_MAIN_PROCESS_PORT='29579',ILVR_SOCKET_IFNAME='bond1.102')
+        ILVR_MAIN_PROCESS_IP='172.16.11.41',ILVR_MAIN_PROCESS_PORT='29579',ILVR_SOCKET_IFNAME='bond0.11')
     result=subprocess.run([str(ROOT/'run_stage1_training.sh'),'--dry-run','--stage1-variant','v3','--method','dora',
         '--model','models/Qwen2.5-VL-3B-Instruct','--data-path',str(ROOT/'data/TRAIN.jsonl'),
         '--image-root',str(ROOT/'data/images'),'--output-dir',str(ROOT/'checkpoints/v3-optimizer-dry'),*extra],

@@ -20,7 +20,7 @@
 - FP32 전체 vocabulary log-softmax, target `i`는 predictor `i-1`; 바로 다음 text item만 점수화하고 text/text crossing token은 gain에서만 제외한다.
 - FP32 gradient buffer, FP64 dot/norm 및 projection 중간값; `min_h_norm_sq=1e-30`; epsilon으로 denominator를 바꾸지 않는다.
 - `theta_new = theta_old + Delta_S1 + alpha_vis*u`; base AdamW moments는 base gradient로만 갱신한다.
-- 모든 GPU training/probe/smoke는 기존 coordinator의 **2노드·4rank**, remote rank 0 `10.1.102.41`, local rank 1, `bond1.102`를 사용한다. 직접 rank 실행은 금지다.
+- 모든 GPU training/probe/smoke는 기존 coordinator의 **2노드·4rank**, remote rank 0 `172.16.11.41`, local rank 1, `bond0.11`를 사용한다. 직접 rank 실행은 금지다.
 - fresh 실행은 microbatch 1, accumulation 4, global batch 16, LR 5e-5, seed 42, warmup 10, CE 0.1; DoRA r32/alpha64/dropout0.05, latent8 및 기존 Stage 1 설정을 명시한다. tiny probe도 이를 사용하고 기존 tiny model/data fixture의 크기만 작게 둔다.
 - Python/tests는 `./venv/ilvr-venv/bin/python`, import 경로는 `PYTHONPATH=transformers/src:src:.`; CPU tests는 `CUDA_VISIBLE_DEVICES=''`를 명시한다. dependency 설치는 하지 않는다.
 - 데이터는 `data/`, weights/state는 `checkpoints/`, 결과는 `results/`, 로그는 `logs/`; 기존 symlink를 유지한다. fixture도 저장 종류에 따라 배치한다.

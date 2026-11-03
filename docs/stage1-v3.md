@@ -181,8 +181,8 @@ Example **dry run** (replace the remote roots with the provisioned checkout):
   --image-root /root/.codex/worktrees/541e/ILVR/data/images_comt --dry-run
 ```
 
-Remote machine rank 0 remains `korea@10.1.102.41`, container `llm_kd`, with
-rendezvous `10.1.102.41` and Gloo/NCCL interface `bond1.102`; local machine rank
+Remote machine rank 0 remains `korea@172.16.11.41`, container `llm_kd`, with
+rendezvous `172.16.11.41` and Gloo/NCCL interface `bond0.11`; local machine rank
 is 1. Two GPUs on each node are mandatory. Read the canonical AGENTS.md,
 training-defaults.md and [operator guide](multinode-training.md) before an
 actual run. Preserve the repository `data/`, `checkpoints/`, `venv/` links.

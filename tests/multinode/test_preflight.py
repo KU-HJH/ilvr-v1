@@ -37,7 +37,7 @@ def snapshot(node, rank):
         deepspeed_version="0.18.7",
         torchrun_ok=True,
         gpu_names=("NVIDIA H100 NVL", "NVIDIA H100 NVL"),
-        interface="bond1.102",
+        interface="bond0.11",
         input_paths_ok=True,
         artifact_roots_writable=True,
         artifact_free_bytes=500_000_000_000,
@@ -153,7 +153,7 @@ def test_preflight_rejects_commit_mismatch_before_launch():
         ({"torch_version": "2.7.0+cu126"}, "environment versions"),
         ({"gpu_names": ("NVIDIA H100 NVL",)}, "exactly two GPUs"),
         ({"gpu_names": ("NVIDIA A100", "NVIDIA A100")}, "H100"),
-        ({"interface": "eth0"}, "bond1.102"),
+        ({"interface": "eth0"}, "bond0.11"),
         ({"input_paths_ok": False}, "input paths"),
         ({"artifact_roots_writable": False}, "artifact roots"),
         ({"artifact_free_bytes": 1024}, "free space"),
@@ -200,7 +200,7 @@ def test_remote_exec_shell_quotes_each_argument():
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
-        "korea@10.1.102.41",
+        "korea@172.16.11.41",
     ]
     assert len(command) == 7
     remote = shlex.split(command[6])
@@ -244,7 +244,7 @@ def test_remote_collection_checks_container_then_parses_probe_json():
         "BatchMode=yes",
         "-o",
         "ConnectTimeout=8",
-        "korea@10.1.102.41",
+        "korea@172.16.11.41",
     ]
     assert shlex.split(calls[1][6])[:2] == ["/usr/bin/docker", "exec"]
 

@@ -70,7 +70,7 @@ v3 OFF의 기존 동작은 보존한다. 저장된 다른 목적함수를 v3로 
 |---|---|
 | 초기화 | original Qwen2.5-VL-3B-Instruct pretrained base, fresh run; Stage1/Stage2 결과 가중치 사용 안 함 |
 | 분산 | 2 nodes × 2 GPUs = 4 ranks; 기존 Stage1 multinode coordinator |
-| 노드 | remote `korea@10.1.102.41` / `llm_kd` rank0, local rank1; rendezvous `10.1.102.41`; Gloo/NCCL `bond1.102` |
+| 노드 | remote `korea@172.16.11.41` / `llm_kd` rank0, local rank1; rendezvous `172.16.11.41`; Gloo/NCCL `bond0.11` |
 | batch | per-device microbatch1 × accumulation4 × ranks4 = global16 |
 | optimizer | 기존 AdamW/linear, LR5e-5, warmup10 updates, weight decay0.01, max grad norm1.0 |
 | 재현/precision | seed42, BF16, 저장소 `venv/ilvr-venv` |

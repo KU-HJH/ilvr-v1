@@ -123,7 +123,7 @@ def test_token_entropy_cli_coordinator_and_worker_mode(tmp_path,selector,resumed
     resolved=v3_resume.resolve_coordinator_arguments(('--resume',str(checkpoint)),tmp_path/'out')
     assert resolved[resolved.index('--stage1-v3-gain-weighting')+1]=='token_entropy'
     env={**os.environ,'STAGE1_VARIANT':'','ILVR_NUM_MACHINES':'2','ILVR_NUM_PROCESSES':'4','ILVR_MACHINE_RANK':'1',
-        'ILVR_MAIN_PROCESS_IP':'10.1.102.41','ILVR_MAIN_PROCESS_PORT':'29579','ILVR_SOCKET_IFNAME':'bond1.102'}
+        'ILVR_MAIN_PROCESS_IP':'172.16.11.41','ILVR_MAIN_PROCESS_PORT':'29579','ILVR_SOCKET_IFNAME':'bond0.11'}
     extra=['--resume',str(checkpoint)] if resumed else ['--stage1-variant','v3','--stage1-v3-selector',selector,
         '--stage1-v3-gain-weighting','token_entropy']
     result=subprocess.run([str(ROOT/'run_stage1_training.sh'),'--dry-run','--method','dora',

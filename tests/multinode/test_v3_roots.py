@@ -49,7 +49,7 @@ def test_root_identity_survives_serialization(tmp_path):
 
 
 @pytest.mark.parametrize('field,value', [
-    ('remote_host','someone@10.1.102.41'), ('remote_container','foreign'),
+    ('remote_host','someone@172.16.11.41'), ('remote_container','foreign'),
     ('master_addr','127.0.0.1'), ('socket_ifname','eth0'),
     ('remote_rank',1), ('local_rank',0), ('num_machines',1),
     ('gpus_per_node',4), ('num_processes',2), ('remote_rank',False),

@@ -65,9 +65,9 @@ def test_checkpoint_rsync_uses_container_destination_and_local_source():
     push = build_push_command(m,cluster=p.cluster)
     remote = str(REMOTE/'checkpoints'/m.run_id/m.checkpoint_relative)+'/'
     local = str(LOCAL/'checkpoints'/m.run_id/m.checkpoint_relative)+'/'
-    assert push[-2:] == (local,'korea@10.1.102.41:'+remote)
+    assert push[-2:] == (local,'korea@172.16.11.41:'+remote)
     pull=build_pull_command(strict_manifest(0),cluster=p.cluster)
-    assert pull[-2] == 'korea@10.1.102.41:'+remote
+    assert pull[-2] == 'korea@172.16.11.41:'+remote
     assert pull[-1] == str(LOCAL/'checkpoints'/m.run_id)+'/'
     assert str(HOST) not in ' '.join(push+pull)
 

@@ -38,7 +38,7 @@ def test_fixed_probe_command_uses_owned_four_rank_harness_without_training():
         assert command[command.index("--")+1].endswith("/bin/accelerate")
         assert "--num_processes" in command and command[command.index("--num_processes")+1] == "4"
         assert command[command.index("--machine_rank")+1] == str(rank)
-        assert command[command.index("--main_process_ip")+1] == "10.1.102.41"
+        assert command[command.index("--main_process_ip")+1] == "172.16.11.41"
         assert str(plan.cluster.remote_repo_root / "scripts/probe_dil_full_model.py") in command
         assert str(manifest) in command
         assert "run_stage2_training.sh" not in " ".join(command)

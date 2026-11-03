@@ -64,8 +64,8 @@ def test_coordinator_allowlist_and_launcher_enforce_fresh_profile_without_writes
     assert validate_stage1_arguments(('--stage1-variant','v3'))==('--stage1-variant','v3')
     env=dict(os.environ,STAGE1_VARIANT='v3',STAGE1_EPOCHS='3',STAGE1_CE_WEIGHT='1',STAGE1_EMA_TAU='.999',
         STAGE1_GRADIENT_ACCUMULATION='2',STAGE1_DEEPSPEED_CONFIG='configs/deepspeed_zero3.json',
-        ILVR_NUM_MACHINES='2',ILVR_NUM_PROCESSES='4',ILVR_MACHINE_RANK='1',ILVR_MAIN_PROCESS_IP='10.1.102.41',
-        ILVR_MAIN_PROCESS_PORT='29579',ILVR_SOCKET_IFNAME='bond1.102')
+        ILVR_NUM_MACHINES='2',ILVR_NUM_PROCESSES='4',ILVR_MACHINE_RANK='1',ILVR_MAIN_PROCESS_IP='172.16.11.41',
+        ILVR_MAIN_PROCESS_PORT='29579',ILVR_SOCKET_IFNAME='bond0.11')
     result=subprocess.run([str(ROOT/'run_stage1_training.sh'),'--dry-run','--method','dora','--model','models/Qwen2.5-VL-3B-Instruct',
         '--data-path',str(ROOT/'data/TRAIN.jsonl'),'--image-root',str(ROOT/'data/images'),
         '--output-dir',str(ROOT/'checkpoints/v3-profile-test')],env=env,cwd=ROOT,text=True,capture_output=True)
@@ -158,7 +158,7 @@ def test_launcher_passes_selector_to_worker_argv(tmp_path,selector,resumed):
         checkpoint,_=saved(tmp_path,selector)
         extra=['--resume',str(checkpoint)]
     env=dict(os.environ,ILVR_NUM_MACHINES='2',ILVR_NUM_PROCESSES='4',ILVR_MACHINE_RANK='1',
-        ILVR_MAIN_PROCESS_IP='10.1.102.41',ILVR_MAIN_PROCESS_PORT='29579',ILVR_SOCKET_IFNAME='bond1.102')
+        ILVR_MAIN_PROCESS_IP='172.16.11.41',ILVR_MAIN_PROCESS_PORT='29579',ILVR_SOCKET_IFNAME='bond0.11')
     env.pop('STAGE1_VARIANT',None)
     result=subprocess.run([str(ROOT/'run_stage1_training.sh'),'--dry-run','--method','dora',
         '--model','models/Qwen2.5-VL-3B-Instruct','--data-path',str(ROOT/'data/TRAIN.jsonl'),
